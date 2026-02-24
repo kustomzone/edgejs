@@ -4,11 +4,16 @@
 #include <atomic>
 #include <new>
 
+#include <uv.h>
+
 struct napi_async_work__ {
   napi_env env = nullptr;
   napi_async_execute_callback execute = nullptr;
   napi_async_complete_callback complete = nullptr;
   void* data = nullptr;
+  uv_work_t req{};
+  bool queued = false;
+  bool deleting = false;
 };
 
 struct napi_threadsafe_function__ {
@@ -25,6 +30,19 @@ namespace {
 
 inline bool CheckEnv(napi_env env) {
   return env != nullptr && env->isolate != nullptr;
+}
+
+void UvExecute(uv_work_t* req) {
+  auto* work = static_cast<napi_async_work__*>(req->data);
+  if (work == nullptr || work->execute == nullptr) return;
+  work->execute(work->env, work->data);
+}
+
+void UvAfterWork(uv_work_t* req, int status) {
+  auto* work = static_cast<napi_async_work__*>(req->data);
+  if (work == nullptr || work->complete == nullptr || work->deleting) return;
+  napi_status napi_status_code = (status == UV_ECANCELED) ? napi_cancelled : napi_ok;
+  work->complete(work->env, napi_status_code, work->data);
 }
 
 }  // namespace
@@ -91,12 +109,14 @@ napi_status NAPI_CDECL napi_create_async_work(napi_env env,
   work->execute = execute;
   work->complete = complete;
   work->data = data;
+  work->req.data = work;
   *result = work;
   return napi_ok;
 }
 
 napi_status NAPI_CDECL napi_delete_async_work(napi_env env, napi_async_work work) {
   if (!CheckEnv(env) || work == nullptr) return napi_invalid_arg;
+  work->deleting = true;
   delete work;
   return napi_ok;
 }
@@ -104,17 +124,19 @@ napi_status NAPI_CDECL napi_delete_async_work(napi_env env, napi_async_work work
 napi_status NAPI_CDECL napi_queue_async_work(node_api_basic_env env, napi_async_work work) {
   auto* napiEnv = const_cast<napi_env>(env);
   if (!CheckEnv(napiEnv) || work == nullptr) return napi_invalid_arg;
-  work->execute(napiEnv, work->data);
-  work->complete(napiEnv, napi_ok, work->data);
-  delete work;
+  if (work->queued) return napi_generic_failure;
+  int rc = uv_queue_work(uv_default_loop(), &work->req, UvExecute, UvAfterWork);
+  if (rc != 0) return napi_generic_failure;
+  work->queued = true;
   return napi_ok;
 }
 
 napi_status NAPI_CDECL napi_cancel_async_work(node_api_basic_env env, napi_async_work work) {
   auto* napiEnv = const_cast<napi_env>(env);
   if (!CheckEnv(napiEnv) || work == nullptr) return napi_invalid_arg;
-  delete work;
-  return napi_ok;
+  if (!work->queued) return napi_generic_failure;
+  int rc = uv_cancel(reinterpret_cast<uv_req_t*>(&work->req));
+  return (rc == 0) ? napi_ok : napi_generic_failure;
 }
 
 napi_status NAPI_CDECL napi_create_threadsafe_function(

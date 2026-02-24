@@ -25,6 +25,7 @@ set(NAPI_V8_V8_DEFINES
   "${NAPI_V8_V8_DEFINES_DEFAULT}"
   CACHE STRING "Semicolon-separated V8 embedder compile definitions"
 )
+set(NAPI_V8_UV_INCLUDE_DIR "${NAPI_V8_NODE_ROOT}/deps/uv/include")
 
 add_library(napi_v8 STATIC
   src/js_native_api_v8.cc
@@ -32,12 +33,15 @@ add_library(napi_v8 STATIC
   src/napi_v8_platform.cc
 )
 
+find_library(NAPI_V8_UV_LIB NAMES uv libuv HINTS /opt/homebrew/lib /usr/local/lib)
+
 target_include_directories(napi_v8
   PUBLIC
     "${NAPI_V8_ROOT}/include"
   PRIVATE
     "${NAPI_V8_ROOT}/src"
     "${NAPI_V8_V8_INCLUDE_DIR}"
+    "${NAPI_V8_UV_INCLUDE_DIR}"
 )
 
 target_compile_definitions(napi_v8
@@ -46,6 +50,9 @@ target_compile_definitions(napi_v8
 )
 if(NAPI_V8_V8_DEFINES)
   target_compile_definitions(napi_v8 PRIVATE ${NAPI_V8_V8_DEFINES})
+endif()
+if(NAPI_V8_UV_LIB)
+  target_link_libraries(napi_v8 PRIVATE "${NAPI_V8_UV_LIB}")
 endif()
 
 if(NAPI_V8_BUILD_TESTS)
