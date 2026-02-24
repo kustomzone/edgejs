@@ -33,6 +33,15 @@ struct napi_deferred__ {
   v8::Global<v8::Promise::Resolver> resolver;
 };
 
+struct napi_handle_scope__ {
+  napi_env env = nullptr;
+};
+
+struct napi_escapable_handle_scope__ {
+  napi_env env = nullptr;
+  bool escaped = false;
+};
+
 namespace {
 
 struct CallbackPayload {
@@ -1254,6 +1263,51 @@ napi_status NAPI_CDECL napi_get_new_target(
     return napi_invalid_arg;
   }
   *result = cbinfo->new_target;
+  return napi_ok;
+}
+
+napi_status NAPI_CDECL napi_open_handle_scope(napi_env env, napi_handle_scope* result) {
+  if (!CheckEnv(env) || result == nullptr) return napi_invalid_arg;
+  auto* scope = new (std::nothrow) napi_handle_scope__();
+  if (scope == nullptr) return napi_generic_failure;
+  scope->env = env;
+  *result = scope;
+  return napi_ok;
+}
+
+napi_status NAPI_CDECL napi_close_handle_scope(napi_env env, napi_handle_scope scope) {
+  if (!CheckEnv(env) || scope == nullptr) return napi_invalid_arg;
+  delete scope;
+  return napi_ok;
+}
+
+napi_status NAPI_CDECL napi_open_escapable_handle_scope(
+    napi_env env, napi_escapable_handle_scope* result) {
+  if (!CheckEnv(env) || result == nullptr) return napi_invalid_arg;
+  auto* scope = new (std::nothrow) napi_escapable_handle_scope__();
+  if (scope == nullptr) return napi_generic_failure;
+  scope->env = env;
+  *result = scope;
+  return napi_ok;
+}
+
+napi_status NAPI_CDECL napi_close_escapable_handle_scope(
+    napi_env env, napi_escapable_handle_scope scope) {
+  if (!CheckEnv(env) || scope == nullptr) return napi_invalid_arg;
+  delete scope;
+  return napi_ok;
+}
+
+napi_status NAPI_CDECL napi_escape_handle(napi_env env,
+                                          napi_escapable_handle_scope scope,
+                                          napi_value escapee,
+                                          napi_value* result) {
+  if (!CheckEnv(env) || scope == nullptr || escapee == nullptr || result == nullptr) {
+    return napi_invalid_arg;
+  }
+  if (scope->escaped) return napi_escape_called_twice;
+  scope->escaped = true;
+  *result = escapee;
   return napi_ok;
 }
 
