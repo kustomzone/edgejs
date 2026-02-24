@@ -54,6 +54,11 @@ if(NAPI_V8_V8_MONOLITH_LIB)
         napi_v8
         "${NAPI_V8_V8_MONOLITH_LIB}"
     )
+    target_compile_definitions(${target_name}
+      PRIVATE
+        NAPI_V8_NODE_ROOT_PATH="${NAPI_V8_NODE_ROOT}"
+        NAPI_V8_ROOT_PATH="${NAPI_V8_ROOT}"
+    )
     if(NAPI_V8_V8_DEFINES)
       target_compile_definitions(${target_name} PRIVATE ${NAPI_V8_V8_DEFINES})
     endif()
