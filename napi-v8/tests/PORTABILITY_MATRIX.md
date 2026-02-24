@@ -7,6 +7,15 @@ This matrix classifies Node test directories for Phase 1 `napi-v8`.
 - `out_of_scope_phase1`: tightly coupled to Node process/runtime semantics.
 - `in_progress`: currently ported and wired.
 
+## Porting Policy
+
+- Entries marked as ported should keep upstream Node source/tests as close to
+  verbatim as possible.
+- The only intended implementation adaptation is replacing direct V8 API usage
+  with N-API usage.
+- Harness/shim/build glue changes are allowed when needed to execute upstream
+  tests in `napi-v8`.
+
 ## `js-native-api` (`node/test/js-native-api`)
 
 ### in_progress

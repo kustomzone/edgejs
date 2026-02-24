@@ -1,6 +1,14 @@
 # napi-v8 Tests
 
-Tier-1 tests use GoogleTest and port selected Node `js-native-api` fixtures.
+Tier-1 tests use GoogleTest and port Node fixtures.
+
+## Porting Rule
+
+- Tests should be ported from Node as fully/verbatim as possible.
+- Do not rewrite upstream test intent unless unavoidable.
+- Adapt only execution glue (runner/shim/build wiring) as needed.
+- If an upstream source path uses direct V8 APIs, replace those paths with
+  N-API usage while preserving behavior.
 
 ## Current Ported Tests
 

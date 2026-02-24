@@ -14,6 +14,15 @@ The long-term intent is to make runtime internals less engine-coupled while pres
 - Avoid exposing V8-specific details from public or internal integration layers.
 - Progress incrementally, validating behavior with tests at every phase.
 
+## Source And Test Porting Policy
+
+- Source and tests should be ported from Node as fully and verbatim as possible.
+- The only intended source-level exception is when upstream code uses direct V8
+  APIs: those paths should be adapted to use N-API interfaces instead.
+- Prefer adapting harness/runtime glue over rewriting upstream test logic.
+- Preserve upstream behavior and failure semantics while applying N-API-based
+  substitutions.
+
 ## Current Status
 
 The project is in planning/bootstrap stage. The roadmap below defines the execution order and milestones.
@@ -32,6 +41,8 @@ Scope:
   - `js_native_api_v8_internals.h`
   - and the files they depend on
 - Preserve N-API behavior and contracts while hiding V8 internals.
+- Keep source and tests aligned with upstream Node files, except V8 API usage
+  which should be replaced with N-API usage.
 
 Exit criteria:
 - A standalone layer that passes initial N-API behavior checks.

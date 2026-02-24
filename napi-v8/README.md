@@ -9,6 +9,14 @@
  - Internal implementation: V8-backed code only in `src/`.
  - Test strategy: port portable tests from `node/test/js-native-api` first.
 
+ ## Porting Policy
+
+ - Source and tests should be ported from upstream Node as fully as possible.
+ - Keep upstream files/logic verbatim unless adaptation is strictly required.
+ - The only intended code adaptation rule: replace direct V8 API usage with
+   equivalent N-API usage.
+ - Favor harness/environment shims over rewriting upstream test content.
+
  ## Layout
 
  - `include/`: public C headers (V8-agnostic surface)
