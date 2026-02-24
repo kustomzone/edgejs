@@ -214,6 +214,10 @@ if(NAPI_V8_V8_MONOLITH_LIB)
     runners/test_33_typedarray.cc
     ported/js-native-api/test_typedarray/test_typedarray.c
   )
+  add_fixture_test(napi_v8_test_34_new_target
+    runners/test_34_new_target.cc
+    ported/js-native-api/test_new_target/test_new_target.c
+  )
   find_library(NAPI_V8_UV_LIB NAMES uv libuv HINTS /opt/homebrew/lib /usr/local/lib)
   if(NAPI_V8_UV_LIB)
     target_link_libraries(napi_v8_test_28_node_instance_data PRIVATE "${NAPI_V8_UV_LIB}")

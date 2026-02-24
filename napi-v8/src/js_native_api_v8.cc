@@ -150,7 +150,7 @@ void FunctionTrampoline(const v8::FunctionCallbackInfo<v8::Value>& info) {
   cbinfo->env = env;
   cbinfo->data = payload->data;
   cbinfo->this_arg = napi_v8_wrap_value(env, info.This());
-  if (!info.NewTarget().IsEmpty()) {
+  if (!info.NewTarget().IsEmpty() && !info.NewTarget()->IsUndefined()) {
     cbinfo->new_target = napi_v8_wrap_value(env, info.NewTarget());
   }
   cbinfo->args.reserve(info.Length());

@@ -24,6 +24,7 @@ This matrix classifies Node test directories for Phase 1 `napi-v8`.
 - `test_exception` (ported to gtest harness)
 - `test_function` (ported to gtest harness)
 - `test_number` (ported to gtest harness)
+- `test_new_target` (ported to gtest harness)
 - `test_reference` (ported to gtest harness)
 - `test_string` (ported to gtest harness)
 - `test_symbol` (ported to gtest harness)
@@ -47,7 +48,6 @@ This matrix classifies Node test directories for Phase 1 `napi-v8`.
 - `test_finalizer`
 - `test_handle_scope`
 - `test_instance_data`
-- `test_new_target`
 - `test_promise`
 - `test_reference_double_free`
 
