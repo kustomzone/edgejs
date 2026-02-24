@@ -501,7 +501,10 @@ napi_status NAPI_CDECL napi_create_function(napi_env env,
                                             napi_callback cb,
                                             void* data,
                                             napi_value* result) {
-  if (!CheckEnv(env) || cb == nullptr || result == nullptr) return napi_invalid_arg;
+  if (!CheckEnv(env)) return napi_invalid_arg;
+  if (cb == nullptr || result == nullptr) {
+    return napi_v8_set_last_error(env, napi_invalid_arg, "Invalid argument");
+  }
   auto* payload = new (std::nothrow) CallbackPayload{env, cb, data};
   if (payload == nullptr) return napi_generic_failure;
 
@@ -524,7 +527,8 @@ napi_status NAPI_CDECL napi_create_function(napi_env env,
   if (!name.IsEmpty()) fn->SetName(name);
 
   *result = napi_v8_wrap_value(env, fn);
-  return (*result == nullptr) ? napi_generic_failure : napi_ok;
+  if (*result == nullptr) return napi_generic_failure;
+  return napi_v8_clear_last_error(env);
 }
 
 napi_status NAPI_CDECL napi_define_class(napi_env env,
