@@ -19,6 +19,7 @@ set(NAPI_V8_V8_EXTRA_LIBS
 set(NAPI_V8_GTEST_ROOT "${NAPI_V8_NODE_ROOT}/deps/googletest")
 set(NAPI_V8_UV_INCLUDE_DIR "${NAPI_V8_NODE_ROOT}/deps/uv/include")
 include(GoogleTest)
+option(NAPI_V8_BUILD_NODE_API_TESTS "Build node-api fixture tests in napi-v8" OFF)
 
 if(NAPI_V8_V8_MONOLITH_LIB)
   add_library(napi_v8_gtest STATIC
@@ -37,6 +38,11 @@ if(NAPI_V8_V8_MONOLITH_LIB)
   )
 
   function(add_fixture_test target_name)
+    if(NOT NAPI_V8_BUILD_NODE_API_TESTS AND
+       target_name MATCHES "^napi_v8_test_(20_node_general|21_general|22_node_exception|23_instance_data_ref_then_set|24_instance_data_set_then_ref|28_node_instance_data|38_finalizer|42_node_async|43_node_hello_world|44_node_async_cleanup_hook|45_node_async_context|46_node_buffer|47_node_buffer_finalizer|48_node_callback_scope|49_node_cleanup_hook|50_node_env_teardown_gc|51_node_fatal|52_node_fatal_exception|53_node_init_order|54_node_make_callback|55_node_make_callback_recurse|56_node_reference_by_api_v9|57_node_reference_by_api_v10|58_node_threadsafe_function|59_node_threadsafe_function_shutdown|60_node_uv_loop|61_node_uv_threadpool_size|62_node_worker_buffer_callback|63_node_worker_terminate|64_node_worker_terminate_finalization)$")
+      return()
+    endif()
+
     add_executable(${target_name} ${ARGN})
     target_include_directories(${target_name}
       PRIVATE
@@ -164,7 +170,9 @@ if(NAPI_V8_V8_MONOLITH_LIB)
     runners/test_21_general.cc
     ported/js-native-api/test_general/test_general.c
   )
-  target_compile_definitions(napi_v8_test_21_general PRIVATE NAPI_EXPERIMENTAL)
+  if(TARGET napi_v8_test_21_general)
+    target_compile_definitions(napi_v8_test_21_general PRIVATE NAPI_EXPERIMENTAL)
+  endif()
   add_fixture_test(napi_v8_test_22_node_exception
     runners/test_22_node_exception.cc
     ported/node-api/test_exception/test_exception.c
@@ -239,7 +247,9 @@ if(NAPI_V8_V8_MONOLITH_LIB)
     runners/test_38_finalizer.cc
     ported/js-native-api/test_finalizer/test_finalizer.c
   )
-  target_compile_definitions(napi_v8_test_38_finalizer PRIVATE NAPI_EXPERIMENTAL NODE_API_EXPERIMENTAL_NO_WARNING)
+  if(TARGET napi_v8_test_38_finalizer)
+    target_compile_definitions(napi_v8_test_38_finalizer PRIVATE NAPI_EXPERIMENTAL NODE_API_EXPERIMENTAL_NO_WARNING)
+  endif()
   add_fixture_test(napi_v8_test_39_cannot_run_js
     runners/test_39_cannot_run_js.cc
     ported/js-native-api/test_cannot_run_js/test_cannot_run_js.c
@@ -274,7 +284,9 @@ if(NAPI_V8_V8_MONOLITH_LIB)
     runners/test_46_node_buffer.cc
     ported/node-api/test_buffer/test_buffer.c
   )
-  target_compile_definitions(napi_v8_test_46_node_buffer PRIVATE NAPI_VERSION=10)
+  if(TARGET napi_v8_test_46_node_buffer)
+    target_compile_definitions(napi_v8_test_46_node_buffer PRIVATE NAPI_VERSION=10)
+  endif()
   add_fixture_test(napi_v8_test_47_node_buffer_finalizer
     runners/test_47_node_buffer_finalizer.cc
     ported/node-api/test_buffer/test_finalizer.c
@@ -315,12 +327,16 @@ if(NAPI_V8_V8_MONOLITH_LIB)
     runners/test_56_node_reference_by_api_v9.cc
     ported/node-api/test_reference_by_node_api_version/test_reference_by_node_api_version.c
   )
-  target_compile_definitions(napi_v8_test_56_node_reference_by_api_v9 PRIVATE NAPI_VERSION=9)
+  if(TARGET napi_v8_test_56_node_reference_by_api_v9)
+    target_compile_definitions(napi_v8_test_56_node_reference_by_api_v9 PRIVATE NAPI_VERSION=9)
+  endif()
   add_fixture_test(napi_v8_test_57_node_reference_by_api_v10
     runners/test_57_node_reference_by_api_v10.cc
     ported/node-api/test_reference_by_node_api_version/test_reference_by_node_api_version.c
   )
-  target_compile_definitions(napi_v8_test_57_node_reference_by_api_v10 PRIVATE NAPI_VERSION=10)
+  if(TARGET napi_v8_test_57_node_reference_by_api_v10)
+    target_compile_definitions(napi_v8_test_57_node_reference_by_api_v10 PRIVATE NAPI_VERSION=10)
+  endif()
   add_fixture_test(napi_v8_test_58_node_threadsafe_function
     runners/test_58_node_threadsafe_function.cc
     ported/node-api/test_threadsafe_function/binding.c
@@ -350,40 +366,40 @@ if(NAPI_V8_V8_MONOLITH_LIB)
     ported/node-api/test_worker_terminate_finalization/test_worker_terminate_finalization.c
   )
   find_library(NAPI_V8_UV_LIB NAMES uv libuv HINTS /opt/homebrew/lib /usr/local/lib)
-  if(NAPI_V8_UV_LIB)
+  if(NAPI_V8_UV_LIB AND TARGET napi_v8_test_42_node_async)
     target_link_libraries(napi_v8_test_42_node_async PRIVATE "${NAPI_V8_UV_LIB}")
   endif()
-  if(NAPI_V8_UV_LIB)
+  if(NAPI_V8_UV_LIB AND TARGET napi_v8_test_44_node_async_cleanup_hook)
     target_link_libraries(napi_v8_test_44_node_async_cleanup_hook PRIVATE "${NAPI_V8_UV_LIB}")
   endif()
-  if(NAPI_V8_UV_LIB)
+  if(NAPI_V8_UV_LIB AND TARGET napi_v8_test_28_node_instance_data)
     target_link_libraries(napi_v8_test_28_node_instance_data PRIVATE "${NAPI_V8_UV_LIB}")
   endif()
-  if(NAPI_V8_UV_LIB)
+  if(NAPI_V8_UV_LIB AND TARGET napi_v8_test_46_node_buffer)
     target_link_libraries(napi_v8_test_46_node_buffer PRIVATE "${NAPI_V8_UV_LIB}")
   endif()
-  if(NAPI_V8_UV_LIB)
+  if(NAPI_V8_UV_LIB AND TARGET napi_v8_test_47_node_buffer_finalizer)
     target_link_libraries(napi_v8_test_47_node_buffer_finalizer PRIVATE "${NAPI_V8_UV_LIB}")
   endif()
-  if(NAPI_V8_UV_LIB)
+  if(NAPI_V8_UV_LIB AND TARGET napi_v8_test_48_node_callback_scope)
     target_link_libraries(napi_v8_test_48_node_callback_scope PRIVATE "${NAPI_V8_UV_LIB}")
   endif()
-  if(NAPI_V8_UV_LIB)
+  if(NAPI_V8_UV_LIB AND TARGET napi_v8_test_51_node_fatal)
     target_link_libraries(napi_v8_test_51_node_fatal PRIVATE "${NAPI_V8_UV_LIB}")
   endif()
-  if(NAPI_V8_UV_LIB)
+  if(NAPI_V8_UV_LIB AND TARGET napi_v8_test_58_node_threadsafe_function)
     target_link_libraries(napi_v8_test_58_node_threadsafe_function PRIVATE "${NAPI_V8_UV_LIB}")
   endif()
-  if(NAPI_V8_UV_LIB)
+  if(NAPI_V8_UV_LIB AND TARGET napi_v8_test_59_node_threadsafe_function_shutdown)
     target_link_libraries(napi_v8_test_59_node_threadsafe_function_shutdown PRIVATE "${NAPI_V8_UV_LIB}")
   endif()
-  if(NAPI_V8_UV_LIB)
+  if(NAPI_V8_UV_LIB AND TARGET napi_v8_test_60_node_uv_loop)
     target_link_libraries(napi_v8_test_60_node_uv_loop PRIVATE "${NAPI_V8_UV_LIB}")
   endif()
-  if(NAPI_V8_UV_LIB)
+  if(NAPI_V8_UV_LIB AND TARGET napi_v8_test_61_node_uv_threadpool_size)
     target_link_libraries(napi_v8_test_61_node_uv_threadpool_size PRIVATE "${NAPI_V8_UV_LIB}")
   endif()
-  if(NAPI_V8_UV_LIB)
+  if(NAPI_V8_UV_LIB AND TARGET napi_v8_test_64_node_worker_terminate_finalization)
     target_link_libraries(napi_v8_test_64_node_worker_terminate_finalization PRIVATE "${NAPI_V8_UV_LIB}")
   endif()
 else()

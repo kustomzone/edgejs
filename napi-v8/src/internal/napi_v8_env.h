@@ -41,11 +41,6 @@ struct napi_ref__ {
   bool can_be_weak = false;
 };
 
-struct napi_env_cleanup_hook__ {
-  napi_cleanup_hook hook = nullptr;
-  void* arg = nullptr;
-};
-
 struct napi_env__ {
   struct TypeTagEntry {
     v8::Global<v8::Value> value;
@@ -76,6 +71,7 @@ struct napi_env__ {
   std::vector<void*> buffer_records;
   std::vector<void*> wrap_finalizers;
   std::vector<TypeTagEntry> type_tag_entries;
+  void (*node_api_cleanup_runner)(napi_env) = nullptr;
 };
 
 napi_status napi_v8_set_last_error(napi_env env,

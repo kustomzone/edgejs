@@ -443,8 +443,9 @@ napi_env__::napi_env__(v8::Local<v8::Context> context, int32_t module_api_versio
 }
 
 napi_env__::~napi_env__() {
-  napi_v8_run_async_cleanup_hooks(this);
-  napi_v8_run_env_cleanup_hooks(this);
+  if (node_api_cleanup_runner != nullptr) {
+    node_api_cleanup_runner(this);
+  }
   napi_v8_finalize_buffer_records(this);
 
   for (auto* raw_record : wrap_finalizers) {
@@ -512,20 +513,6 @@ void napi_v8_finalize_buffer_records(napi_env env) {
     }
   }
   env->buffer_records.clear();
-}
-
-void napi_v8_run_env_cleanup_hooks(napi_env env) {
-  if (!CheckEnv(env)) return;
-  for (auto it = env->env_cleanup_hooks.rbegin(); it != env->env_cleanup_hooks.rend(); ++it) {
-    auto* entry = static_cast<napi_env_cleanup_hook__*>(*it);
-    if (entry != nullptr && entry->hook != nullptr) {
-      entry->hook(entry->arg);
-    }
-  }
-  for (void* raw : env->env_cleanup_hooks) {
-    delete static_cast<napi_env_cleanup_hook__*>(raw);
-  }
-  env->env_cleanup_hooks.clear();
 }
 
 extern "C" {

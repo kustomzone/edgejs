@@ -35,6 +35,11 @@ struct napi_async_cleanup_hook_handle__ {
   bool removed = false;
 };
 
+struct napi_env_cleanup_hook__ {
+  napi_cleanup_hook hook = nullptr;
+  void* arg = nullptr;
+};
+
 struct napi_callback_scope__ {
   napi_env env = nullptr;
 };
@@ -43,6 +48,11 @@ namespace {
 
 inline bool CheckEnv(napi_env env) {
   return env != nullptr && env->isolate != nullptr;
+}
+
+void RunNodeApiCleanupHooks(napi_env env) {
+  napi_v8_run_async_cleanup_hooks(env);
+  napi_v8_run_env_cleanup_hooks(env);
 }
 
 void UvExecute(uv_work_t* req) {
@@ -98,6 +108,20 @@ void napi_v8_run_async_cleanup_hooks(napi_env env) {
     delete handle;
   }
   env->async_cleanup_hooks.clear();
+}
+
+void napi_v8_run_env_cleanup_hooks(napi_env env) {
+  if (!CheckEnv(env)) return;
+  for (auto it = env->env_cleanup_hooks.rbegin(); it != env->env_cleanup_hooks.rend(); ++it) {
+    auto* entry = static_cast<napi_env_cleanup_hook__*>(*it);
+    if (entry != nullptr && entry->hook != nullptr) {
+      entry->hook(entry->arg);
+    }
+  }
+  for (void* raw : env->env_cleanup_hooks) {
+    delete static_cast<napi_env_cleanup_hook__*>(raw);
+  }
+  env->env_cleanup_hooks.clear();
 }
 
 extern "C" {
@@ -273,6 +297,7 @@ napi_status NAPI_CDECL napi_add_async_cleanup_hook(
     napi_async_cleanup_hook_handle* remove_handle) {
   auto* napiEnv = const_cast<napi_env>(env);
   if (!CheckEnv(napiEnv) || hook == nullptr) return napi_invalid_arg;
+  napiEnv->node_api_cleanup_runner = RunNodeApiCleanupHooks;
 
   auto* handle = new (std::nothrow) napi_async_cleanup_hook_handle__();
   if (handle == nullptr) return napi_generic_failure;
@@ -326,6 +351,7 @@ napi_status NAPI_CDECL napi_add_env_cleanup_hook(node_api_basic_env env,
                                                  void* arg) {
   auto* napiEnv = const_cast<napi_env>(env);
   if (!CheckEnv(napiEnv) || fun == nullptr) return napi_invalid_arg;
+  napiEnv->node_api_cleanup_runner = RunNodeApiCleanupHooks;
   auto* entry = new (std::nothrow) napi_env_cleanup_hook__();
   if (entry == nullptr) return napi_generic_failure;
   entry->hook = fun;
