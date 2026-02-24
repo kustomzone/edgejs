@@ -74,15 +74,16 @@ This matrix classifies Node test directories for Phase 1 `napi-v8`.
 - `test_make_callback_recurse` (ported to gtest harness)
 - `test_reference_by_node_api_version` (ported to gtest harness)
 - `test_threadsafe_function` (ported to gtest harness)
+- `test_threadsafe_function_shutdown` (ported to gtest harness)
+- `test_uv_loop` (ported to gtest harness)
+- `test_uv_threadpool_size` (ported to gtest harness)
+- `test_worker_buffer_callback` (ported to gtest harness)
+- `test_worker_terminate` (ported to gtest harness)
+- `test_worker_terminate_finalization` (ported to gtest harness)
 
 ### defer_phase2
 
-- `test_threadsafe_function_shutdown`
-- `test_uv_loop`
-- `test_uv_threadpool_size`
-- `test_worker_buffer_callback`
-- `test_worker_terminate`
-- `test_worker_terminate_finalization`
+- (none currently)
 
 ### out_of_scope_phase1
 

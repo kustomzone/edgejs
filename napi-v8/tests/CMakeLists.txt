@@ -320,6 +320,30 @@ if(NAPI_V8_V8_MONOLITH_LIB)
     runners/test_58_node_threadsafe_function.cc
     ported/node-api/test_threadsafe_function/binding.c
   )
+  add_fixture_test(napi_v8_test_59_node_threadsafe_function_shutdown
+    runners/test_59_node_threadsafe_function_shutdown.cc
+    ported/node-api/test_threadsafe_function_shutdown/binding.cc
+  )
+  add_fixture_test(napi_v8_test_60_node_uv_loop
+    runners/test_60_node_uv_loop.cc
+    ported/node-api/test_uv_loop/test_uv_loop.cc
+  )
+  add_fixture_test(napi_v8_test_61_node_uv_threadpool_size
+    runners/test_61_node_uv_threadpool_size.cc
+    ported/node-api/test_uv_threadpool_size/test_uv_threadpool_size.c
+  )
+  add_fixture_test(napi_v8_test_62_node_worker_buffer_callback
+    runners/test_62_node_worker_buffer_callback.cc
+    ported/node-api/test_worker_buffer_callback/test_worker_buffer_callback.c
+  )
+  add_fixture_test(napi_v8_test_63_node_worker_terminate
+    runners/test_63_node_worker_terminate.cc
+    ported/node-api/test_worker_terminate/test_worker_terminate.c
+  )
+  add_fixture_test(napi_v8_test_64_node_worker_terminate_finalization
+    runners/test_64_node_worker_terminate_finalization.cc
+    ported/node-api/test_worker_terminate_finalization/test_worker_terminate_finalization.c
+  )
   find_library(NAPI_V8_UV_LIB NAMES uv libuv HINTS /opt/homebrew/lib /usr/local/lib)
   if(NAPI_V8_UV_LIB)
     target_link_libraries(napi_v8_test_42_node_async PRIVATE "${NAPI_V8_UV_LIB}")
@@ -344,6 +368,18 @@ if(NAPI_V8_V8_MONOLITH_LIB)
   endif()
   if(NAPI_V8_UV_LIB)
     target_link_libraries(napi_v8_test_58_node_threadsafe_function PRIVATE "${NAPI_V8_UV_LIB}")
+  endif()
+  if(NAPI_V8_UV_LIB)
+    target_link_libraries(napi_v8_test_59_node_threadsafe_function_shutdown PRIVATE "${NAPI_V8_UV_LIB}")
+  endif()
+  if(NAPI_V8_UV_LIB)
+    target_link_libraries(napi_v8_test_60_node_uv_loop PRIVATE "${NAPI_V8_UV_LIB}")
+  endif()
+  if(NAPI_V8_UV_LIB)
+    target_link_libraries(napi_v8_test_61_node_uv_threadpool_size PRIVATE "${NAPI_V8_UV_LIB}")
+  endif()
+  if(NAPI_V8_UV_LIB)
+    target_link_libraries(napi_v8_test_64_node_worker_terminate_finalization PRIVATE "${NAPI_V8_UV_LIB}")
   endif()
 else()
   message(STATUS "Skipping napi_v8_tier1_tests: set NAPI_V8_V8_MONOLITH_LIB to link V8 runtime")
