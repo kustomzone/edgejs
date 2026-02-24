@@ -37,6 +37,11 @@ struct napi_ref__ {
 };
 
 struct napi_env__ {
+  struct TypeTagEntry {
+    v8::Global<v8::Value> value;
+    napi_type_tag tag{};
+  };
+
   explicit napi_env__(v8::Local<v8::Context> context, int32_t module_api_version);
   ~napi_env__();
 
@@ -53,6 +58,7 @@ struct napi_env__ {
   void* instance_data = nullptr;
   napi_finalize instance_data_finalize_cb = nullptr;
   void* instance_data_finalize_hint = nullptr;
+  std::vector<TypeTagEntry> type_tag_entries;
 };
 
 napi_status napi_v8_set_last_error(napi_env env,

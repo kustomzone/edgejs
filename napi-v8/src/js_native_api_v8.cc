@@ -1188,7 +1188,13 @@ napi_status NAPI_CDECL napi_get_property_names(napi_env env,
   if (!target->IsObject()) return napi_object_expected;
   v8::TryCatch tc(env->isolate);
   v8::Local<v8::Array> names;
-  if (!target.As<v8::Object>()->GetPropertyNames(env->context()).ToLocal(&names)) {
+  if (!target.As<v8::Object>()
+           ->GetPropertyNames(env->context(),
+                              v8::KeyCollectionMode::kIncludePrototypes,
+                              static_cast<v8::PropertyFilter>(v8::ONLY_ENUMERABLE | v8::SKIP_SYMBOLS),
+                              v8::IndexFilter::kIncludeIndices,
+                              v8::KeyConversionMode::kConvertToString)
+           .ToLocal(&names)) {
     return ReturnPendingIfCaught(env, tc, "Exception while getting property names");
   }
   *result = napi_v8_wrap_value(env, names);
@@ -1202,10 +1208,36 @@ napi_status NAPI_CDECL napi_get_all_property_names(napi_env env,
                                                    napi_key_conversion key_conversion,
                                                    napi_value* result) {
   if (!CheckValue(env, object) || result == nullptr) return InvalidArg(env);
-  (void)key_mode;
-  (void)key_filter;
-  (void)key_conversion;
-  return napi_get_property_names(env, object, result);
+  v8::Local<v8::Value> target = napi_v8_unwrap_value(object);
+  if (!target->IsObject()) return napi_object_expected;
+
+  v8::KeyCollectionMode collection_mode =
+      (key_mode == napi_key_own_only) ? v8::KeyCollectionMode::kOwnOnly
+                                      : v8::KeyCollectionMode::kIncludePrototypes;
+  int property_filter = v8::ALL_PROPERTIES;
+  if ((key_filter & napi_key_writable) != 0) property_filter |= v8::ONLY_WRITABLE;
+  if ((key_filter & napi_key_enumerable) != 0) property_filter |= v8::ONLY_ENUMERABLE;
+  if ((key_filter & napi_key_configurable) != 0) property_filter |= v8::ONLY_CONFIGURABLE;
+  if ((key_filter & napi_key_skip_strings) != 0) property_filter |= v8::SKIP_STRINGS;
+  if ((key_filter & napi_key_skip_symbols) != 0) property_filter |= v8::SKIP_SYMBOLS;
+
+  v8::KeyConversionMode conversion_mode =
+      (key_conversion == napi_key_keep_numbers) ? v8::KeyConversionMode::kKeepNumbers
+                                                : v8::KeyConversionMode::kConvertToString;
+
+  v8::TryCatch tc(env->isolate);
+  v8::Local<v8::Array> names;
+  if (!target.As<v8::Object>()
+           ->GetPropertyNames(env->context(),
+                              collection_mode,
+                              static_cast<v8::PropertyFilter>(property_filter),
+                              v8::IndexFilter::kIncludeIndices,
+                              conversion_mode)
+           .ToLocal(&names)) {
+    return ReturnPendingIfCaught(env, tc, "Exception while getting all property names");
+  }
+  *result = napi_v8_wrap_value(env, names);
+  return (*result == nullptr) ? napi_generic_failure : napi_ok;
 }
 
 napi_status NAPI_CDECL napi_set_named_property(napi_env env,
@@ -1920,24 +1952,19 @@ napi_status NAPI_CDECL napi_type_tag_object(
     napi_env env, napi_value value, const napi_type_tag* type_tag) {
   if (!CheckValue(env, value) || type_tag == nullptr) return napi_invalid_arg;
   v8::Local<v8::Value> target = napi_v8_unwrap_value(value);
-  if (!target->IsObject()) return napi_invalid_arg;
-  v8::Local<v8::Object> obj = target.As<v8::Object>();
-  v8::Local<v8::Private> kLo = v8::Private::ForApi(
-      env->isolate, v8::String::NewFromUtf8Literal(env->isolate, "__napi_type_tag_lo"));
-  v8::Local<v8::Private> kHi = v8::Private::ForApi(
-      env->isolate, v8::String::NewFromUtf8Literal(env->isolate, "__napi_type_tag_hi"));
-  if (!obj
-           ->SetPrivate(env->context(),
-                        kLo,
-                        v8::BigInt::NewFromUnsigned(env->isolate, type_tag->lower))
-           .FromMaybe(false) ||
-      !obj
-           ->SetPrivate(env->context(),
-                        kHi,
-                        v8::BigInt::NewFromUnsigned(env->isolate, type_tag->upper))
-           .FromMaybe(false)) {
-    return napi_generic_failure;
+  if (!target->IsObject() && !target->IsExternal()) return napi_invalid_arg;
+
+  for (auto& entry : env->type_tag_entries) {
+    if (!entry.value.IsEmpty() && entry.value.Get(env->isolate)->StrictEquals(target)) {
+      entry.tag = *type_tag;
+      return napi_ok;
+    }
   }
+
+  napi_env__::TypeTagEntry entry;
+  entry.value.Reset(env->isolate, target);
+  entry.tag = *type_tag;
+  env->type_tag_entries.push_back(std::move(entry));
   return napi_ok;
 }
 
@@ -1949,28 +1976,19 @@ napi_status NAPI_CDECL napi_check_object_type_tag(napi_env env,
     return napi_invalid_arg;
   }
   v8::Local<v8::Value> target = napi_v8_unwrap_value(value);
-  if (!target->IsObject()) {
+  if (!target->IsObject() && !target->IsExternal()) {
     *result = false;
     return napi_ok;
   }
-  v8::Local<v8::Object> obj = target.As<v8::Object>();
-  v8::Local<v8::Private> kLo = v8::Private::ForApi(
-      env->isolate, v8::String::NewFromUtf8Literal(env->isolate, "__napi_type_tag_lo"));
-  v8::Local<v8::Private> kHi = v8::Private::ForApi(
-      env->isolate, v8::String::NewFromUtf8Literal(env->isolate, "__napi_type_tag_hi"));
-  v8::Local<v8::Value> lo;
-  v8::Local<v8::Value> hi;
-  if (!obj->GetPrivate(env->context(), kLo).ToLocal(&lo) ||
-      !obj->GetPrivate(env->context(), kHi).ToLocal(&hi) ||
-      !lo->IsBigInt() || !hi->IsBigInt()) {
-    *result = false;
-    return napi_ok;
+
+  for (auto& entry : env->type_tag_entries) {
+    if (entry.value.IsEmpty()) continue;
+    if (entry.value.Get(env->isolate)->StrictEquals(target)) {
+      *result = (entry.tag.lower == type_tag->lower && entry.tag.upper == type_tag->upper);
+      return napi_ok;
+    }
   }
-  bool lossless_lo = false;
-  bool lossless_hi = false;
-  uint64_t lo_v = lo.As<v8::BigInt>()->Uint64Value(&lossless_lo);
-  uint64_t hi_v = hi.As<v8::BigInt>()->Uint64Value(&lossless_hi);
-  *result = lossless_lo && lossless_hi && lo_v == type_tag->lower && hi_v == type_tag->upper;
+  *result = false;
   return napi_ok;
 }
 
