@@ -1,43 +1,66 @@
 'use strict';
 
-function formatReceived(value) {
-  if (value === null) return ' Received null';
-  if (value === undefined) return ' Received undefined';
-  if (typeof value === 'function') {
-    return ` Received function ${value.name || '<anonymous>'}`;
+const {
+  codes: {
+    ERR_INVALID_ARG_TYPE,
+    ERR_INVALID_ARG_VALUE,
+  },
+} = require('internal/errors');
+
+function validateFunction(value, name) {
+  if (typeof value !== 'function') {
+    throw new ERR_INVALID_ARG_TYPE(name, 'Function', value);
   }
-  if (typeof value === 'object') {
-    if (value && value.constructor && value.constructor.name) {
-      return ` Received an instance of ${value.constructor.name}`;
-    }
-    return ' Received an instance of Object';
-  }
-  const text = String(value);
-  if (text.length > 25) {
-    return ` Received type ${typeof value} (${text.slice(0, 25)}...)`;
-  }
-  return ` Received type ${typeof value} (${text})`;
 }
 
-function createTypeError(name, expectedType, actualValue) {
-  const err = new TypeError(`The "${name}" argument must be of type ${expectedType}.${formatReceived(actualValue)}`);
-  err.code = 'ERR_INVALID_ARG_TYPE';
-  return err;
+function validateAbortSignal(value, name) {
+  if (!value || typeof value !== 'object' || typeof value.aborted !== 'boolean') {
+    throw new ERR_INVALID_ARG_TYPE(name, 'AbortSignal', value);
+  }
 }
 
 function validateString(value, name) {
   if (typeof value !== 'string') {
-    throw createTypeError(name, 'string', value);
+    throw new ERR_INVALID_ARG_TYPE(name, 'string', value);
+  }
+}
+
+function validateUint32(value, name, positive) {
+  if (!Number.isInteger(value)) {
+    throw new ERR_INVALID_ARG_TYPE(name, 'number', value);
+  }
+  if (value < 0 || value > 0xFFFFFFFF || (positive && value === 0)) {
+    throw new ERR_INVALID_ARG_VALUE(name, value);
   }
 }
 
 function validateObject(value, name) {
   if (value === null || typeof value !== 'object') {
-    throw createTypeError(name, 'object', value);
+    throw new ERR_INVALID_ARG_TYPE(name, 'object', value);
+  }
+}
+
+function validateBoolean(value, name) {
+  if (typeof value !== 'boolean') {
+    throw new ERR_INVALID_ARG_TYPE(name, 'boolean', value);
+  }
+}
+
+function validateInteger(value, name, min = Number.MIN_SAFE_INTEGER, max = Number.MAX_SAFE_INTEGER) {
+  if (!Number.isInteger(value)) {
+    throw new ERR_INVALID_ARG_TYPE(name, 'number', value);
+  }
+  if (value < min || value > max) {
+    throw new ERR_INVALID_ARG_VALUE(name, value);
   }
 }
 
 module.exports = {
   validateObject,
+  validateAbortSignal,
+  validateBoolean,
+  validateFunction,
+  validateInteger,
   validateString,
+  validateUint32,
 };
