@@ -147,6 +147,13 @@ class ERR_UNKNOWN_ENCODING extends TypeError {
   }
 }
 
+class ERR_INVALID_THIS extends TypeError {
+  constructor(type) {
+    super(`Value of "this" must be of type ${type}`);
+    this.code = 'ERR_INVALID_THIS';
+  }
+}
+
 class ERR_INVALID_BUFFER_SIZE extends RangeError {
   constructor(name = '16-bits') {
     super(`Buffer size must be a multiple of ${name}`);
@@ -254,6 +261,7 @@ module.exports = {
     ERR_OUT_OF_RANGE,
     ERR_BUFFER_OUT_OF_BOUNDS,
     ERR_UNKNOWN_ENCODING,
+    ERR_INVALID_THIS,
     ERR_INVALID_BUFFER_SIZE,
     ERR_MISSING_ARGS,
     ERR_SYSTEM_ERROR,
