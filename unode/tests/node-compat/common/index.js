@@ -93,6 +93,11 @@ function canCreateSymLink() {
   return true;
 }
 
+function skip(msg) {
+  console.log(`1..0 # Skipped: ${msg || ''}`.trim());
+  process.exit(0);
+}
+
 module.exports = {
   mustCall,
   mustSucceed,
@@ -104,4 +109,5 @@ module.exports = {
   isMainThread,
   isDumbTerminal,
   canCreateSymLink,
+  skip,
 };

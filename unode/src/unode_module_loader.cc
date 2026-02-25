@@ -250,9 +250,6 @@ bool ResolveBuiltinPath(const std::string& specifier, const std::string& base_di
       return true;
     }
   }
-  if (id.find('/') != std::string::npos) {
-    return false;
-  }
   // When UNODE_FALLBACK_BUILTINS_DIR is set (e.g. raw Node tests), try it first
   // so we always load unode's builtins (fs, assert, path) instead of node's or stubs.
   if (fallback != nullptr && fallback[0] != '\0') {

@@ -107,7 +107,9 @@ std::string StatusToString(napi_status status) {
   }
 }
 
-std::string GetAndClearPendingException(napi_env env) {
+std::string GetAndClearPendingException(napi_env env, bool* is_process_exit, int* process_exit_code) {
+  if (is_process_exit != nullptr) *is_process_exit = false;
+  if (process_exit_code != nullptr) *process_exit_code = 1;
   bool pending = false;
   if (napi_is_exception_pending(env, &pending) != napi_ok || !pending) {
     return "";
@@ -116,6 +118,19 @@ std::string GetAndClearPendingException(napi_env env) {
   napi_value exception = nullptr;
   if (napi_get_and_clear_last_exception(env, &exception) != napi_ok || exception == nullptr) {
     return "";
+  }
+
+  bool has_exit_code = false;
+  if (napi_has_named_property(env, exception, "__unodeExitCode", &has_exit_code) == napi_ok && has_exit_code) {
+    napi_value exit_code_value = nullptr;
+    int32_t code = 1;
+    if (napi_get_named_property(env, exception, "__unodeExitCode", &exit_code_value) == napi_ok &&
+        exit_code_value != nullptr &&
+        napi_get_value_int32(env, exit_code_value, &code) == napi_ok) {
+      if (is_process_exit != nullptr) *is_process_exit = true;
+      if (process_exit_code != nullptr) *process_exit_code = code;
+      return "";
+    }
   }
 
   napi_value exception_string = nullptr;
@@ -440,7 +455,19 @@ int RunScriptWithGlobals(napi_env env, const char* source_text, const char* entr
     return 0;
   }
 
-  const std::string exception_message = GetAndClearPendingException(env);
+  bool is_process_exit = false;
+  int process_exit_code = 1;
+  const std::string exception_message =
+      GetAndClearPendingException(env, &is_process_exit, &process_exit_code);
+  if (is_process_exit) {
+    if (error_out != nullptr) {
+      error_out->clear();
+      if (process_exit_code != 0) {
+        *error_out = "process.exit(" + std::to_string(process_exit_code) + ")";
+      }
+    }
+    return process_exit_code;
+  }
   if (error_out != nullptr) {
     if (!exception_message.empty()) {
       *error_out = exception_message;
@@ -536,6 +563,34 @@ napi_value ProcessUmaskCallback(napi_env env, napi_callback_info info) {
   return result;
 }
 
+napi_value ProcessExitCallback(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value args[1] = {nullptr};
+  if (napi_get_cb_info(env, info, &argc, args, nullptr, nullptr) != napi_ok) {
+    return nullptr;
+  }
+
+  int32_t exit_code = 0;
+  if (argc > 0 && args[0] != nullptr) {
+    napi_valuetype arg_type = napi_undefined;
+    if (napi_typeof(env, args[0], &arg_type) == napi_ok && arg_type != napi_undefined) {
+      napi_get_value_int32(env, args[0], &exit_code);
+    }
+  }
+
+  napi_value code_value = nullptr;
+  napi_value message_value = nullptr;
+  napi_value error_value = nullptr;
+  napi_create_string_utf8(env, "ERR_UNODE_PROCESS_EXIT", NAPI_AUTO_LENGTH, &code_value);
+  napi_create_string_utf8(env, "process.exit()", NAPI_AUTO_LENGTH, &message_value);
+  napi_create_error(env, code_value, message_value, &error_value);
+  napi_value exit_code_value = nullptr;
+  napi_create_int32(env, exit_code, &exit_code_value);
+  napi_set_named_property(env, error_value, "__unodeExitCode", exit_code_value);
+  napi_throw(env, error_value);
+  return nullptr;
+}
+
 napi_status UnodeInstallProcessObject(napi_env env) {
   if (env == nullptr) {
     return napi_invalid_arg;
@@ -605,6 +660,15 @@ napi_status UnodeInstallProcessObject(napi_env env) {
     return status;
   }
   status = InstallProcessStream(env, process_obj, "stderr", 2, ProcessStderrWriteCallback);
+  if (status != napi_ok) {
+    return status;
+  }
+  napi_value exit_fn = nullptr;
+  status = napi_create_function(env, "exit", NAPI_AUTO_LENGTH, ProcessExitCallback, nullptr, &exit_fn);
+  if (status != napi_ok || exit_fn == nullptr) {
+    return (status == napi_ok) ? napi_generic_failure : status;
+  }
+  status = napi_set_named_property(env, process_obj, "exit", exit_fn);
   if (status != napi_ok) {
     return status;
   }

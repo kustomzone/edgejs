@@ -363,4 +363,140 @@ TEST_F(Test3NodeDropinSubsetPhase02, RawFsUtimesFromNodeTest) {
   EXPECT_EQ(exit_code, 0) << "error=" << error;
   EXPECT_TRUE(error.empty()) << "error=" << error;
 }
+
+TEST_F(Test3NodeDropinSubsetPhase02, RawPathFromNodeTest) {
+  EnvScope s(runtime_.get());
+  std::string error;
+  const int exit_code = RunRawNodeTestScript(s.env, "test-path.js", &error);
+  EXPECT_EQ(exit_code, 0) << "error=" << error;
+  EXPECT_TRUE(error.empty()) << "error=" << error;
+}
+
+TEST_F(Test3NodeDropinSubsetPhase02, RawPathBasenameFromNodeTest) {
+  EnvScope s(runtime_.get());
+  std::string error;
+  const int exit_code = RunRawNodeTestScript(s.env, "test-path-basename.js", &error);
+  EXPECT_EQ(exit_code, 0) << "error=" << error;
+  EXPECT_TRUE(error.empty()) << "error=" << error;
+}
+
+TEST_F(Test3NodeDropinSubsetPhase02, RawPathDirnameFromNodeTest) {
+  EnvScope s(runtime_.get());
+  std::string error;
+  const int exit_code = RunRawNodeTestScript(s.env, "test-path-dirname.js", &error);
+  EXPECT_EQ(exit_code, 0) << "error=" << error;
+  EXPECT_TRUE(error.empty()) << "error=" << error;
+}
+
+TEST_F(Test3NodeDropinSubsetPhase02, RawPathExtnameFromNodeTest) {
+  EnvScope s(runtime_.get());
+  std::string error;
+  const int exit_code = RunRawNodeTestScript(s.env, "test-path-extname.js", &error);
+  EXPECT_EQ(exit_code, 0) << "error=" << error;
+  EXPECT_TRUE(error.empty()) << "error=" << error;
+}
+
+TEST_F(Test3NodeDropinSubsetPhase02, RawPathGlobFromNodeTest) {
+  EnvScope s(runtime_.get());
+  std::string error;
+  const int exit_code = RunRawNodeTestScript(s.env, "test-path-glob.js", &error);
+  EXPECT_EQ(exit_code, 0) << "error=" << error;
+  EXPECT_TRUE(error.empty()) << "error=" << error;
+}
+
+TEST_F(Test3NodeDropinSubsetPhase02, RawPathIsAbsoluteFromNodeTest) {
+  EnvScope s(runtime_.get());
+  std::string error;
+  const int exit_code = RunRawNodeTestScript(s.env, "test-path-isabsolute.js", &error);
+  EXPECT_EQ(exit_code, 0) << "error=" << error;
+  EXPECT_TRUE(error.empty()) << "error=" << error;
+}
+
+TEST_F(Test3NodeDropinSubsetPhase02, RawPathJoinFromNodeTest) {
+  EnvScope s(runtime_.get());
+  std::string error;
+  const int exit_code = RunRawNodeTestScript(s.env, "test-path-join.js", &error);
+  EXPECT_EQ(exit_code, 0) << "error=" << error;
+  EXPECT_TRUE(error.empty()) << "error=" << error;
+}
+
+TEST_F(Test3NodeDropinSubsetPhase02, RawPathMakeLongFromNodeTest) {
+  EnvScope s(runtime_.get());
+  std::string error;
+  const int exit_code = RunRawNodeTestScript(s.env, "test-path-makelong.js", &error);
+  EXPECT_EQ(exit_code, 0) << "error=" << error;
+  EXPECT_TRUE(error.empty()) << "error=" << error;
+}
+
+TEST_F(Test3NodeDropinSubsetPhase02, RawPathNormalizeFromNodeTest) {
+  EnvScope s(runtime_.get());
+  std::string error;
+  const int exit_code = RunRawNodeTestScript(s.env, "test-path-normalize.js", &error);
+  EXPECT_EQ(exit_code, 0) << "error=" << error;
+  EXPECT_TRUE(error.empty()) << "error=" << error;
+}
+
+TEST_F(Test3NodeDropinSubsetPhase02, RawPathParseFormatFromNodeTest) {
+  EnvScope s(runtime_.get());
+  std::string error;
+  const int exit_code = RunRawNodeTestScript(s.env, "test-path-parse-format.js", &error);
+  EXPECT_EQ(exit_code, 0) << "error=" << error;
+  EXPECT_TRUE(error.empty()) << "error=" << error;
+}
+
+TEST_F(Test3NodeDropinSubsetPhase02, RawPathPosixExistsFromNodeTest) {
+  EnvScope s(runtime_.get());
+  std::string error;
+  const int exit_code = RunRawNodeTestScript(s.env, "test-path-posix-exists.js", &error);
+  EXPECT_EQ(exit_code, 0) << "error=" << error;
+  EXPECT_TRUE(error.empty()) << "error=" << error;
+}
+
+TEST_F(Test3NodeDropinSubsetPhase02, RawPathPosixRelativeOnWindowsFromNodeTest) {
+  EnvScope s(runtime_.get());
+  std::string error;
+  const int exit_code = RunRawNodeTestScript(s.env, "test-path-posix-relative-on-windows.js", &error);
+  EXPECT_EQ(exit_code, 0) << "error=" << error;
+  EXPECT_TRUE(error.empty()) << "error=" << error;
+}
+
+TEST_F(Test3NodeDropinSubsetPhase02, RawPathRelativeFromNodeTest) {
+  EnvScope s(runtime_.get());
+  std::string error;
+  const int exit_code = RunRawNodeTestScript(s.env, "test-path-relative.js", &error);
+  EXPECT_EQ(exit_code, 0) << "error=" << error;
+  EXPECT_TRUE(error.empty()) << "error=" << error;
+}
+
+TEST_F(Test3NodeDropinSubsetPhase02, RawPathResolveFromNodeTest) {
+  EnvScope s(runtime_.get());
+  std::string error;
+  const int exit_code = RunRawNodeTestScript(s.env, "test-path-resolve.js", &error);
+  EXPECT_EQ(exit_code, 0) << "error=" << error;
+  EXPECT_TRUE(error.empty()) << "error=" << error;
+}
+
+TEST_F(Test3NodeDropinSubsetPhase02, RawPathWin32ExistsFromNodeTest) {
+  EnvScope s(runtime_.get());
+  std::string error;
+  const int exit_code = RunRawNodeTestScript(s.env, "test-path-win32-exists.js", &error);
+  EXPECT_EQ(exit_code, 0) << "error=" << error;
+  EXPECT_TRUE(error.empty()) << "error=" << error;
+}
+
+TEST_F(Test3NodeDropinSubsetPhase02, RawPathWin32NormalizeDeviceNamesFromNodeTest) {
+  EnvScope s(runtime_.get());
+  std::string error;
+  const int exit_code = RunRawNodeTestScript(s.env, "test-path-win32-normalize-device-names.js", &error);
+  EXPECT_EQ(exit_code, 0) << "error=" << error;
+  EXPECT_TRUE(error.empty()) << "error=" << error;
+}
+
+TEST_F(Test3NodeDropinSubsetPhase02, RawPathZeroLengthStringsFromNodeTest) {
+  EnvScope s(runtime_.get());
+  std::string error;
+  const int exit_code = RunRawNodeTestScript(s.env, "test-path-zero-length-strings.js", &error);
+  EXPECT_EQ(exit_code, 0) << "error=" << error;
+  EXPECT_TRUE(error.empty()) << "error=" << error;
+}
 #endif

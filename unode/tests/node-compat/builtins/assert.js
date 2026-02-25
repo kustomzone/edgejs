@@ -15,11 +15,38 @@ function strictEqual(actual, expected, message) {
   }
 }
 
+function isDeepStrictEqual(a, b) {
+  if (Object.is(a, b)) return true;
+  if (typeof a !== typeof b) return false;
+  if (a === null || b === null) return a === b;
+  if (typeof a !== 'object') return false;
+
+  const aIsArray = Array.isArray(a);
+  const bIsArray = Array.isArray(b);
+  if (aIsArray !== bIsArray) return false;
+
+  if (aIsArray) {
+    if (a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i += 1) {
+      if (!isDeepStrictEqual(a[i], b[i])) return false;
+    }
+    return true;
+  }
+
+  const aKeys = Object.keys(a);
+  const bKeys = Object.keys(b);
+  if (aKeys.length !== bKeys.length) return false;
+  for (let i = 0; i < aKeys.length; i += 1) {
+    const key = aKeys[i];
+    if (!Object.prototype.hasOwnProperty.call(b, key)) return false;
+    if (!isDeepStrictEqual(a[key], b[key])) return false;
+  }
+  return true;
+}
+
 function deepStrictEqual(actual, expected, message) {
-  const actualJson = JSON.stringify(actual);
-  const expectedJson = JSON.stringify(expected);
-  if (actualJson !== expectedJson) {
-    throw new AssertionError(message || ('Expected deep equality. actual=' + actualJson + ' expected=' + expectedJson));
+  if (!isDeepStrictEqual(actual, expected)) {
+    throw new AssertionError(message || ('Expected deep equality. actual=' + JSON.stringify(actual) + ' expected=' + JSON.stringify(expected)));
   }
 }
 
@@ -56,6 +83,9 @@ function fail(message) {
 
 function matchesExpected(err, expected) {
   if (!expected) return true;
+  if (Object.prototype.toString.call(expected) === '[object RegExp]') {
+    return expected.test(String(err));
+  }
   if (typeof expected === 'function') {
     if (expected.prototype && (expected === Error || expected.prototype instanceof Error)) {
       return err instanceof expected;
@@ -94,6 +124,15 @@ function throws(fn, expected) {
   }
   if (!thrown) {
     throw new AssertionError('Expected function to throw');
+  }
+}
+
+function match(actual, regexp, message) {
+  if (Object.prototype.toString.call(regexp) !== '[object RegExp]') {
+    throw new AssertionError('The "regexp" argument must be a RegExp');
+  }
+  if (!regexp.test(String(actual))) {
+    throw new AssertionError(message || `Expected "${String(actual)}" to match ${String(regexp)}`);
   }
 }
 
