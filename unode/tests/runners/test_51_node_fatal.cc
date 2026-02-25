@@ -19,12 +19,10 @@ TEST_F(Test51NodeFatal, FatalMessageDeath) {
         ASSERT_EQ(napi_get_global(s.env, &global), napi_ok);
         ASSERT_EQ(napi_set_named_property(s.env, global, "__tf", exports), napi_ok);
 
-        v8::Local<v8::String> source = v8::String::NewFromUtf8(
-            s.isolate, "__tf.Test()", v8::NewStringType::kNormal).ToLocalChecked();
-        v8::Local<v8::Script> script =
-            v8::Script::Compile(s.context, source).ToLocalChecked();
-        v8::MaybeLocal<v8::Value> ignored = script->Run(s.context);
-        (void)ignored;
+        napi_value script = nullptr;
+        ASSERT_EQ(napi_create_string_utf8(s.env, "__tf.Test()", NAPI_AUTO_LENGTH, &script), napi_ok);
+        napi_value result = nullptr;
+        (void)napi_run_script(s.env, script, &result);
       },
       "FATAL ERROR: test_fatal::Test fatal message");
 }
@@ -40,12 +38,10 @@ TEST_F(Test51NodeFatal, FatalStringLengthDeath) {
         ASSERT_EQ(napi_get_global(s.env, &global), napi_ok);
         ASSERT_EQ(napi_set_named_property(s.env, global, "__tf", exports), napi_ok);
 
-        v8::Local<v8::String> source = v8::String::NewFromUtf8(
-            s.isolate, "__tf.TestStringLength()", v8::NewStringType::kNormal).ToLocalChecked();
-        v8::Local<v8::Script> script =
-            v8::Script::Compile(s.context, source).ToLocalChecked();
-        v8::MaybeLocal<v8::Value> ignored = script->Run(s.context);
-        (void)ignored;
+        napi_value script = nullptr;
+        ASSERT_EQ(napi_create_string_utf8(s.env, "__tf.TestStringLength()", NAPI_AUTO_LENGTH, &script), napi_ok);
+        napi_value result = nullptr;
+        (void)napi_run_script(s.env, script, &result);
       },
       "FATAL ERROR: test_fatal::Test fatal message");
 }

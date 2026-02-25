@@ -4,6 +4,7 @@
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <vector>
 
 #include "test_env.h"
 
@@ -14,23 +15,41 @@ inline std::string ReadTextFile(const std::string& path) {
   return ss.str();
 }
 
+inline static std::string NapiValueExceptionToString(napi_env env, napi_value exception) {
+  if (exception == nullptr) return "";
+  napi_value exception_string = nullptr;
+  if (napi_coerce_to_string(env, exception, &exception_string) != napi_ok || exception_string == nullptr) {
+    return "";
+  }
+  size_t length = 0;
+  if (napi_get_value_string_utf8(env, exception_string, nullptr, 0, &length) != napi_ok) {
+    return "";
+  }
+  std::vector<char> buffer(length + 1, '\0');
+  size_t copied = 0;
+  if (napi_get_value_string_utf8(env, exception_string, buffer.data(), buffer.size(), &copied) != napi_ok) {
+    return "";
+  }
+  return std::string(buffer.data(), copied);
+}
+
 inline bool RunScript(EnvScope& s, const std::string& source_text, const char* label) {
-  v8::TryCatch tc(s.isolate);
-  v8::Local<v8::String> source =
-      v8::String::NewFromUtf8(s.isolate, source_text.c_str(), v8::NewStringType::kNormal)
-          .ToLocalChecked();
-  v8::Local<v8::Script> script;
-  if (!v8::Script::Compile(s.context, source).ToLocal(&script)) return false;
-  v8::Local<v8::Value> out;
-  if (!script->Run(s.context).ToLocal(&out)) {
-    if (tc.HasCaught()) {
-      v8::String::Utf8Value msg(s.isolate, tc.Exception());
-      ADD_FAILURE() << "JS exception (" << label << "): " << (*msg ? *msg : "<empty>");
-    }
+  napi_value script = nullptr;
+  if (napi_create_string_utf8(s.env, source_text.c_str(), NAPI_AUTO_LENGTH, &script) != napi_ok) {
     return false;
   }
-  s.isolate->PerformMicrotaskCheckpoint();
-  return true;
+  napi_value result = nullptr;
+  napi_status status = napi_run_script(s.env, script, &result);
+  if (status == napi_ok) {
+    s.isolate->PerformMicrotaskCheckpoint();
+    return true;
+  }
+  napi_value exception = nullptr;
+  if (napi_get_and_clear_last_exception(s.env, &exception) == napi_ok && exception != nullptr) {
+    std::string msg = NapiValueExceptionToString(s.env, exception);
+    ADD_FAILURE() << "JS exception (" << label << "): " << (msg.empty() ? "<empty>" : msg);
+  }
+  return false;
 }
 
 inline void ForceGcCallback(const v8::FunctionCallbackInfo<v8::Value>& info) {
