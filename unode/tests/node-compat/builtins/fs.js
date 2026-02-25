@@ -5,6 +5,29 @@ if (!binding) {
   throw new Error('fs builtin requires __unode_fs binding');
 }
 
+if (typeof globalThis.TextEncoder === 'undefined') {
+  globalThis.TextEncoder = function TextEncoder() {};
+  globalThis.TextEncoder.prototype.encode = function encode(s) {
+    const str = String(s);
+    const out = [];
+    for (let i = 0; i < str.length; i++) {
+      let c = str.charCodeAt(i);
+      if (c >= 0xd800 && c <= 0xdbff && i + 1 < str.length) {
+        const c2 = str.charCodeAt(i + 1);
+        if (c2 >= 0xdc00 && c2 <= 0xdfff) {
+          c = 0x10000 + ((c - 0xd800) << 10) + (c2 - 0xdc00);
+          i++;
+        }
+      }
+      if (c < 0x80) out.push(c);
+      else if (c < 0x800) { out.push(0xc0 | (c >> 6)); out.push(0x80 | (c & 0x3f)); }
+      else if (c < 0x10000) { out.push(0xe0 | (c >> 12)); out.push(0x80 | ((c >> 6) & 0x3f)); out.push(0x80 | (c & 0x3f)); }
+      else { out.push(0xf0 | (c >> 18)); out.push(0x80 | ((c >> 12) & 0x3f)); out.push(0x80 | ((c >> 6) & 0x3f)); out.push(0x80 | (c & 0x3f)); }
+    }
+    return new Uint8Array(out);
+  };
+}
+
 function pathTypeError(path) {
   const err = new TypeError('path must be a string, Buffer, or URL. Received ' + (path === null ? 'null' : typeof path));
   err.code = 'ERR_INVALID_ARG_TYPE';
@@ -23,6 +46,28 @@ function invalidArgTypeHelper(input) {
   return ` Received type ${typeof input} (${s.length > 25 ? s.slice(0, 25) + '...' : s})`;
 }
 
+function decodeUtf8FromBytes(view) {
+  if (typeof TextDecoder !== 'undefined') {
+    return new TextDecoder().decode(view);
+  }
+  const u8 = view.buffer ? new Uint8Array(view.buffer, view.byteOffset || 0, view.byteLength) : new Uint8Array(view);
+  let s = '';
+  for (let i = 0; i < u8.length; ) {
+    const b = u8[i++];
+    if (b < 0x80) {
+      s += String.fromCharCode(b);
+    } else if (b < 0xe0) {
+      s += String.fromCharCode(((b & 0x1f) << 6) | (u8[i++] & 0x3f));
+    } else if (b < 0xf0) {
+      s += String.fromCharCode(((b & 0x0f) << 12) | ((u8[i++] & 0x3f) << 6) | (u8[i++] & 0x3f));
+    } else {
+      const c = ((b & 0x07) << 18) | ((u8[i++] & 0x3f) << 12) | ((u8[i++] & 0x3f) << 6) | (u8[i++] & 0x3f);
+      s += c <= 0xffff ? String.fromCharCode(c) : String.fromCharCode(0xd7c0 + (c >> 10), 0xdc00 + (c & 0x3ff));
+    }
+  }
+  return s;
+}
+
 function getValidatedPath(path, argName) {
   if (path == null) {
     const type = 'of type string or an instance of Buffer or URL.' + invalidArgTypeHelper(path);
@@ -33,10 +78,10 @@ function getValidatedPath(path, argName) {
   if (typeof path === 'object' && path && path.href !== undefined) {
     path = path.pathname || path.href;
     if (typeof path === 'string' && path.startsWith('file://')) path = path.slice(7) || '/';
-  } else if (typeof path === 'object' && path && typeof path.byteLength === 'number') {
-    path = typeof TextDecoder !== 'undefined' ? new TextDecoder().decode(path) : String.fromCharCode.apply(null, new Uint8Array(path.buffer || path));
   } else if (typeof path === 'object' && path && typeof path.length === 'number' && path.toString && path.constructor && path.constructor.name === 'Buffer') {
-    path = path.toString();
+    path = path.toString('utf8');
+  } else if (typeof path === 'object' && path && typeof path.byteLength === 'number') {
+    path = decodeUtf8FromBytes(path.buffer ? new Uint8Array(path.buffer, path.byteOffset || 0, path.byteLength) : path);
   } else if (typeof path === 'object' && path) {
     const type = 'of type string or an instance of Buffer or URL.' + invalidArgTypeHelper(path);
     const err = new TypeError(argName ? `The "${argName}" argument must be ${type}` : 'path must be a string, Buffer, or URL. Received ' + typeof path);
@@ -1124,6 +1169,7 @@ function fsyncSync(fd) {
 function mkdtempSync(prefix, options) {
   options = getOptions(options, { encoding: 'utf8' });
   prefix = getValidatedPath(prefix, 'prefix');
+  prefix = String(prefix).normalize('NFC');
   return binding.mkdtemp(prefix);
 }
 
@@ -1135,6 +1181,7 @@ function mkdtemp(prefix, options, callback) {
   callback = makeCallback(callback);
   options = getOptions(options, { encoding: 'utf8' });
   prefix = getValidatedPath(prefix, 'prefix');
+  prefix = String(prefix).normalize('NFC');
   setImmediateOrSync(() => {
     try {
       const path = binding.mkdtemp(prefix);
