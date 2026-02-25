@@ -1,1 +1,1 @@
-globalThis.__phase01_value = 7;
+console.log("hello from unode");

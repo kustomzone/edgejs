@@ -5,6 +5,8 @@
 #include <string>
 #include <vector>
 
+#include "unode_node_api.h"
+
 namespace {
 
 std::string ReadTextFile(const char* path) {
@@ -106,7 +108,7 @@ std::string GetAndClearPendingException(napi_env env) {
 
 }  // namespace
 
-int UnodeRunScriptFile(napi_env env, const char* script_path, std::string* error_out) {
+int UnodeRunScriptSource(napi_env env, const char* source_text, std::string* error_out) {
   if (error_out != nullptr) {
     error_out->clear();
   }
@@ -116,16 +118,23 @@ int UnodeRunScriptFile(napi_env env, const char* script_path, std::string* error
     }
     return 1;
   }
-  const std::string source = ReadTextFile(script_path);
-  if (source.empty()) {
+  if (source_text == nullptr || source_text[0] == '\0') {
     if (error_out != nullptr) {
-      *error_out = "Failed to read script file";
+      *error_out = "Empty script source";
+    }
+    return 1;
+  }
+
+  napi_status status = UnodeInstallConsole(env);
+  if (status != napi_ok) {
+    if (error_out != nullptr) {
+      *error_out = "UnodeInstallConsole failed: " + StatusToString(status);
     }
     return 1;
   }
 
   napi_value script = nullptr;
-  napi_status status = napi_create_string_utf8(env, source.c_str(), source.size(), &script);
+  status = napi_create_string_utf8(env, source_text, NAPI_AUTO_LENGTH, &script);
   if (status != napi_ok || script == nullptr) {
     if (error_out != nullptr) {
       *error_out = "napi_create_string_utf8 failed: " + StatusToString(status);
@@ -148,4 +157,18 @@ int UnodeRunScriptFile(napi_env env, const char* script_path, std::string* error
     }
   }
   return 1;
+}
+
+int UnodeRunScriptFile(napi_env env, const char* script_path, std::string* error_out) {
+  if (error_out != nullptr) {
+    error_out->clear();
+  }
+  const std::string source = ReadTextFile(script_path);
+  if (source.empty()) {
+    if (error_out != nullptr) {
+      *error_out = "Failed to read script file";
+    }
+    return 1;
+  }
+  return UnodeRunScriptSource(env, source.c_str(), error_out);
 }

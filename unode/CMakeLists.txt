@@ -66,6 +66,7 @@ target_include_directories(unode_runtime
 target_link_libraries(unode_runtime
   PUBLIC
     napi_v8
+    unode_node_api
 )
 
 enable_testing()
