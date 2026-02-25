@@ -5,6 +5,7 @@
 
 #include "js_native_api.h"
 
+napi_status UnodeInstallConsole(napi_env env);
 int UnodeRunScriptSource(napi_env env, const char* source_text, std::string* error_out);
 int UnodeRunScriptFile(napi_env env, const char* script_path, std::string* error_out);
 
