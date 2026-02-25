@@ -7,7 +7,14 @@
 #include <libplatform/libplatform.h>
 #include <v8.h>
 
-#include "napi_v8_platform.h"
+#include "unofficial_napi.h"
+
+extern "C" {
+napi_status NAPI_CDECL unofficial_napi_create_env(v8::Local<v8::Context> context,
+                                                  int32_t module_api_version,
+                                                  napi_env* result);
+napi_status NAPI_CDECL unofficial_napi_destroy_env(napi_env env);
+}
 
 class V8Runtime {
  public:
@@ -53,13 +60,13 @@ struct EnvScope {
         handle_scope(isolate),
         context(v8::Context::New(isolate)),
         context_scope(context) {
-    EXPECT_EQ(napi_v8_create_env(context, 8, &env), napi_ok);
+    EXPECT_EQ(unofficial_napi_create_env(context, 8, &env), napi_ok);
     EXPECT_NE(env, nullptr);
   }
 
   ~EnvScope() {
     if (env != nullptr) {
-      EXPECT_EQ(napi_v8_destroy_env(env), napi_ok);
+      EXPECT_EQ(unofficial_napi_destroy_env(env), napi_ok);
       env = nullptr;
     }
   }

@@ -46,9 +46,7 @@ set(NAPI_V8_V8_EXTRA_LIBS
 
 add_library(napi_v8 STATIC
   src/js_native_api_v8.cc
-  src/napi_v8_platform.cc
-  src/unofficial_napi_v8_test_env.cc
-  src/unofficial_napi_request_gc_for_testing.cc
+  src/unofficial_napi.cc
 )
 
 target_include_directories(napi_v8
