@@ -1,5 +1,7 @@
 'use strict';
 
+// Node-compatible assert builtin. require('assert') and require('node:assert') both resolve here.
+// API subset: AssertionError, ok, strictEqual, deepStrictEqual, notStrictEqual, ifError, fail, throws, rejects.
 function AssertionError(message) {
   this.name = 'AssertionError';
   this.message = message || 'Assertion failed';

@@ -1,6 +1,6 @@
 'use strict';
 require('../common');
-const assert = require('../common/assert');
+const assert = require('assert');
 const path = require('../common/path');
 
 {

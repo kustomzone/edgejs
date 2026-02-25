@@ -86,6 +86,14 @@ int RunRawNodeTestScript(napi_env env, const char* node_test_relative_path, std:
 
 }  // namespace
 
+TEST_F(Test3NodeDropinSubsetPhase02, NodeAssertSubsetTest) {
+  EnvScope s(runtime_.get());
+  std::string error;
+  const int exit_code = RunNodeCompatScript(s.env, "parallel/test-node-assert.js", &error);
+  EXPECT_EQ(exit_code, 0) << "error=" << error;
+  EXPECT_TRUE(error.empty()) << "error=" << error;
+}
+
 TEST_F(Test3NodeDropinSubsetPhase02, RequireCacheSubsetTest) {
   EnvScope s(runtime_.get());
   std::string error;

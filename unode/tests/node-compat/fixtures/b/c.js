@@ -1,5 +1,5 @@
 const d = require('./d');
-const assert = require('../../common/assert');
+const assert = require('assert');
 const pkg = require('./package');
 
 assert.strictEqual('world', pkg.hello);
