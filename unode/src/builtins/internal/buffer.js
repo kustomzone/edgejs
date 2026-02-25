@@ -10,4 +10,4 @@ if (!globalThis.primordials) {
   globalThis.primordials = primordials;
 }
 
-module.exports = require(path.resolve(__dirname, '../../../../../node/lib/internal/buffer.js'));
+module.exports = require(path.resolve(__dirname, '../../../../node/lib/internal/buffer.js'));

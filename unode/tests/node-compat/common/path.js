@@ -1,3 +1,3 @@
 'use strict';
 
-module.exports = require('../builtins/path');
+module.exports = require('path');

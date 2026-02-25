@@ -43,6 +43,46 @@ if (typeof Buffer.isAscii === 'function') {
   };
 }
 
+function wrapGenericSearchMethod(name) {
+  const original = Buffer.prototype[name];
+  if (typeof original !== 'function') return;
+  Buffer.prototype[name] = function wrappedSearchMethod(...args) {
+    if (!Buffer.isBuffer(this) && ArrayBuffer.isView(this)) {
+      return original.apply(Buffer.from(this), args);
+    }
+    return original.apply(this, args);
+  };
+}
+
+wrapGenericSearchMethod('includes');
+
+function attachUint8ArrayAlias(name) {
+  if (typeof Buffer.prototype[name] !== 'function') return;
+  if (typeof Uint8Array.prototype[name] === 'function') return;
+  Object.defineProperty(Uint8Array.prototype, name, {
+    configurable: true,
+    writable: true,
+    value: Buffer.prototype[name],
+  });
+}
+
+[
+  'asciiSlice',
+  'base64Slice',
+  'base64urlSlice',
+  'latin1Slice',
+  'hexSlice',
+  'ucs2Slice',
+  'utf8Slice',
+  'asciiWrite',
+  'base64Write',
+  'base64urlWrite',
+  'latin1Write',
+  'hexWrite',
+  'ucs2Write',
+  'utf8Write',
+].forEach(attachUint8ArrayAlias);
+
 function validateIsEncodingInput(input) {
   const isAB = input instanceof ArrayBuffer || (typeof SharedArrayBuffer === 'function' && input instanceof SharedArrayBuffer);
   const isView = ArrayBuffer.isView(input);

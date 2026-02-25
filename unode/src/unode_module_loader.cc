@@ -213,7 +213,7 @@ static bool ResolveNodeModules(const std::string& specifier, const std::string& 
   return FindPathInNodeModules(specifier, paths, out);
 }
 
-// Resolve bare specifier (e.g. "assert", "path", "node:worker_threads") from base_dir/../builtins/<id>.js, or from
+// Resolve bare specifier (e.g. "assert", "path", "node:worker_threads") from unode/src/builtins/<id>.js, or from
 // UNODE_FALLBACK_BUILTINS_DIR when running from node/test/ (raw mode).
 // Strips "node:" prefix so node:worker_threads resolves to builtins/worker_threads.js.
 bool ResolveBuiltinPath(const std::string& specifier, const std::string& base_dir, fs::path* out) {
@@ -227,6 +227,22 @@ bool ResolveBuiltinPath(const std::string& specifier, const std::string& base_di
   const char* fallback = !g_fallback_builtins_override.empty()
                              ? g_fallback_builtins_override.c_str()
                              : std::getenv("UNODE_FALLBACK_BUILTINS_DIR");
+  static const fs::path runtime_builtins_dir =
+      fs::absolute(fs::path(__FILE__).parent_path() / "builtins").lexically_normal();
+  fs::path resolved;
+  fs::path candidate = runtime_builtins_dir / (id + ".js");
+  if (ResolveAsFile(candidate, &resolved)) {
+    *out = resolved.lexically_normal();
+    return true;
+  }
+  // Preserve Node-style relative builtin lookup for modules loaded from node/lib
+  // (e.g. internal/v8/startup_snapshot from node/lib/buffer.js).
+  const fs::path base_relative_builtins = fs::absolute(fs::path(base_dir) / ".." / "builtins").lexically_normal();
+  candidate = base_relative_builtins / (id + ".js");
+  if (ResolveAsFile(candidate, &resolved)) {
+    *out = resolved.lexically_normal();
+    return true;
+  }
   // When fallback is set, allow "internal/..." specifiers (e.g. internal/test/binding) for raw Node tests.
   // Match prefix "internal" (8 chars). Must not use "internal/" here: compare(0, 8, "internal/") compares
   // 8 chars of id with the full 9-char literal and never matches.
@@ -234,7 +250,6 @@ bool ResolveBuiltinPath(const std::string& specifier, const std::string& base_di
   if (fallback != nullptr && fallback[0] != '\0' && id.size() > 8 &&
       id.compare(0, sizeof(kInternalPrefix) - 1, kInternalPrefix) == 0) {
     fs::path fallback_path = fs::absolute(fs::path(fallback));
-    fs::path resolved;
     std::string flat;
     for (char c : id) {
       flat += (c == '/') ? '_' : c;
@@ -250,23 +265,7 @@ bool ResolveBuiltinPath(const std::string& specifier, const std::string& base_di
       return true;
     }
   }
-  // When UNODE_FALLBACK_BUILTINS_DIR is set (e.g. raw Node tests), try it first
-  // so we always load unode's builtins (fs, assert, path) instead of node's or stubs.
-  if (fallback != nullptr && fallback[0] != '\0') {
-    fs::path candidate = fs::absolute(fs::path(fallback)) / (id + ".js");
-    fs::path resolved;
-    if (ResolveAsFile(candidate, &resolved)) {
-      *out = resolved.lexically_normal();
-      return true;
-    }
-  }
-  const fs::path builtins_dir = fs::path(base_dir) / ".." / "builtins";
-  fs::path candidate = fs::absolute(builtins_dir / (id + ".js")).lexically_normal();
-  fs::path resolved;
-  if (ResolveAsFile(candidate, &resolved)) {
-    *out = resolved.lexically_normal();
-    return true;
-  }
+  // Keep fallback support for test-only shims when running raw Node tests.
   if (fallback != nullptr && fallback[0] != '\0') {
     candidate = fs::absolute(fs::path(fallback)) / (id + ".js");
     if (ResolveAsFile(candidate, &resolved)) {
