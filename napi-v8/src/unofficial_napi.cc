@@ -80,9 +80,8 @@ void ReleaseRuntime() {
 
 extern "C" {
 
-napi_status NAPI_CDECL unofficial_napi_create_env(v8::Local<v8::Context> context,
-                                                  int32_t module_api_version,
-                                                  napi_env* result) {
+napi_status NAPI_CDECL unofficial_napi_create_env_from_context(
+    v8::Local<v8::Context> context, int32_t module_api_version, napi_env* result) {
   if (result == nullptr || context.IsEmpty()) return napi_invalid_arg;
   auto* env = new (std::nothrow) napi_env__(context, module_api_version);
   if (env == nullptr) return napi_generic_failure;
@@ -90,7 +89,7 @@ napi_status NAPI_CDECL unofficial_napi_create_env(v8::Local<v8::Context> context
   return napi_ok;
 }
 
-napi_status NAPI_CDECL unofficial_napi_destroy_env(napi_env env) {
+napi_status NAPI_CDECL unofficial_napi_destroy_env_instance(napi_env env) {
   if (env == nullptr) return napi_invalid_arg;
   delete env;
   return napi_ok;
@@ -104,9 +103,9 @@ napi_status NAPI_CDECL unofficial_napi_wrap_existing_value(napi_env env,
   return (*result == nullptr) ? napi_generic_failure : napi_ok;
 }
 
-napi_status NAPI_CDECL unofficial_napi_open_env_scope(int32_t module_api_version,
-                                                      napi_env* env_out,
-                                                      void** scope_out) {
+napi_status NAPI_CDECL unofficial_napi_create_env(int32_t module_api_version,
+                                                  napi_env* env_out,
+                                                  void** scope_out) {
   if (env_out == nullptr || scope_out == nullptr) return napi_invalid_arg;
 
   v8::Isolate* isolate = nullptr;
@@ -122,7 +121,7 @@ napi_status NAPI_CDECL unofficial_napi_open_env_scope(int32_t module_api_version
   v8::Local<v8::Context> context = v8::Context::New(isolate);
   scope->context.emplace(isolate, context);
   scope->context_scope.emplace(context);
-  status = unofficial_napi_create_env(context, module_api_version, &scope->env);
+  status = unofficial_napi_create_env_from_context(context, module_api_version, &scope->env);
   if (status != napi_ok || scope->env == nullptr) {
     delete scope;
     ReleaseRuntime();
@@ -134,13 +133,13 @@ napi_status NAPI_CDECL unofficial_napi_open_env_scope(int32_t module_api_version
   return napi_ok;
 }
 
-napi_status NAPI_CDECL unofficial_napi_close_env_scope(void* scope_ptr) {
+napi_status NAPI_CDECL unofficial_napi_release_env(void* scope_ptr) {
   if (scope_ptr == nullptr) return napi_invalid_arg;
   auto* scope = static_cast<UnofficialEnvScope*>(scope_ptr);
 
   napi_status status = napi_ok;
   if (scope->env != nullptr) {
-    status = unofficial_napi_destroy_env(scope->env);
+    status = unofficial_napi_destroy_env_instance(scope->env);
     scope->env = nullptr;
   }
   delete scope;
