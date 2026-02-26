@@ -2,6 +2,7 @@
 
 const assert = require('assert');
 const childProcess = require('child_process');
+const fs = require('fs');
 try { require('internal/event_target'); } catch {}
 
 const mustCallChecks = [];
@@ -178,7 +179,24 @@ function getArrayBufferViews(buffer) {
 }
 
 function getTTYfd() {
-  return -1;
+  try {
+    const tty = require('tty');
+    const ttyFd = [1, 2, 4, 5].find((fd) => tty.isatty(fd));
+    if (ttyFd !== undefined) return ttyFd;
+    return fs.openSync('/dev/tty');
+  } catch {
+    return -1;
+  }
+}
+
+function runWithInvalidFD(func) {
+  let fd = 1 << 30;
+  try {
+    while (fs.fstatSync(fd--) && fd > 0);
+  } catch {
+    return func(fd);
+  }
+  printSkipMessage('Could not generate an invalid fd');
 }
 
 module.exports = {
@@ -209,4 +227,5 @@ module.exports = {
   spawnPromisified,
   getArrayBufferViews,
   getTTYfd,
+  runWithInvalidFD,
 };

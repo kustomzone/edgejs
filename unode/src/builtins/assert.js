@@ -188,5 +188,6 @@ assert.fail = fail;
 assert.throws = throws;
 assert.rejects = rejects;
 assert.match = match;
+assert.strict = assert;
 
 module.exports = assert;

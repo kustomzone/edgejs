@@ -263,6 +263,58 @@ function getNativeInternalBinding() {
 
 class UnodePipeStub {}
 class UnodePipeConnectWrapStub {}
+class UnodeTTYWrap {
+  constructor(fd, ctx = undefined) {
+    this.fd = Number(fd);
+    this.reading = false;
+    this._raw = false;
+    if (!Number.isInteger(this.fd) || this.fd < 0 || this.fd > 2) {
+      if (ctx && typeof ctx === 'object') {
+        ctx.errno = UV_EINVAL;
+        ctx.code = 'EINVAL';
+        ctx.message = 'invalid argument';
+        ctx.syscall = 'uv_tty_init';
+      }
+      this._initError = UV_EINVAL;
+    }
+  }
+  setBlocking() { return 0; }
+  setRawMode(flag) {
+    this._raw = !!flag;
+    return this._initError || 0;
+  }
+  getWindowSize(size) {
+    if (this._initError) return this._initError;
+    if (Array.isArray(size)) {
+      size[0] = 80;
+      size[1] = 24;
+    }
+    return 0;
+  }
+  writeBuffer(req, buffer) {
+    if (this._initError) return this._initError;
+    try {
+      const fs = require('fs');
+      fs.writeSync(this.fd, buffer);
+    } catch {}
+    if (req && typeof req.oncomplete === 'function') req.oncomplete(0, this, req);
+    return 0;
+  }
+  writeUtf8String(req, str) {
+    return this.writeBuffer(req, Buffer.from(String(str), 'utf8'));
+  }
+  writeAsciiString(req, str) {
+    return this.writeBuffer(req, Buffer.from(String(str), 'ascii'));
+  }
+  writeUcs2String(req, str) {
+    return this.writeBuffer(req, Buffer.from(String(str), 'utf16le'));
+  }
+  readStart() { this.reading = true; return 0; }
+  readStop() { this.reading = false; return 0; }
+  close(cb) { if (typeof cb === 'function') cb(); }
+  ref() {}
+  unref() {}
+}
 
 function internalBinding(name) {
   if (name === 'uv') {
@@ -597,6 +649,14 @@ function internalBinding(name) {
         if (byteLength >= 96) return true;
         kHasBackingStore.add(view);
         return false;
+      },
+    };
+  }
+  if (name === 'tty_wrap') {
+    return {
+      TTY: UnodeTTYWrap,
+      isTTY(fd) {
+        return Number.isInteger(fd) && fd >= 0 && fd <= 2;
       },
     };
   }

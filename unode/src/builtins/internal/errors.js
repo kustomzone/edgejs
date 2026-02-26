@@ -529,6 +529,25 @@ class ERR_INVALID_FD_TYPE extends TypeError {
   }
 }
 
+class ERR_INVALID_FD extends RangeError {
+  constructor(fd) {
+    super(`"fd" must be a positive integer: ${String(fd)}`);
+    this.code = 'ERR_INVALID_FD';
+  }
+}
+
+class ERR_TTY_INIT_FAILED extends Error {
+  constructor(ctx) {
+    const info = (ctx && typeof ctx === 'object') ? ctx : {};
+    const code = info.code || 'EINVAL';
+    const message = info.message || 'invalid argument';
+    super(`TTY initialization failed: uv_tty_init returned ${code} (${message})`);
+    this.name = 'SystemError';
+    this.code = 'ERR_TTY_INIT_FAILED';
+    this.info = info;
+  }
+}
+
 class ERR_SOCKET_DGRAM_IS_CONNECTED extends Error {
   constructor() {
     super('Already connected');
@@ -718,7 +737,9 @@ module.exports = {
     ERR_SOCKET_CLOSED,
     ERR_SOCKET_CLOSED_BEFORE_CONNECTION,
     ERR_SOCKET_BAD_TYPE,
+    ERR_INVALID_FD,
     ERR_INVALID_FD_TYPE,
+    ERR_TTY_INIT_FAILED,
     ERR_SOCKET_DGRAM_IS_CONNECTED,
     ERR_SOCKET_DGRAM_NOT_CONNECTED,
     ERR_SOCKET_DGRAM_NOT_RUNNING,
