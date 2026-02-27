@@ -36,12 +36,22 @@ TEST_F(Test1CliPhase01, MissingScriptArgReturnsUsageError) {
   EXPECT_EQ(error, "Usage: unode <script.js>");
 }
 
-TEST_F(Test1CliPhase01, ExtraArgsReturnUsageError) {
-  const char* argv[] = {"unode", "first.js", "second.js"};
+TEST_F(Test1CliPhase01, ExtraArgsAreForwardedToScriptArgv) {
+  const std::string script_path = WriteTempScript(
+      "unode_phase01_cli_extra_args",
+      "console.log(process.argv.slice(2).join(','));\n");
+  const char* argv[] = {"unode", script_path.c_str(), "alpha", "beta", "gamma"};
+
+  testing::internal::CaptureStdout();
   std::string error;
-  const int exit_code = UnodeRunCli(3, argv, &error);
-  EXPECT_EQ(exit_code, 1);
-  EXPECT_EQ(error, "Usage: unode <script.js>");
+  const int exit_code = UnodeRunCli(5, argv, &error);
+  const std::string stdout_output = testing::internal::GetCapturedStdout();
+
+  EXPECT_EQ(exit_code, 0) << "error=" << error;
+  EXPECT_TRUE(error.empty()) << "error=" << error;
+  EXPECT_NE(stdout_output.find("alpha,beta,gamma"), std::string::npos);
+
+  RemoveTempScript(script_path);
 }
 
 TEST_F(Test1CliPhase01, MissingScriptFileReturnsNonZero) {

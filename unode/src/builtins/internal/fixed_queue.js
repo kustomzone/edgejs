@@ -1,17 +1,4 @@
 'use strict';
 
-class FixedQueue {
-  constructor() {
-    this._list = [];
-  }
-
-  push(value) {
-    this._list.push(value);
-  }
-
-  shift() {
-    return this._list.shift();
-  }
-}
-
-module.exports = FixedQueue;
+const path = require('path');
+module.exports = require(path.resolve(__dirname, '../../../../node/lib/internal/fixed_queue.js'));

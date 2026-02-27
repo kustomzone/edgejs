@@ -2,6 +2,7 @@
 
 #include <filesystem>
 #include <string>
+#include <vector>
 
 #include "unofficial_napi.h"
 #include "unode_runtime.h"
@@ -68,11 +69,20 @@ int UnodeRunCli(int argc, const char* const* argv, std::string* error_out) {
   if (error_out != nullptr) {
     error_out->clear();
   }
-  if (argv == nullptr || argc != 2) {
+  if (argv == nullptr || argc < 2) {
+    UnodeSetScriptArgv({});
     if (error_out != nullptr) {
       *error_out = kUsage;
     }
     return 1;
   }
+  std::vector<std::string> script_argv;
+  script_argv.reserve(static_cast<size_t>(argc - 2));
+  for (int i = 2; i < argc; ++i) {
+    if (argv[i] != nullptr) {
+      script_argv.emplace_back(argv[i]);
+    }
+  }
+  UnodeSetScriptArgv(script_argv);
   return UnodeRunCliScript(argv[1], error_out);
 }

@@ -164,6 +164,13 @@ class ERR_INVALID_THIS extends TypeError {
   }
 }
 
+class ERR_ILLEGAL_CONSTRUCTOR extends TypeError {
+  constructor() {
+    super('Illegal constructor');
+    this.code = 'ERR_ILLEGAL_CONSTRUCTOR';
+  }
+}
+
 class ERR_INVALID_BUFFER_SIZE extends RangeError {
   constructor(name = '16-bits') {
     super(`Buffer size must be a multiple of ${name}`);
@@ -708,6 +715,7 @@ module.exports = {
     ERR_BUFFER_OUT_OF_BOUNDS,
     ERR_UNKNOWN_ENCODING,
     ERR_INVALID_THIS,
+    ERR_ILLEGAL_CONSTRUCTOR,
     ERR_INVALID_BUFFER_SIZE,
     ERR_FALSY_VALUE_REJECTION,
     ERR_MISSING_ARGS,

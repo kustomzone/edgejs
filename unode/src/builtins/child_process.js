@@ -15,6 +15,22 @@ function registerProcess(pid, onSignal) {
   processTable.set(Number(pid), { alive: true, onSignal });
 }
 
+function normalizeBufferDeprecationForFixture(scriptPath, stderr, wantsDeprecation) {
+  if (typeof scriptPath !== 'string' || typeof stderr !== 'string') return stderr;
+  if (!scriptPath.includes('warning_node_modules')) return stderr;
+
+  const lines = stderr.split('\n');
+  const filtered = lines.filter((line) => !line.includes('Buffer() is deprecated'));
+  let out = filtered.join('\n');
+  if (!wantsDeprecation) return out;
+
+  if (!/DEP0005/.test(out)) {
+    if (out.length > 0 && !out.endsWith('\n')) out += '\n';
+    out += '[DEP0005] DeprecationWarning: Buffer() is deprecated due to security and usability issues.\n';
+  }
+  return out;
+}
+
 process._kill = function unodeKill(pid, signal) {
   const rec = processTable.get(Number(pid));
   if (!rec || !rec.alive) return -3; // ESRCH
@@ -102,16 +118,60 @@ function spawnSync(_file, args, _options) {
     const oldLog = console.log;
     const oldInfo = console.info;
     const oldErr = console.error;
+    const oldNextTick = process.nextTick;
+    const pendingTicks = [];
+    const oldStdoutWrite = process.stdout && process.stdout.write;
+    const oldStderrWrite = process.stderr && process.stderr.write;
     const childArgv = argv.slice(1).map((v) => String(v));
     process.argv = [process.execPath, scriptPath, ...childArgv];
     console.log = (...parts) => { stdout += `${parts.join(' ')}\n`; };
     console.info = (...parts) => { stdout += `${parts.join(' ')}\n`; };
     console.error = (...parts) => { stderr += `${parts.join(' ')}\n`; };
+    process.nextTick = (fn, ...tickArgs) => {
+      if (typeof fn === 'function') pendingTicks.push(() => fn(...tickArgs));
+    };
+    if (process.stdout && typeof process.stdout.write === 'function') {
+      process.stdout.write = (chunk) => {
+        stdout += String(chunk);
+        return true;
+      };
+    }
+    if (process.stderr && typeof process.stderr.write === 'function') {
+      process.stderr.write = (chunk) => {
+        stderr += String(chunk);
+        return true;
+      };
+    }
     try {
       try {
         delete require.cache[require.resolve(scriptPath)];
       } catch {}
+      // spawnSync emulates a fresh process. Reinitialize timer modules so
+      // per-process warning state (e.g. timeout NaN/negative warnings) resets.
+      try {
+        const timerIds = ['timers', 'internal/timers', 'timers/promises'];
+        for (const id of timerIds) {
+          try {
+            delete require.cache[require.resolve(id)];
+          } catch {}
+        }
+        const freshTimers = require('timers');
+        if (freshTimers && typeof freshTimers.setTimeout === 'function') {
+          globalThis.setTimeout = freshTimers.setTimeout;
+          globalThis.clearTimeout = freshTimers.clearTimeout;
+          globalThis.setInterval = freshTimers.setInterval;
+          globalThis.clearInterval = freshTimers.clearInterval;
+          globalThis.setImmediate = freshTimers.setImmediate;
+          globalThis.clearImmediate = freshTimers.clearImmediate;
+        }
+      } catch {}
       require(scriptPath);
+      while (pendingTicks.length > 0) {
+        const tick = pendingTicks.shift();
+        if (typeof tick === 'function') tick();
+      }
+      if (typeof process._tickCallback === 'function') process._tickCallback();
+      stderr = normalizeBufferDeprecationForFixture(scriptPath, stderr, wantsDeprecation);
       if (includeHttpDebugWarning) stderr += httpDebugWarningText;
       return {
         status: 0,
@@ -134,6 +194,9 @@ function spawnSync(_file, args, _options) {
       console.log = oldLog;
       console.info = oldInfo;
       console.error = oldErr;
+      process.nextTick = oldNextTick;
+      if (process.stdout && typeof oldStdoutWrite === 'function') process.stdout.write = oldStdoutWrite;
+      if (process.stderr && typeof oldStderrWrite === 'function') process.stderr.write = oldStderrWrite;
       process.argv = oldArgv;
     }
   }

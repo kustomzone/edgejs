@@ -12,11 +12,40 @@ const UV_ENOMEM = -12;
 const UV_ENOTSOCK = -88;
 const UV_UNKNOWN = -4094;
 const UV_EAI_MEMORY = -3001;
+const kNativeTimersBinding = (typeof globalThis === 'object' && globalThis) ?
+  (globalThis.__unode_timers_binding || null) : null;
 const kHasBackingStore = new WeakSet();
-const kImmediateInfo = new Int32Array(3);
-const kTimeoutInfo = new Int32Array(1);
+const kImmediateInfo = (kNativeTimersBinding &&
+  kNativeTimersBinding.immediateInfo instanceof Int32Array &&
+  kNativeTimersBinding.immediateInfo.length >= 3) ?
+  kNativeTimersBinding.immediateInfo : new Int32Array(3);
+const kTimeoutInfo = (kNativeTimersBinding &&
+  kNativeTimersBinding.timeoutInfo instanceof Int32Array &&
+  kNativeTimersBinding.timeoutInfo.length >= 1) ?
+  kNativeTimersBinding.timeoutInfo : new Int32Array(1);
 const kTickInfo = new Int32Array(1);
 const kIsBuildingSnapshotBuffer = new Uint8Array([0]);
+const kSharedSymbolsBinding = (() => {
+  const syms = {
+    async_id_symbol: Symbol('async_id_symbol'),
+    owner_symbol: Symbol('owner_symbol'),
+    resource_symbol: Symbol('resource_symbol'),
+    trigger_async_id_symbol: Symbol('trigger_async_id_symbol'),
+  };
+  return {
+    ...syms,
+    symbols: syms,
+  };
+})();
+let kDebugTimersImmediateCalls = 0;
+function isDebugTimersJsEnabled() {
+  try {
+    return typeof process === 'object' &&
+      process && process.env && process.env.UNODE_DEBUG_TIMERS_JS === '1';
+  } catch {
+    return false;
+  }
+}
 
 // When the loader passes the native-created empty container (globalThis.__unode_primordials),
 // we fill it in place via Node's per_context primordials script so one object identity is
@@ -128,11 +157,140 @@ if (!globalThis.__unode_private_accessors_installed) {
 
 let watchdogDepth = 0;
 let watchdogPending = false;
+let timersImmediateCallback = null;
+let timersProcessTimersCallback = null;
+let timersBootstrapDone = false;
+let timersScheduledHandle = null;
+let timersImmediateHandle = null;
+let timerRefEnabled = true;
+let immediateRefEnabled = true;
 if (!globalThis.__unode_sigint_watchdog_listener_installed && typeof process?.on === 'function') {
   globalThis.__unode_sigint_watchdog_listener_installed = true;
   process.on('SIGINT', () => {
     if (watchdogDepth > 0) watchdogPending = true;
   });
+}
+
+function getNativeTimerPrimitives() {
+  return {
+    setTimeoutFn: typeof globalThis.setTimeout === 'function' ? globalThis.setTimeout.bind(globalThis) : null,
+    clearTimeoutFn: typeof globalThis.clearTimeout === 'function' ? globalThis.clearTimeout.bind(globalThis) : null,
+    setImmediateFn: typeof globalThis.setImmediate === 'function' ? globalThis.setImmediate.bind(globalThis) : null,
+    clearImmediateFn: typeof globalThis.clearImmediate === 'function' ? globalThis.clearImmediate.bind(globalThis) : null,
+    queueMicrotaskFn: typeof globalThis.queueMicrotask === 'function' ? globalThis.queueMicrotask.bind(globalThis) : null,
+  };
+}
+
+function applyHandleRefState(handle, refEnabled) {
+  if (!handle) return;
+  if (refEnabled) {
+    if (typeof handle.ref === 'function') handle.ref();
+  } else if (typeof handle.unref === 'function') {
+    handle.unref();
+  }
+}
+
+function clearScheduledTimersHandle() {
+  if (!timersScheduledHandle) return;
+  if (timersScheduledHandle && typeof timersScheduledHandle === 'object') {
+    timersScheduledHandle.__unode_cancelled = true;
+  }
+  const { clearTimeoutFn } = getNativeTimerPrimitives();
+  if (clearTimeoutFn) {
+    clearTimeoutFn(timersScheduledHandle);
+  }
+  timersScheduledHandle = null;
+}
+
+function clearScheduledImmediateHandle() {
+  if (!timersImmediateHandle) return;
+  const { clearImmediateFn, clearTimeoutFn } = getNativeTimerPrimitives();
+  if (clearImmediateFn) {
+    clearImmediateFn(timersImmediateHandle);
+  } else if (clearTimeoutFn) {
+    clearTimeoutFn(timersImmediateHandle);
+  }
+  timersImmediateHandle = null;
+}
+
+function scheduleImmediateDispatch() {
+  if (timersImmediateHandle || !timersImmediateCallback) return;
+  const dispatch = () => {
+    timersImmediateHandle = null;
+    if (typeof timersImmediateCallback !== 'function') return;
+    timersImmediateCallback();
+    if (kImmediateInfo[0] > 0) {
+      scheduleImmediateDispatch();
+    }
+  };
+  const { queueMicrotaskFn, setImmediateFn, setTimeoutFn } = getNativeTimerPrimitives();
+  if (queueMicrotaskFn) {
+    timersImmediateHandle = { __unode_microtask: true };
+    queueMicrotaskFn(dispatch);
+  } else if (setImmediateFn) {
+    timersImmediateHandle = setImmediateFn(dispatch);
+  } else if (setTimeoutFn) {
+    timersImmediateHandle = setTimeoutFn(dispatch, 0);
+  }
+  applyHandleRefState(timersImmediateHandle, immediateRefEnabled);
+}
+
+function scheduleTimersDispatch(delayMs) {
+  clearScheduledTimersHandle();
+  const safeDelay = Number.isFinite(delayMs) ? Math.max(1, Math.trunc(delayMs)) : 1;
+  const { queueMicrotaskFn, setTimeoutFn } = getNativeTimerPrimitives();
+  if (queueMicrotaskFn) {
+    const handle = { __unode_cancelled: false };
+    timersScheduledHandle = handle;
+    const target = Date.now() + safeDelay;
+    const spin = () => {
+      if (handle.__unode_cancelled || timersScheduledHandle !== handle) return;
+      if (Date.now() >= target) {
+        runTimersDispatch();
+        return;
+      }
+      queueMicrotaskFn(spin);
+    };
+    queueMicrotaskFn(spin);
+    return;
+  }
+  if (setTimeoutFn) {
+    timersScheduledHandle = setTimeoutFn(runTimersDispatch, safeDelay);
+    applyHandleRefState(timersScheduledHandle, timerRefEnabled);
+  }
+}
+
+function runTimersDispatch() {
+  timersScheduledHandle = null;
+  if (typeof timersProcessTimersCallback !== 'function') return;
+  const now = Date.now();
+  const nextExpiry = Number(timersProcessTimersCallback(now));
+  if (nextExpiry === 0 || !Number.isFinite(nextExpiry)) return;
+  const absExpiry = Math.abs(nextExpiry);
+  const delay = Math.max(1, absExpiry - Date.now());
+  timerRefEnabled = nextExpiry > 0;
+  scheduleTimersDispatch(delay);
+}
+
+function ensureTimersBootstrap() {
+  if (timersBootstrapDone) return;
+  timersBootstrapDone = true;
+  try {
+    const { setupTaskQueue } = require('internal/process/task_queues');
+    const { nextTick, runNextTicks } = setupTaskQueue();
+    if (process && typeof process === 'object') process.nextTick = nextTick;
+    const { getTimerCallbacks } = require('internal/timers');
+    const { processImmediate, processTimers } = getTimerCallbacks(runNextTicks);
+    timersImmediateCallback = processImmediate;
+    timersProcessTimersCallback = processTimers;
+    const nativeTimers = kNativeTimersBinding;
+    if (nativeTimers && typeof nativeTimers.setupTimers === 'function') {
+      nativeTimers.setupTimers(timersImmediateCallback, timersProcessTimersCallback);
+    }
+  } catch (err) {
+    timersBootstrapDone = false;
+    throw err;
+  }
 }
 
 function toStringTag(value) {
@@ -356,13 +514,87 @@ function internalBinding(name) {
     };
   }
   if (name === 'timers') {
+    const nativeTimers = kNativeTimersBinding;
     return {
       immediateInfo: kImmediateInfo,
       timeoutInfo: kTimeoutInfo,
-      toggleTimerRef() {},
-      toggleImmediateRef() {},
-      scheduleTimer() {},
+      setupTimers(processImmediate, processTimers) {
+        timersImmediateCallback = typeof processImmediate === 'function' ? processImmediate : null;
+        timersProcessTimersCallback = typeof processTimers === 'function' ? processTimers : null;
+        if (nativeTimers && typeof nativeTimers.setupTimers === 'function') {
+          const wrappedImmediate = () => {
+            kDebugTimersImmediateCalls++;
+            if (isDebugTimersJsEnabled() &&
+                (kDebugTimersImmediateCalls <= 20 || (kDebugTimersImmediateCalls % 1000) === 0)) {
+              try {
+                const m = '[unode-timers-js] before processImmediate #' +
+                  String(kDebugTimersImmediateCalls) +
+                  ' count=' + String(kImmediateInfo[0]) +
+                  ' refCount=' + String(kImmediateInfo[1]) +
+                  ' hasOutstanding=' + String(kImmediateInfo[2]);
+                if (process && typeof process._rawDebug === 'function') process._rawDebug(m);
+                else if (typeof console === 'object' && console && typeof console.error === 'function') console.error(m);
+              } catch {}
+            }
+            if (kImmediateInfo[0] === 0 && kImmediateInfo[1] === 0 && kImmediateInfo[2] === 0) {
+              if (typeof nativeTimers.toggleImmediateRef === 'function') {
+                nativeTimers.toggleImmediateRef(false);
+              }
+              return;
+            }
+            if (typeof timersImmediateCallback === 'function') timersImmediateCallback();
+            if (typeof nativeTimers.toggleImmediateRef === 'function') {
+              nativeTimers.toggleImmediateRef(kImmediateInfo[1] > 0);
+            }
+            if (isDebugTimersJsEnabled() &&
+                (kDebugTimersImmediateCalls <= 20 || (kDebugTimersImmediateCalls % 1000) === 0)) {
+              try {
+                const m = '[unode-timers-js] after processImmediate #' +
+                  String(kDebugTimersImmediateCalls) +
+                  ' count=' + String(kImmediateInfo[0]) +
+                  ' refCount=' + String(kImmediateInfo[1]) +
+                  ' hasOutstanding=' + String(kImmediateInfo[2]);
+                if (process && typeof process._rawDebug === 'function') process._rawDebug(m);
+                else if (typeof console === 'object' && console && typeof console.error === 'function') console.error(m);
+              } catch {}
+            }
+          };
+          nativeTimers.setupTimers(wrappedImmediate, timersProcessTimersCallback);
+        } else if (kImmediateInfo[0] > 0) {
+          scheduleImmediateDispatch();
+        }
+      },
+      toggleTimerRef(ref) {
+        ensureTimersBootstrap();
+        timerRefEnabled = !!ref;
+        if (nativeTimers && typeof nativeTimers.toggleTimerRef === 'function') {
+          nativeTimers.toggleTimerRef(timerRefEnabled);
+        } else {
+          applyHandleRefState(timersScheduledHandle, timerRefEnabled);
+        }
+      },
+      toggleImmediateRef(ref) {
+        ensureTimersBootstrap();
+        immediateRefEnabled = !!ref;
+        if (nativeTimers && typeof nativeTimers.toggleImmediateRef === 'function') {
+          nativeTimers.toggleImmediateRef(immediateRefEnabled);
+        } else {
+          applyHandleRefState(timersImmediateHandle, immediateRefEnabled);
+          if (kImmediateInfo[0] > 0) scheduleImmediateDispatch();
+        }
+      },
+      scheduleTimer(duration) {
+        ensureTimersBootstrap();
+        if (nativeTimers && typeof nativeTimers.scheduleTimer === 'function') {
+          nativeTimers.scheduleTimer(duration);
+        } else {
+          scheduleTimersDispatch(duration);
+        }
+      },
       getLibuvNow() {
+        if (nativeTimers && typeof nativeTimers.getLibuvNow === 'function') {
+          return nativeTimers.getLibuvNow();
+        }
         return Date.now();
       },
     };
@@ -409,16 +641,7 @@ function internalBinding(name) {
     };
   }
   if (name === 'symbols') {
-    const syms = {
-      async_id_symbol: Symbol('async_id_symbol'),
-      owner_symbol: Symbol('owner_symbol'),
-      resource_symbol: Symbol('resource_symbol'),
-      trigger_async_id_symbol: Symbol('trigger_async_id_symbol'),
-    };
-    return {
-      ...syms,
-      symbols: syms,
-    };
+    return kSharedSymbolsBinding;
   }
   if (name === 'os') return globalThis.__unode_os || {};
   if (name === 'buffer') return globalThis.__unode_buffer || {};

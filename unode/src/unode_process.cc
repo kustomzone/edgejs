@@ -631,6 +631,7 @@ napi_value ProcessAbortCallback(napi_env env, napi_callback_info info) {
 napi_status UnodeInstallProcessObject(napi_env env,
                                       const std::string& current_script_path,
                                       const std::vector<std::string>& exec_argv,
+                                      const std::vector<std::string>& script_argv,
                                       const std::string& process_title) {
   if (env == nullptr) return napi_invalid_arg;
   if (g_unode_exec_path.empty()) g_unode_exec_path = DetectExecPath();
@@ -650,7 +651,8 @@ napi_status UnodeInstallProcessObject(napi_env env,
 
   napi_value argv_arr = nullptr;
   const bool has_script_path = !current_script_path.empty();
-  status = napi_create_array_with_length(env, has_script_path ? 2 : 0, &argv_arr);
+  const size_t argv_len = has_script_path ? (2 + script_argv.size()) : 0;
+  status = napi_create_array_with_length(env, argv_len, &argv_arr);
   if (status != napi_ok || argv_arr == nullptr) return (status == napi_ok) ? napi_generic_failure : status;
   if (has_script_path) {
     napi_value exec_argv0 = nullptr;
@@ -659,6 +661,13 @@ napi_status UnodeInstallProcessObject(napi_env env,
     napi_value script_argv1 = nullptr;
     napi_create_string_utf8(env, current_script_path.c_str(), NAPI_AUTO_LENGTH, &script_argv1);
     if (script_argv1 != nullptr) napi_set_element(env, argv_arr, 1, script_argv1);
+    for (size_t i = 0; i < script_argv.size(); ++i) {
+      napi_value arg = nullptr;
+      if (napi_create_string_utf8(env, script_argv[i].c_str(), NAPI_AUTO_LENGTH, &arg) == napi_ok &&
+          arg != nullptr) {
+        napi_set_element(env, argv_arr, static_cast<uint32_t>(i + 2), arg);
+      }
+    }
   }
   status = napi_set_named_property(env, process_obj, "argv", argv_arr);
   if (status != napi_ok) return status;

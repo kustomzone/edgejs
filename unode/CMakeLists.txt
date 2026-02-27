@@ -103,6 +103,7 @@ add_library(unode_runtime STATIC
   src/unode_udp_wrap.cc
   src/unode_url.cc
   src/unode_util.cc
+  src/unode_timers_host.cc
   src/crypto/unode_crypto_binding.cc
   src/unode_crypto.cc
 )

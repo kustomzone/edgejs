@@ -32,13 +32,20 @@
 #include "unode_url.h"
 #include "unode_util.h"
 #include "unode_cares_wrap.h"
+#include "unode_timers_host.h"
 
 namespace {
 
 std::string g_unode_current_script_path;
 std::vector<std::string> g_unode_exec_argv;
 std::string g_unode_process_title;
+std::vector<std::string> g_unode_script_argv;
 const auto g_process_start_time = std::chrono::steady_clock::now();
+
+bool DebugExceptionsEnabled() {
+  const char* env = std::getenv("UNODE_DEBUG_EXCEPTIONS");
+  return env != nullptr && env[0] != '\0' && env[0] != '0';
+}
 
 std::string ReadTextFile(const char* path) {
   if (path == nullptr || path[0] == '\0') {
@@ -233,15 +240,242 @@ bool EmitProcessLifecycleEvent(napi_env env, const char* event_name, int exit_co
   return napi_call_function(env, process_obj, emit_fn, 2, args, &ignored) == napi_ok;
 }
 
+bool DispatchUncaughtException(napi_env env, napi_value exception, bool* handled_out) {
+  if (handled_out != nullptr) *handled_out = false;
+  if (exception == nullptr) return false;
+
+  napi_value global = nullptr;
+  if (napi_get_global(env, &global) != napi_ok || global == nullptr) return false;
+  bool has_process = false;
+  if (napi_has_named_property(env, global, "process", &has_process) != napi_ok || !has_process) return false;
+  napi_value process_obj = nullptr;
+  if (napi_get_named_property(env, global, "process", &process_obj) != napi_ok || process_obj == nullptr) {
+    return false;
+  }
+
+  // Prefer Node's own fatal exception pipeline when available.
+  // This preserves domain/capture/monitor semantics better than reimplementing it.
+  bool has_fatal_exception = false;
+  if (napi_has_named_property(env, process_obj, "_fatalException", &has_fatal_exception) == napi_ok &&
+      has_fatal_exception) {
+    napi_value fatal_fn = nullptr;
+    if (napi_get_named_property(env, process_obj, "_fatalException", &fatal_fn) == napi_ok &&
+        fatal_fn != nullptr) {
+      napi_valuetype fatal_type = napi_undefined;
+      if (napi_typeof(env, fatal_fn, &fatal_type) == napi_ok && fatal_type == napi_function) {
+        napi_value args[1] = {exception};
+        napi_value ret = nullptr;
+        if (napi_call_function(env, process_obj, fatal_fn, 1, args, &ret) == napi_ok &&
+            ret != nullptr) {
+          bool handled = false;
+          if (napi_get_value_bool(env, ret, &handled) == napi_ok) {
+            if (DebugExceptionsEnabled()) {
+              std::cerr << "[unode-exc] _fatalException handled="
+                        << (handled ? "true" : "false") << "\n";
+            }
+            if (handled_out != nullptr) *handled_out = handled;
+            return true;
+          }
+        }
+      }
+    }
+  }
+
+  napi_value origin = nullptr;
+  napi_create_string_utf8(env, "uncaughtException", NAPI_AUTO_LENGTH, &origin);
+
+  // Emit uncaughtExceptionMonitor first (best effort).
+  bool has_emit = false;
+  if (napi_has_named_property(env, process_obj, "emit", &has_emit) == napi_ok && has_emit) {
+    napi_value emit_fn = nullptr;
+    if (napi_get_named_property(env, process_obj, "emit", &emit_fn) == napi_ok && emit_fn != nullptr) {
+      napi_valuetype emit_type = napi_undefined;
+      if (napi_typeof(env, emit_fn, &emit_type) == napi_ok && emit_type == napi_function) {
+        napi_value monitor_name = nullptr;
+        napi_create_string_utf8(env, "uncaughtExceptionMonitor", NAPI_AUTO_LENGTH, &monitor_name);
+        napi_value monitor_args[3] = {monitor_name, exception, origin};
+        napi_value ignored = nullptr;
+        (void)napi_call_function(env, process_obj, emit_fn, 3, monitor_args, &ignored);
+      }
+    }
+  }
+
+  // Capture callback takes precedence.
+  bool handled = false;
+  // Domain error handlers should get first chance for exceptions thrown
+  // within an active domain context.
+  bool has_domain = false;
+  if (napi_has_named_property(env, process_obj, "domain", &has_domain) == napi_ok && has_domain) {
+    napi_value domain_obj = nullptr;
+    if (napi_get_named_property(env, process_obj, "domain", &domain_obj) == napi_ok &&
+        domain_obj != nullptr) {
+      napi_valuetype domain_type = napi_undefined;
+      if (napi_typeof(env, domain_obj, &domain_type) == napi_ok && domain_type == napi_object) {
+        bool has_domain_emit = false;
+        if (napi_has_named_property(env, domain_obj, "emit", &has_domain_emit) == napi_ok &&
+            has_domain_emit) {
+          napi_value domain_emit_fn = nullptr;
+          if (napi_get_named_property(env, domain_obj, "emit", &domain_emit_fn) == napi_ok &&
+              domain_emit_fn != nullptr) {
+            napi_valuetype de_type = napi_undefined;
+            if (napi_typeof(env, domain_emit_fn, &de_type) == napi_ok && de_type == napi_function) {
+              napi_value error_name = nullptr;
+              napi_create_string_utf8(env, "error", NAPI_AUTO_LENGTH, &error_name);
+              napi_value domain_args[2] = {error_name, exception};
+              napi_value domain_ret = nullptr;
+              if (napi_call_function(env, domain_obj, domain_emit_fn, 2, domain_args, &domain_ret) == napi_ok &&
+                  domain_ret != nullptr) {
+                bool emitted = false;
+                if (napi_get_value_bool(env, domain_ret, &emitted) == napi_ok && emitted) {
+                  handled = true;
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  bool has_capture_getter = false;
+  if (!handled &&
+      napi_has_named_property(env, process_obj, "__unode_get_uncaught_exception_capture_callback",
+                              &has_capture_getter) == napi_ok &&
+      has_capture_getter) {
+    napi_value getter = nullptr;
+    if (napi_get_named_property(env, process_obj, "__unode_get_uncaught_exception_capture_callback",
+                                &getter) == napi_ok &&
+        getter != nullptr) {
+      napi_valuetype getter_type = napi_undefined;
+      if (napi_typeof(env, getter, &getter_type) == napi_ok && getter_type == napi_function) {
+        napi_value cap_fn = nullptr;
+        if (napi_call_function(env, process_obj, getter, 0, nullptr, &cap_fn) == napi_ok &&
+            cap_fn != nullptr) {
+          napi_valuetype cap_type = napi_undefined;
+          if (napi_typeof(env, cap_fn, &cap_type) == napi_ok && cap_type == napi_function) {
+            napi_value args[1] = {exception};
+            napi_value ignored = nullptr;
+            if (napi_call_function(env, process_obj, cap_fn, 1, args, &ignored) == napi_ok) {
+              handled = true;
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // If no capture callback handled it, emit uncaughtException.
+  if (!handled) {
+    // Fallback for domain error routing when process.domain is not populated
+    // but the domain module still tracks an active domain.
+    napi_value global = nullptr;
+    if (napi_get_global(env, &global) == napi_ok && global != nullptr) {
+      bool has_require = false;
+      if (napi_has_named_property(env, global, "require", &has_require) == napi_ok && has_require) {
+        napi_value require_fn = nullptr;
+        if (napi_get_named_property(env, global, "require", &require_fn) == napi_ok &&
+            require_fn != nullptr) {
+          napi_valuetype require_type = napi_undefined;
+          if (napi_typeof(env, require_fn, &require_type) == napi_ok && require_type == napi_function) {
+            napi_value domain_mod_name = nullptr;
+            if (napi_create_string_utf8(env, "domain", NAPI_AUTO_LENGTH, &domain_mod_name) == napi_ok &&
+                domain_mod_name != nullptr) {
+              napi_value domain_mod = nullptr;
+              napi_value req_args[1] = {domain_mod_name};
+              if (napi_call_function(env, global, require_fn, 1, req_args, &domain_mod) == napi_ok &&
+                  domain_mod != nullptr) {
+                bool has_active = false;
+                if (napi_has_named_property(env, domain_mod, "active", &has_active) == napi_ok && has_active) {
+                  napi_value active_domain = nullptr;
+                  if (napi_get_named_property(env, domain_mod, "active", &active_domain) == napi_ok &&
+                      active_domain != nullptr) {
+                    napi_valuetype active_type = napi_undefined;
+                    if (napi_typeof(env, active_domain, &active_type) == napi_ok && active_type == napi_object) {
+                      bool has_emit = false;
+                      if (napi_has_named_property(env, active_domain, "emit", &has_emit) == napi_ok && has_emit) {
+                        napi_value emit_fn = nullptr;
+                        if (napi_get_named_property(env, active_domain, "emit", &emit_fn) == napi_ok &&
+                            emit_fn != nullptr) {
+                          napi_valuetype emit_type = napi_undefined;
+                          if (napi_typeof(env, emit_fn, &emit_type) == napi_ok && emit_type == napi_function) {
+                            napi_value error_name = nullptr;
+                            napi_create_string_utf8(env, "error", NAPI_AUTO_LENGTH, &error_name);
+                            napi_value domain_args[2] = {error_name, exception};
+                            napi_value domain_ret = nullptr;
+                            if (napi_call_function(env, active_domain, emit_fn, 2, domain_args, &domain_ret) ==
+                                    napi_ok &&
+                                domain_ret != nullptr) {
+                              bool emitted = false;
+                              if (napi_get_value_bool(env, domain_ret, &emitted) == napi_ok && emitted) {
+                                handled = true;
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  if (!handled) {
+    napi_value emit_fn = nullptr;
+    if (napi_get_named_property(env, process_obj, "emit", &emit_fn) == napi_ok && emit_fn != nullptr) {
+      napi_valuetype emit_type = napi_undefined;
+      if (napi_typeof(env, emit_fn, &emit_type) == napi_ok && emit_type == napi_function) {
+        napi_value ue_name = nullptr;
+        napi_create_string_utf8(env, "uncaughtException", NAPI_AUTO_LENGTH, &ue_name);
+        napi_value ue_args[3] = {ue_name, exception, origin};
+        napi_value emit_ret = nullptr;
+        if (napi_call_function(env, process_obj, emit_fn, 3, ue_args, &emit_ret) == napi_ok &&
+            emit_ret != nullptr) {
+          bool emitted = false;
+          if (napi_get_value_bool(env, emit_ret, &emitted) == napi_ok && emitted) {
+            handled = true;
+          }
+        }
+      }
+    }
+  }
+
+  if (DebugExceptionsEnabled()) {
+    std::cerr << "[unode-exc] DispatchUncaughtException handled=" << (handled ? "true" : "false") << "\n";
+  }
+  if (handled_out != nullptr) *handled_out = handled;
+  return true;
+}
+
 int HandlePendingExceptionAfterLoopStep(napi_env env, std::string* error_out) {
   bool has_pending = false;
   if (napi_is_exception_pending(env, &has_pending) != napi_ok || !has_pending) {
     return -1;
   }
+
+  napi_value exception = nullptr;
+  if (napi_get_and_clear_last_exception(env, &exception) != napi_ok || exception == nullptr) {
+    if (error_out != nullptr) *error_out = "Unhandled async exception";
+    return 1;
+  }
+
   bool is_process_exit = false;
   int process_exit_code = 1;
-  const std::string exception_message =
-      GetAndClearPendingException(env, &is_process_exit, &process_exit_code);
+  bool has_exit_code = false;
+  if (napi_has_named_property(env, exception, "__unodeExitCode", &has_exit_code) == napi_ok && has_exit_code) {
+    napi_value exit_code_value = nullptr;
+    int32_t code = 1;
+    if (napi_get_named_property(env, exception, "__unodeExitCode", &exit_code_value) == napi_ok &&
+        exit_code_value != nullptr &&
+        napi_get_value_int32(env, exit_code_value, &code) == napi_ok) {
+      is_process_exit = true;
+      process_exit_code = code;
+    }
+  }
   if (is_process_exit) {
     if (error_out != nullptr) {
       error_out->clear();
@@ -250,6 +484,28 @@ int HandlePendingExceptionAfterLoopStep(napi_env env, std::string* error_out) {
       }
     }
     return process_exit_code;
+  }
+
+  bool handled = false;
+  (void)DispatchUncaughtException(env, exception, &handled);
+  if (handled) {
+    if (DebugExceptionsEnabled()) {
+      std::cerr << "[unode-exc] handled async exception, continue loop\n";
+    }
+    return -1;
+  }
+
+  std::string exception_message;
+  napi_value exception_string = nullptr;
+  if (napi_coerce_to_string(env, exception, &exception_string) == napi_ok && exception_string != nullptr) {
+    size_t length = 0;
+    if (napi_get_value_string_utf8(env, exception_string, nullptr, 0, &length) == napi_ok) {
+      std::vector<char> buffer(length + 1, '\0');
+      size_t copied = 0;
+      if (napi_get_value_string_utf8(env, exception_string, buffer.data(), buffer.size(), &copied) == napi_ok) {
+        exception_message.assign(buffer.data(), copied);
+      }
+    }
   }
   if (error_out != nullptr) {
     *error_out = exception_message.empty() ? "Unhandled async exception" : exception_message;
@@ -410,7 +666,7 @@ int RunScriptWithGlobals(napi_env env,
   ParseNodeStyleFlagsFromSource(source_text);
 
   napi_status status = UnodeInstallProcessObject(
-      env, g_unode_current_script_path, g_unode_exec_argv, g_unode_process_title);
+      env, g_unode_current_script_path, g_unode_exec_argv, g_unode_script_argv, g_unode_process_title);
   if (status != napi_ok) {
     if (error_out != nullptr) {
       *error_out = "UnodeInstallProcessObject failed: " + StatusToString(status);
@@ -441,6 +697,7 @@ int RunScriptWithGlobals(napi_env env,
   ClearPendingExceptionIfAny(env);
   UnodeInstallUrlBinding(env);
   UnodeInstallUtilBinding(env);
+  UnodeInstallTimersHostBinding(env);
   UnodeInstallCryptoBinding(env);
   ClearPendingExceptionIfAny(env);
   status = UnodeInstallModuleLoader(env, entry_script_path);
@@ -481,7 +738,7 @@ int RunScriptWithGlobals(napi_env env,
       "    else invoke();"
       "  };"
       "}"
-      "if (typeof process.emitWarning !== 'function') {"
+      "if (true) {"
       "  process.emitWarning = function(warning, type, code, ctor){"
       "    var makeTypeErr = function(){"
       "      var e = new TypeError('The \"warning\" argument must be of type string or an instance of Error.');"
@@ -526,7 +783,7 @@ int RunScriptWithGlobals(napi_env env,
       "    if (code !== undefined) w.code = code;"
       "    if (detail !== undefined) w.detail = detail;"
       "    if (w && w.name === 'DeprecationWarning' && process.noDeprecation === true) return;"
-      "    if (typeof process.emit === 'function') process.emit('warning', w);"
+      "    process.nextTick(function(){ if (typeof process.emit === 'function') process.emit('warning', w); });"
       "    var text = String((w && w.name) || 'Warning') + ': ' + String((w && w.message) || '');"
       "    process.nextTick(function(){ if (process.stderr && typeof process.stderr.write === 'function') process.stderr.write(text + '\\n'); });"
       "  };"
@@ -569,7 +826,7 @@ int RunScriptWithGlobals(napi_env env,
       "    return Array.isArray(globalThis.__unode_active_requests) ? globalThis.__unode_active_requests.slice() : [];"
       "  };"
       "}"
-      "if (!globalThis.__unode_resource_tracking_installed) {"
+      "(function(){ if (!globalThis.__unode_resource_tracking_installed) {"
       "  globalThis.__unode_resource_tracking_installed = true;"
       "  var __activeResources = globalThis.__unode_active_resources;"
       "  if (!(__activeResources && typeof __activeResources.set === 'function')) {"
@@ -588,7 +845,7 @@ int RunScriptWithGlobals(napi_env env,
       "      var h;"
       "      var wrapped = function(){"
       "        __activeResources.delete(h);"
-      "        if (typeof cb === 'function') return cb.apply(this, arguments);"
+      "        if (typeof cb === 'function') return Reflect.apply(cb, this, arguments);"
       "      };"
       "      h = __nativeSetTimeout.apply(globalThis, [wrapped, ms].concat(args));"
       "      __activeResources.set(h, 'Timeout');"
@@ -615,7 +872,7 @@ int RunScriptWithGlobals(napi_env env,
       "      var h;"
       "      var wrapped = function(){"
       "        __activeResources.delete(h);"
-      "        if (typeof cb === 'function') return cb.apply(this, arguments);"
+      "        if (typeof cb === 'function') return Reflect.apply(cb, this, arguments);"
       "      };"
       "      h = __nativeSetImmediate.apply(globalThis, [wrapped].concat(args));"
       "      __activeResources.set(h, 'Immediate');"
@@ -625,7 +882,7 @@ int RunScriptWithGlobals(napi_env env,
       "  if (typeof __nativeClearImmediate === 'function') {"
       "    globalThis.clearImmediate = function(h){ __activeResources.delete(h); return __nativeClearImmediate(h); };"
       "  }"
-      "}"
+      "  }})();"
       "if (typeof process.getActiveResourcesInfo !== 'function') {"
       "  process.getActiveResourcesInfo = function(){"
       "    var out = [];"
@@ -1073,22 +1330,15 @@ int RunScriptWithGlobals(napi_env env,
       "    }"
       "  };"
       "}"
-      "if (typeof globalThis.setTimeout === 'undefined' ||"
-      "    typeof globalThis.clearTimeout === 'undefined' ||"
-      "    typeof globalThis.setInterval === 'undefined' ||"
-      "    typeof globalThis.clearInterval === 'undefined' ||"
-      "    typeof globalThis.setImmediate === 'undefined' ||"
-      "    typeof globalThis.clearImmediate === 'undefined') {"
-      "  try {"
-      "    var __timers = require('timers');"
-      "    if (typeof globalThis.setTimeout === 'undefined') globalThis.setTimeout = __timers.setTimeout;"
-      "    if (typeof globalThis.clearTimeout === 'undefined') globalThis.clearTimeout = __timers.clearTimeout;"
-      "    if (typeof globalThis.setInterval === 'undefined') globalThis.setInterval = __timers.setInterval;"
-      "    if (typeof globalThis.clearInterval === 'undefined') globalThis.clearInterval = __timers.clearInterval;"
-      "    if (typeof globalThis.setImmediate === 'undefined') globalThis.setImmediate = __timers.setImmediate;"
-      "    if (typeof globalThis.clearImmediate === 'undefined') globalThis.clearImmediate = __timers.clearImmediate;"
-      "  } catch (_) {}"
-      "}"
+      "try {"
+      "  var __timers = require('timers');"
+      "  globalThis.setTimeout = __timers.setTimeout;"
+      "  globalThis.clearTimeout = __timers.clearTimeout;"
+      "  globalThis.setInterval = __timers.setInterval;"
+      "  globalThis.clearInterval = __timers.clearInterval;"
+      "  globalThis.setImmediate = __timers.setImmediate;"
+      "  globalThis.clearImmediate = __timers.clearImmediate;"
+      "} catch (_) {}"
       "if (typeof globalThis.setImmediate === 'undefined') {"
       "  globalThis.setImmediate = function(f) {"
       "    var args = Array.prototype.slice.call(arguments, 1);"
@@ -1111,7 +1361,7 @@ int RunScriptWithGlobals(napi_env env,
       "if (typeof globalThis.clearTimeout === 'undefined') {"
       "  globalThis.clearTimeout = function() {};"
       "}"
-      "if (!globalThis.__unode_resource_tracking_ready) {"
+      "(function(){ if (!globalThis.__unode_resource_tracking_ready) {"
       "  var __ar = globalThis.__unode_active_resources;"
       "  if (!(__ar && typeof __ar.set === 'function')) {"
       "    __ar = new Map();"
@@ -1127,7 +1377,7 @@ int RunScriptWithGlobals(napi_env env,
       "    globalThis.setTimeout = function(cb, ms){"
       "      var args = Array.prototype.slice.call(arguments, 2);"
       "      var h;"
-      "      var wrapped = function(){ __ar.delete(h); if (typeof cb === 'function') return cb.apply(this, arguments); };"
+      "      var wrapped = function(){ __ar.delete(h); if (typeof cb === 'function') return Reflect.apply(cb, this, arguments); };"
       "      h = __st.apply(globalThis, [wrapped, ms].concat(args));"
       "      __ar.set(h, 'Timeout');"
       "      return h;"
@@ -1147,7 +1397,7 @@ int RunScriptWithGlobals(napi_env env,
       "    globalThis.setImmediate = function(cb){"
       "      var args = Array.prototype.slice.call(arguments, 1);"
       "      var h;"
-      "      var wrapped = function(){ __ar.delete(h); if (typeof cb === 'function') return cb.apply(this, arguments); };"
+      "      var wrapped = function(){ __ar.delete(h); if (typeof cb === 'function') return Reflect.apply(cb, this, arguments); };"
       "      h = __sim.apply(globalThis, [wrapped].concat(args));"
       "      __ar.set(h, 'Immediate');"
       "      return h;"
@@ -1155,7 +1405,7 @@ int RunScriptWithGlobals(napi_env env,
       "  }"
       "  if (typeof __cim === 'function') globalThis.clearImmediate = function(h){ __ar.delete(h); return __cim(h); };"
       "  globalThis.__unode_resource_tracking_ready = true;"
-      "}"
+      "  }})();"
       "if (typeof globalThis.queueMicrotask === 'undefined') {"
       "  globalThis.queueMicrotask = function(f) { if (typeof f === 'function') f(); };"
       "}"
@@ -1789,4 +2039,8 @@ int UnodeRunScriptFileWithLoop(napi_env env,
 
 int UnodeRunScriptFile(napi_env env, const char* script_path, std::string* error_out) {
   return UnodeRunScriptFileWithLoop(env, script_path, error_out, false);
+}
+
+void UnodeSetScriptArgv(const std::vector<std::string>& script_argv) {
+  g_unode_script_argv = script_argv;
 }
