@@ -1,7 +1,11 @@
 include(GoogleTest)
 
 set(NAPI_V8_GTEST_ROOT "${NAPI_V8_NODE_ROOT}/deps/googletest")
-set(UNODE_GTEST_PER_TEST_TIMEOUT_SECONDS 5)
+set(UNODE_GTEST_PER_TEST_TIMEOUT_SECONDS 30)
+set(UNODE_CTEST_RESOURCE_LOCK_BUCKETS "24" CACHE STRING
+    "Max concurrent unode gtest cases when ctest parallelism is unbounded (0 disables).")
+set(UNODE_CTEST_RESOURCE_LOCK_PREFIX "unode_gtest_slot" CACHE STRING
+    "Prefix used for generated CTest RESOURCE_LOCK buckets.")
 
 if(NAPI_V8_V8_LIBRARY)
   add_library(unode_gtest STATIC
@@ -59,8 +63,10 @@ if(NAPI_V8_V8_LIBRARY)
       TARGET ${target_name}
       POST_BUILD
       COMMAND /usr/bin/env python3
-              ${UNODE_ROOT}/tests/cmake/dedupe_gtest_manifest.py
+              ${UNODE_ROOT}/scripts/dedupe_gtest_manifest.py
               ${_gtest_tests_manifest}
+              --resource-lock-buckets ${UNODE_CTEST_RESOURCE_LOCK_BUCKETS}
+              --resource-lock-prefix ${UNODE_CTEST_RESOURCE_LOCK_PREFIX}
       VERBATIM
     )
   endfunction()

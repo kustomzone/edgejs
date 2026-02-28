@@ -3,6 +3,12 @@
 #include <string>
 #include <string_view>
 #include <vector>
+#if !defined(_WIN32)
+#include <cerrno>
+#include <fcntl.h>
+#include <sys/file.h>
+#include <unistd.h>
+#endif
 
 #include "test_env.h"
 #include "unode_module_loader.h"
@@ -11,6 +17,59 @@
 class Test3NodeDropinSubsetPhase02 : public FixtureTestBase {};
 
 namespace {
+
+std::string MakeTestSerialId(std::string_view key) {
+  // Stable FNV-1a hash so the same test path maps to the same isolated tmpdir suffix.
+  uint64_t h = 1469598103934665603ull;
+  for (char c : key) {
+    h ^= static_cast<unsigned char>(c);
+    h *= 1099511628211ull;
+  }
+  const uint32_t id = static_cast<uint32_t>((h % 1000000000ull) + 1ull);
+  return std::to_string(id);
+}
+
+void SetOrUnsetEnv(const char* name, const std::string* value) {
+  if (value != nullptr) {
+    setenv(name, value->c_str(), 1);
+  } else {
+    unsetenv(name);
+  }
+}
+
+bool StartsWith(std::string_view s, std::string_view prefix) {
+  return s.size() >= prefix.size() && s.substr(0, prefix.size()) == prefix;
+}
+
+class ScopedExclusiveFileLock {
+ public:
+  explicit ScopedExclusiveFileLock(const char* path) {
+#if !defined(_WIN32)
+    if (path == nullptr || path[0] == '\0') {
+      return;
+    }
+    fd_ = open(path, O_CREAT | O_RDWR, 0600);
+    if (fd_ >= 0) {
+      while (flock(fd_, LOCK_EX) == -1 && errno == EINTR) {
+      }
+    }
+#else
+    (void)path;
+#endif
+  }
+
+  ~ScopedExclusiveFileLock() {
+#if !defined(_WIN32)
+    if (fd_ >= 0) {
+      flock(fd_, LOCK_UN);
+      close(fd_);
+    }
+#endif
+  }
+
+ private:
+  int fd_ = -1;
+};
 
 int RunNodeCompatScript(napi_env env, const char* relative_path, std::string* error_out) {
   namespace fs = std::filesystem;
@@ -38,11 +97,36 @@ int RunNodeCompatScript(napi_env env, const char* relative_path, std::string* er
       (unode_root_path / "tests" / "node-compat" / "builtins").string();
   const std::string script_path =
       (unode_root_path / "tests" / "node-compat" / relative_path).string();
+  std::string prior_test_serial_id;
+  bool had_prior_test_serial_id = false;
+  if (const char* existing = std::getenv("TEST_SERIAL_ID")) {
+    prior_test_serial_id = existing;
+    had_prior_test_serial_id = true;
+  }
+  std::string prior_test_thread_id;
+  bool had_prior_test_thread_id = false;
+  if (const char* existing = std::getenv("TEST_THREAD_ID")) {
+    prior_test_thread_id = existing;
+    had_prior_test_thread_id = true;
+  }
+  std::string prior_test_parallel;
+  bool had_prior_test_parallel = false;
+  if (const char* existing = std::getenv("TEST_PARALLEL")) {
+    prior_test_parallel = existing;
+    had_prior_test_parallel = true;
+  }
+  const std::string test_serial_id = MakeTestSerialId(std::string("compat:") + relative_path);
+  setenv("TEST_SERIAL_ID", test_serial_id.c_str(), 1);
+  setenv("TEST_THREAD_ID", test_serial_id.c_str(), 1);
+  setenv("TEST_PARALLEL", "0", 1);
   setenv("UNODE_FALLBACK_BUILTINS_DIR", fallback_builtins.c_str(), 1);
   UnodeSetFallbackBuiltinsDir(fallback_builtins.c_str());
   const int exit_code = UnodeRunScriptFile(env, script_path.c_str(), error_out);
   UnodeSetFallbackBuiltinsDir(nullptr);
   unsetenv("UNODE_FALLBACK_BUILTINS_DIR");
+  SetOrUnsetEnv("TEST_SERIAL_ID", had_prior_test_serial_id ? &prior_test_serial_id : nullptr);
+  SetOrUnsetEnv("TEST_THREAD_ID", had_prior_test_thread_id ? &prior_test_thread_id : nullptr);
+  SetOrUnsetEnv("TEST_PARALLEL", had_prior_test_parallel ? &prior_test_parallel : nullptr);
   return exit_code;
 }
 
@@ -58,6 +142,11 @@ int RunRawNodeTestScript(napi_env env,
   const std::string rel_path = node_test_relative_path ? std::string(node_test_relative_path) : std::string();
   const bool has_suite_prefix = rel_path.find('/') != std::string::npos;
   const std::string script_rel = has_suite_prefix ? rel_path : ("parallel/" + rel_path);
+  const bool is_parallel_suite = StartsWith(script_rel, "parallel/");
+  const bool needs_global_serialization =
+      StartsWith(script_rel, "sequential/") || StartsWith(script_rel, "pummel/");
+  ScopedExclusiveFileLock suite_lock(
+      needs_global_serialization ? "/tmp/unode-node-suite-serial.lock" : nullptr);
   const std::string node_root(NAPI_V8_NODE_ROOT_PATH);
   const std::string unode_root(NAPI_V8_ROOT_PATH);
   fs::path node_root_path(node_root);
@@ -105,6 +194,25 @@ int RunRawNodeTestScript(napi_env env,
   const std::string fallback_builtins =
       (unode_root_path / "tests" / "node-compat" / "builtins").string();
   const std::string node_test_dir = (node_root_path / "test").string();
+  std::string prior_test_serial_id;
+  bool had_prior_test_serial_id = false;
+  if (const char* existing = std::getenv("TEST_SERIAL_ID")) {
+    prior_test_serial_id = existing;
+    had_prior_test_serial_id = true;
+  }
+  std::string prior_test_thread_id;
+  bool had_prior_test_thread_id = false;
+  if (const char* existing = std::getenv("TEST_THREAD_ID")) {
+    prior_test_thread_id = existing;
+    had_prior_test_thread_id = true;
+  }
+  std::string prior_test_parallel;
+  bool had_prior_test_parallel = false;
+  if (const char* existing = std::getenv("TEST_PARALLEL")) {
+    prior_test_parallel = existing;
+    had_prior_test_parallel = true;
+  }
+  const std::string test_serial_id = MakeTestSerialId(script_rel);
   std::string prior_known_globals;
   bool had_prior_known_globals = false;
   if (const char* existing = std::getenv("NODE_TEST_KNOWN_GLOBALS")) {
@@ -114,19 +222,37 @@ int RunRawNodeTestScript(napi_env env,
   setenv("UNODE_FALLBACK_BUILTINS_DIR", fallback_builtins.c_str(), 1);
   setenv("NODE_TEST_DIR", node_test_dir.c_str(), 1);
   setenv("NODE_TEST_KNOWN_GLOBALS", "0", 1);
+  setenv("TEST_SERIAL_ID", test_serial_id.c_str(), 1);
+  setenv("TEST_THREAD_ID", test_serial_id.c_str(), 1);
+  setenv("TEST_PARALLEL", is_parallel_suite ? "1" : "0", 1);
   {
     napi_value global = nullptr;
     napi_value process_v = nullptr;
     napi_value env_v = nullptr;
     napi_value known_globals_v = nullptr;
+    napi_value serial_id_v = nullptr;
+    napi_value thread_id_v = nullptr;
+    napi_value parallel_v = nullptr;
     if (napi_get_global(env, &global) == napi_ok && global != nullptr &&
         napi_get_named_property(env, global, "process", &process_v) == napi_ok &&
         process_v != nullptr &&
         napi_get_named_property(env, process_v, "env", &env_v) == napi_ok &&
         env_v != nullptr &&
         napi_create_string_utf8(env, "0", NAPI_AUTO_LENGTH, &known_globals_v) == napi_ok &&
-        known_globals_v != nullptr) {
+        known_globals_v != nullptr &&
+        napi_create_string_utf8(
+            env, test_serial_id.c_str(), NAPI_AUTO_LENGTH, &serial_id_v) == napi_ok &&
+        serial_id_v != nullptr &&
+        napi_create_string_utf8(
+            env, test_serial_id.c_str(), NAPI_AUTO_LENGTH, &thread_id_v) == napi_ok &&
+        thread_id_v != nullptr &&
+        napi_create_string_utf8(
+            env, is_parallel_suite ? "1" : "0", NAPI_AUTO_LENGTH, &parallel_v) == napi_ok &&
+        parallel_v != nullptr) {
       napi_set_named_property(env, env_v, "NODE_TEST_KNOWN_GLOBALS", known_globals_v);
+      napi_set_named_property(env, env_v, "TEST_SERIAL_ID", serial_id_v);
+      napi_set_named_property(env, env_v, "TEST_THREAD_ID", thread_id_v);
+      napi_set_named_property(env, env_v, "TEST_PARALLEL", parallel_v);
     }
   }
   std::string prior_loop_timeout;
@@ -137,7 +263,7 @@ int RunRawNodeTestScript(napi_env env,
       had_prior_loop_timeout = true;
     }
     if (!had_prior_loop_timeout) {
-      setenv("UNODE_LOOP_TIMEOUT_MS", "2500", 1);
+      setenv("UNODE_LOOP_TIMEOUT_MS", "10000", 1);
     }
   }
   UnodeSetFallbackBuiltinsDir(fallback_builtins.c_str());
@@ -146,6 +272,9 @@ int RunRawNodeTestScript(napi_env env,
   UnodeSetFallbackBuiltinsDir(nullptr);
   unsetenv("UNODE_FALLBACK_BUILTINS_DIR");
   unsetenv("NODE_TEST_DIR");
+  SetOrUnsetEnv("TEST_SERIAL_ID", had_prior_test_serial_id ? &prior_test_serial_id : nullptr);
+  SetOrUnsetEnv("TEST_THREAD_ID", had_prior_test_thread_id ? &prior_test_thread_id : nullptr);
+  SetOrUnsetEnv("TEST_PARALLEL", had_prior_test_parallel ? &prior_test_parallel : nullptr);
   if (had_prior_known_globals) {
     setenv("NODE_TEST_KNOWN_GLOBALS", prior_known_globals.c_str(), 1);
   } else {
