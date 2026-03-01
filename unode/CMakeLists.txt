@@ -16,6 +16,20 @@ set(NAPI_V8_NODE_ROOT
   "${NAPI_V8_NODE_ROOT_DEFAULT}"
   CACHE PATH "Path to Node source root (for raw Node tests/fixtures)"
 )
+option(UNODE_EXTERNAL_NAPI_V8
+  "Treat napi-v8 as an external dependency (do not build/bundle it in this tree)"
+  OFF
+)
+option(UNODE_ALLOW_UNDEFINED_IMPORTS
+  "Allow undefined imports at link time (useful for external runtime deps in wasm/wasix)"
+  OFF
+)
+
+if(CMAKE_SYSTEM_NAME MATCHES "WASI|WASIX" OR
+   CMAKE_C_COMPILER MATCHES "wasixcc" OR
+   CMAKE_CXX_COMPILER MATCHES "wasixcc\\+\\+")
+  set(UNODE_ALLOW_UNDEFINED_IMPORTS ON CACHE BOOL "" FORCE)
+endif()
 
 # Hard gate: unode runtime/library sources must never directly reference V8.
 file(GLOB_RECURSE UNODE_PURE_SRC_FILES
@@ -35,8 +49,13 @@ foreach(UNODE_CODE_FILE IN LISTS UNODE_PURE_SRC_FILES)
 endforeach()
 
 # Build napi-v8 runtime only; node-api logic is owned by unode.
-set(NAPI_V8_BUILD_TESTS OFF CACHE BOOL "" FORCE)
-add_subdirectory("${NAPI_V8_ROOT}" "${CMAKE_CURRENT_BINARY_DIR}/napi-v8")
+if(NOT UNODE_EXTERNAL_NAPI_V8)
+  set(NAPI_V8_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+  add_subdirectory("${NAPI_V8_ROOT}" "${CMAKE_CURRENT_BINARY_DIR}/napi-v8")
+else()
+  add_library(napi_v8 INTERFACE)
+  target_include_directories(napi_v8 INTERFACE "${NAPI_V8_ROOT}/include")
+endif()
 
 # Use Node's bundled libuv (same as Node) for consistent behavior (e.g. mkdtemp).
 set(LIBUV_BUILD_SHARED OFF CACHE BOOL "" FORCE)
@@ -169,6 +188,12 @@ if(UNODE_BUILD_CLI)
   )
   if(NAPI_V8_V8_DEFINES)
     target_compile_definitions(unode PRIVATE ${NAPI_V8_V8_DEFINES})
+  endif()
+  if(UNODE_ALLOW_UNDEFINED_IMPORTS)
+    target_link_options(unode PRIVATE
+      "-Wl,--allow-undefined"
+      "-Wl,--import-undefined"
+    )
   endif()
 endif()
 
