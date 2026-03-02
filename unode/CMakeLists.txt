@@ -82,7 +82,7 @@ target_link_libraries(unode_ncrypto
 )
 
 add_library(unode_simdutf STATIC
-  "${PROJECT_ROOT}/deps/v8/third_party/simdutf/simdutf.cpp"
+  "${PROJECT_ROOT}/deps/simdutf/simdutf.cpp"
 )
 add_library(unode_ada STATIC
   "${PROJECT_ROOT}/deps/ada/ada.cpp"
@@ -94,7 +94,7 @@ target_include_directories(unode_ada
 
 target_include_directories(unode_simdutf
   PUBLIC
-    "${PROJECT_ROOT}/deps/v8/third_party/simdutf"
+    "${PROJECT_ROOT}/deps/simdutf"
 )
 
 target_include_directories(unode_node_api

@@ -5,3 +5,5 @@
 .DS_Store
 /unode/tests/cmake
 /Testing
+/napi/target
+/napi/wasmer/target
