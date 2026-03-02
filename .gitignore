@@ -1,9 +1,10 @@
 /unode/build*
 /build*
-/napi-v8/build*
+/napi/v8/build*
 /unode/Testing
 .DS_Store
 /unode/tests/cmake
 /Testing
 /napi/target
 /napi/wasmer/target
+/napi/cmake

@@ -2,12 +2,12 @@
 
 `unode` is a runtime project that aims to replace Node.js while keeping N-API as
 the core boundary. Unlike Node internals that integrate directly with V8 in many
-paths, `unode` system bindings should be implemented through `napi-v8` APIs.
+paths, `unode` system bindings should be implemented through `napi/v8` APIs.
 
 ## Mission
 
 - Build a Node-compatible runtime architecture centered on N-API contracts.
-- Keep engine-specific details isolated behind `napi-v8`.
+- Keep engine-specific details isolated behind `napi/v8`.
 - Implement system/runtime bindings as N-API modules instead of direct V8 code.
 - Advance in small, test-validated milestones.
 
@@ -21,7 +21,7 @@ paths, `unode` system bindings should be implemented through `napi-v8` APIs.
 - Hard boundary: files under `unode/src` must never include V8 headers
   (`v8.h`, `libplatform/libplatform.h`) or use `v8::` symbols.
 - Host/bootstrap code that requires V8 must live outside `unode/src` (for
-  example, under `napi-v8`), while `unode/src` remains N-API/Node-API only.
+  example, under `napi/v8`), while `unode/src` remains N-API/Node-API only.
 
 ## Non-Goals (for early phases)
 
@@ -34,7 +34,7 @@ paths, `unode` system bindings should be implemented through `napi-v8` APIs.
 - **Runtime kernel**: process/bootstrap/module-loader/event-loop orchestration.
 - **Binding layer**: system features exposed as N-API addons (backed by libuv,
   filesystem/network/process primitives).
-- **Engine adapter**: `napi-v8` as the only JS engine integration surface.
+- **Engine adapter**: `napi/v8` as the only JS engine integration surface.
 - **Compatibility layer**: incremental behavior alignment with Node semantics.
 
 ## Roadmap Summary
@@ -42,7 +42,7 @@ paths, `unode` system bindings should be implemented through `napi-v8` APIs.
 Detailed milestones and test gates are in `unode/ROADMAP.md`.
 
 1. **Bootstrap**
-   - `unode` executable that creates an environment through `napi-v8`.
+   - `unode` executable that creates an environment through `napi/v8`.
    - Run/evaluate JS entry scripts.
 2. **Minimal runtime primitives**
    - Implement foundational bindings (`process`, timers, console, basic module

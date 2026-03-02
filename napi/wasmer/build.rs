@@ -5,9 +5,9 @@ fn main() {
         .parent()
         .unwrap();
 
-    // napi-v8 paths
-    let napi_v8_dir = project_root.join("napi-v8");
-    let napi_v8_include = napi_v8_dir.join("include");
+    // napi/v8 paths
+    let napi_v8_dir = project_root.join("napi/v8");
+    let napi_include = project_root.join("napi/include");
     let napi_v8_src = napi_v8_dir.join("src");
 
     // V8 paths
@@ -16,7 +16,7 @@ fn main() {
     let v8_include = std::env::var("V8_INCLUDE_DIR").unwrap_or(default_v8_include);
     let v8_lib = std::env::var("V8_LIB_DIR").unwrap_or(default_v8_lib);
 
-    // Compile the napi-v8 sources + bridge into a single static library
+    // Compile the napi/v8 sources + bridge into a single static library
     cc::Build::new()
         .cpp(true)
         .flag_if_supported("-std=c++20")
@@ -26,7 +26,7 @@ fn main() {
         .define("V8_31BIT_SMIS_ON_64BIT_ARCH", Some("1"))
         .define("V8_ENABLE_SANDBOX", Some("1"))
         .include(&v8_include)
-        .include(napi_v8_include.to_str().unwrap())
+        .include(napi_include.to_str().unwrap())
         .include(napi_v8_src.to_str().unwrap())
         .file("src/napi_bridge_init.cc")
         .file(napi_v8_src.join("js_native_api_v8.cc").to_str().unwrap())

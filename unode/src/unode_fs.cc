@@ -13,7 +13,7 @@
 #endif
 #include <sys/stat.h>
 
-#include "js_native_api.h"
+#include "node_api.h"
 #include "uv.h"
 
 namespace {

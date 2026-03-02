@@ -18,7 +18,7 @@ criteria.
 ### Deliverables
 - `unode` directory structure and runtime docs.
 - Build target for a minimal executable.
-- Wiring to consume `napi-v8` as dependency.
+- Wiring to consume `napi/v8` as dependency.
 
 ### Tests
 - Build test: project config + link succeeds.

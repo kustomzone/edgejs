@@ -6,8 +6,9 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 set(UNODE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}")
-set(NAPI_V8_ROOT "${UNODE_ROOT}/../napi-v8")
+set(NAPI_V8_ROOT "${UNODE_ROOT}/../napi/v8")
 set(PROJECT_ROOT "${UNODE_ROOT}/../")
+set(NAPI_INCLUDE_ROOT "${PROJECT_ROOT}/napi/include")
 set(NAPI_V8_NODE_ROOT_DEFAULT "${PROJECT_ROOT}/node")
 if(DEFINED ENV{NAPI_V8_NODE_ROOT})
   set(NAPI_V8_NODE_ROOT_DEFAULT "$ENV{NAPI_V8_NODE_ROOT}")
@@ -54,7 +55,7 @@ if(NOT UNODE_EXTERNAL_NAPI_V8)
   add_subdirectory("${NAPI_V8_ROOT}" "${CMAKE_CURRENT_BINARY_DIR}/napi-v8")
 else()
   add_library(napi_v8 INTERFACE)
-  target_include_directories(napi_v8 INTERFACE "${NAPI_V8_ROOT}/include")
+  target_include_directories(napi_v8 INTERFACE "${NAPI_INCLUDE_ROOT}")
 endif()
 
 # Use Node's bundled libuv (same as Node) for consistent behavior (e.g. mkdtemp).
@@ -99,7 +100,7 @@ target_include_directories(unode_simdutf
 
 target_include_directories(unode_node_api
   PRIVATE
-    "${NAPI_V8_ROOT}/include"
+    "${NAPI_INCLUDE_ROOT}"
 )
 
 target_link_libraries(unode_node_api
@@ -142,7 +143,7 @@ target_include_directories(unode_runtime
   PUBLIC
     "${UNODE_ROOT}/src"
   PRIVATE
-    "${NAPI_V8_ROOT}/include"
+    "${NAPI_INCLUDE_ROOT}"
     "${PROJECT_ROOT}/deps/llhttp/include"
     "${PROJECT_ROOT}/deps/ncrypto"
 )
@@ -165,7 +166,7 @@ target_include_directories(unode_cli
   PUBLIC
     "${UNODE_ROOT}/src"
   PRIVATE
-    "${NAPI_V8_ROOT}/include"
+    "${NAPI_INCLUDE_ROOT}"
 )
 target_link_libraries(unode_cli
   PUBLIC
@@ -180,7 +181,7 @@ if(UNODE_BUILD_CLI)
   target_include_directories(unode
     PRIVATE
       "${UNODE_ROOT}/src"
-      "${NAPI_V8_ROOT}/include"
+      "${NAPI_INCLUDE_ROOT}"
   )
   target_link_libraries(unode
     PRIVATE

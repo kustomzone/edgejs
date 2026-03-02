@@ -20,9 +20,9 @@ NAPI_INCLUDE_DIR="$ROOT_DIR/../include"
 TEST_INCLUDE_DIR="$ROOT_DIR/tests/programs"
 NATIVE_INIT_SRC="$ROOT_DIR/tests/napi_native_init.cc"
 
-# napi-v8 paths
-NAPI_V8_DIR="$PROJECT_ROOT/napi-v8"
-NAPI_V8_INCLUDE="$NAPI_V8_DIR/include"
+# napi/v8 paths
+NAPI_V8_DIR="$PROJECT_ROOT/napi/v8"
+NAPI_V8_INCLUDE="$PROJECT_ROOT/napi/include"
 NAPI_V8_SRC="$NAPI_V8_DIR/src"
 
 # V8 paths (auto-detect Homebrew)
@@ -50,7 +50,7 @@ clang -c -std=c11 -O2 \
   "$TEST_SRC" \
   -o "$OUT_DIR/${TEST_NAME}.o"
 
-# Step 2: Compile native init + napi-v8 and link everything
+# Step 2: Compile native init + napi/v8 and link everything
 clang++ -std=c++20 -O2 \
   -DNAPI_EXTERN= \
   -DNAPI_VERSION=8 \

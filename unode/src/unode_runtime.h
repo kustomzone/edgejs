@@ -4,7 +4,7 @@
 #include <string>
 #include <vector>
 
-#include "js_native_api.h"
+#include "node_api.h"
 
 napi_status UnodeInstallConsole(napi_env env);
 napi_status UnodeInstallProcessObject(napi_env env,

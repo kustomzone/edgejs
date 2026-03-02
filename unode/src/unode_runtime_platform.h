@@ -1,7 +1,7 @@
 #ifndef UNODE_RUNTIME_PLATFORM_H_
 #define UNODE_RUNTIME_PLATFORM_H_
 
-#include "js_native_api.h"
+#include "node_api.h"
 
 // Engine-adapter boundary for runtime task draining.
 // The current build provides a V8-backed implementation; future engines can

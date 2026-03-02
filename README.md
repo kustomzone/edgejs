@@ -29,9 +29,9 @@ The project is in planning/bootstrap stage. The roadmap below defines the execut
 
 ## Roadmap
 
-### Phase 1: `napi-v8` Compatibility Layer
+### Phase 1: `napi/v8` Compatibility Layer
 
-Create a `napi-v8` project that exposes N-API using V8 under the hood, without exposing V8 details.
+Create a `napi/v8` project that exposes N-API using V8 under the hood, without exposing V8 details.
 
 Scope:
 - Base the implementation on Node's N-API implementation:

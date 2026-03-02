@@ -19,7 +19,7 @@ if(NAPI_V8_V8_LIBRARY)
       "${NAPI_V8_GTEST_ROOT}/include"
       "${UNODE_ROOT}/tests/runners"
       "${UNODE_ROOT}/src"
-      "${NAPI_V8_ROOT}/include"
+      "${NAPI_INCLUDE_ROOT}"
   )
 
   function(add_unode_node_api_test target_name)
@@ -30,7 +30,7 @@ if(NAPI_V8_V8_LIBRARY)
         "${NAPI_V8_GTEST_ROOT}/include"
         "${UNODE_ROOT}/tests/runners"
         "${UNODE_ROOT}/src"
-        "${NAPI_V8_ROOT}/include"
+        "${NAPI_INCLUDE_ROOT}"
     )
     target_link_libraries(${target_name}
       PRIVATE

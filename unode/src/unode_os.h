@@ -1,7 +1,7 @@
 #ifndef UNODE_OS_H_
 #define UNODE_OS_H_
 
-#include "js_native_api.h"
+#include "node_api.h"
 
 void UnodeInstallOsBinding(napi_env env);
 

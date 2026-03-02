@@ -3,7 +3,7 @@
 
 #include <uv.h>
 
-#include "js_native_api.h"
+#include "node_api.h"
 
 void UnodeInstallPipeWrapBinding(napi_env env);
 uv_stream_t* UnodePipeWrapGetStream(napi_env env, napi_value value);
