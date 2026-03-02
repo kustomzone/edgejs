@@ -1,22 +1,9 @@
-name: ci
+name: test and build
 
 on:
   push:
-    paths:
-      - "napi/**"
-      - "unode/**"
-      - "napi/v8/**"
-      - "napi/cmake/**"
-      - "README.md"
-      - ".github/workflows/napi-v8.yml"
   pull_request:
-    paths:
-      - "napi/**"
-      - "unode/**"
-      - "napi/v8/**"
-      - "napi/cmake/**"
-      - "README.md"
-      - ".github/workflows/napi-v8.yml"
+  workflow_dispatch:
 
 jobs:
   build-linux:
