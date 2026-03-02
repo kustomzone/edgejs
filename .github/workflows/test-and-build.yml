@@ -55,7 +55,7 @@ jobs:
       - name: Compile napi-v8
         run: cmake --build napi/v8/build -j4
 
-      - name: Test napi (parallel: napi-v8 + wasmer)
+      - name: "Test napi (parallel: napi-v8 + wasmer)"
         shell: bash
         run: |
           set -euo pipefail
@@ -145,7 +145,7 @@ jobs:
       - name: Compile napi-v8
         run: cmake --build napi/v8/build -j4
 
-      - name: Test napi (parallel: napi-v8 + wasmer)
+      - name: "Test napi (parallel: napi-v8 + wasmer)"
         shell: bash
         run: |
           set -euo pipefail
