@@ -11,10 +11,14 @@ jobs:
     runs-on: ubuntu-latest
     env:
       LLVM_DIR: llvm
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: sccache
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
@@ -67,15 +71,23 @@ jobs:
       - name: Test napi-wasmer
         run: cargo test --manifest-path napi/wasmer/Cargo.toml --lib -- --nocapture
 
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats || true
+
   wasmer-macos:
     name: wasmer-macos
     runs-on: macos-latest
     env:
       LLVM_DIR: llvm
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: sccache
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
@@ -128,3 +140,7 @@ jobs:
 
       - name: Test napi-wasmer
         run: cargo test --manifest-path napi/wasmer/Cargo.toml --lib -- --nocapture
+
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats || true

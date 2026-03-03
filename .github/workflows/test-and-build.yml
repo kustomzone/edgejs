@@ -11,10 +11,13 @@ jobs:
     runs-on: ubuntu-latest
     env:
       NAPI_V8_BUILD_METHOD: prebuilt
+      SCCACHE_GHA_ENABLED: "true"
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
       - name: Ensure submodules are initialized
         shell: bash
         run: |
@@ -61,15 +64,22 @@ jobs:
           path: unode-linux.zip
           if-no-files-found: error
 
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats || true
+
   build-macos:
     name: build-macos
     runs-on: macos-latest
     env:
       NAPI_V8_BUILD_METHOD: prebuilt
+      SCCACHE_GHA_ENABLED: "true"
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
       - name: Ensure submodules are initialized
         shell: bash
         run: |
@@ -115,3 +125,7 @@ jobs:
           name: unode-macos
           path: unode-macos.zip
           if-no-files-found: error
+
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats || true

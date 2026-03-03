@@ -9,6 +9,10 @@ set(UNODE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}")
 set(NAPI_V8_ROOT "${UNODE_ROOT}/../napi/v8")
 set(PROJECT_ROOT "${UNODE_ROOT}/../")
 set(NAPI_INCLUDE_ROOT "${PROJECT_ROOT}/napi/include")
+
+include("${PROJECT_ROOT}/napi/v8/cmake/NapiBuildCache.cmake")
+napi_enable_sccache_if_available()
+
 set(NAPI_V8_NODE_ROOT_DEFAULT "${PROJECT_ROOT}/node")
 if(DEFINED ENV{NAPI_V8_NODE_ROOT})
   set(NAPI_V8_NODE_ROOT_DEFAULT "$ENV{NAPI_V8_NODE_ROOT}")
