@@ -9,6 +9,11 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <unistd.h>
+
+#if defined(__wasi__) && defined(__cplusplus)
+extern "C" pid_t fork(void);
+#endif
 
 #ifndef SCM_RIGHTS
 #define SCM_RIGHTS 0x01

@@ -1,0 +1,5 @@
+#!/usr/bin/env sh
+
+export WASIXCC_WASM_EXCEPTIONS="${WASIXCC_WASM_EXCEPTIONS:-false}"
+
+exec wasixcc "$@"
