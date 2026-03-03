@@ -67,6 +67,30 @@ set(LIBUV_BUILD_SHARED OFF CACHE BOOL "" FORCE)
 add_subdirectory("${PROJECT_ROOT}/deps/uv" "${CMAKE_CURRENT_BINARY_DIR}/deps/uv")
 find_package(OpenSSL REQUIRED)
 
+set(UNODE_EMBEDDED_V8_VERSION "0.0.0-node.0")
+if(DEFINED NAPI_V8_INCLUDE_DIR AND EXISTS "${NAPI_V8_INCLUDE_DIR}/v8-version.h")
+  file(STRINGS "${NAPI_V8_INCLUDE_DIR}/v8-version.h" _v8_major_line
+       REGEX "^#define V8_MAJOR_VERSION [0-9]+$")
+  file(STRINGS "${NAPI_V8_INCLUDE_DIR}/v8-version.h" _v8_minor_line
+       REGEX "^#define V8_MINOR_VERSION [0-9]+$")
+  file(STRINGS "${NAPI_V8_INCLUDE_DIR}/v8-version.h" _v8_build_line
+       REGEX "^#define V8_BUILD_NUMBER [0-9]+$")
+  file(STRINGS "${NAPI_V8_INCLUDE_DIR}/v8-version.h" _v8_patch_line
+       REGEX "^#define V8_PATCH_LEVEL [0-9]+$")
+  if(_v8_major_line AND _v8_minor_line AND _v8_build_line AND _v8_patch_line)
+    string(REGEX REPLACE "^#define V8_MAJOR_VERSION ([0-9]+)$" "\\1"
+           _v8_major "${_v8_major_line}")
+    string(REGEX REPLACE "^#define V8_MINOR_VERSION ([0-9]+)$" "\\1"
+           _v8_minor "${_v8_minor_line}")
+    string(REGEX REPLACE "^#define V8_BUILD_NUMBER ([0-9]+)$" "\\1"
+           _v8_build "${_v8_build_line}")
+    string(REGEX REPLACE "^#define V8_PATCH_LEVEL ([0-9]+)$" "\\1"
+           _v8_patch "${_v8_patch_line}")
+    set(UNODE_EMBEDDED_V8_VERSION
+      "${_v8_major}.${_v8_minor}.${_v8_build}.${_v8_patch}-node.0")
+  endif()
+endif()
+
 add_library(unode_node_api STATIC
   src/node_api.cc
   src/unofficial_napi_testing_until_gc.cc
@@ -148,6 +172,7 @@ target_include_directories(unode_runtime
     "${UNODE_ROOT}/src"
   PRIVATE
     "${NAPI_INCLUDE_ROOT}"
+    "${PROJECT_ROOT}/deps"
     "${PROJECT_ROOT}/deps/llhttp/include"
     "${PROJECT_ROOT}/deps/ncrypto"
 )
@@ -161,6 +186,10 @@ target_link_libraries(unode_runtime
     unode_ncrypto
     uv_a
     OpenSSL::Crypto
+)
+target_compile_definitions(unode_runtime
+  PRIVATE
+    UNODE_EMBEDDED_V8_VERSION="${UNODE_EMBEDDED_V8_VERSION}"
 )
 
 add_library(unode_cli STATIC

@@ -5,6 +5,7 @@
 #include <cmath>
 #include <ctime>
 #include <cstdlib>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -15,6 +16,22 @@
 #include <vector>
 
 #include <uv.h>
+#include <openssl/crypto.h>
+
+#include "ada/ada.h"
+#include "brotli/c/common/version.h"
+#include "cares/include/ares_version.h"
+#include "llhttp/include/llhttp.h"
+#include "nbytes/include/nbytes.h"
+#include "ncrypto/ncrypto.h"
+#include "simdjson/simdjson.h"
+#include "simdutf/simdutf.h"
+#include "zlib/zlib.h"
+#include "nghttp2/lib/includes/nghttp2/nghttp2ver.h"
+#include "zstd/lib/zstd.h"
+#include "acorn_version.h"
+#include "cjs_module_lexer_version.h"
+#include "node_version.h"
 
 #if defined(_WIN32)
 #include <stdlib.h>
@@ -37,6 +54,13 @@ const auto g_cpu_usage_start = std::chrono::steady_clock::now();
 std::string g_unode_exec_path;
 uint32_t g_process_umask = 0022;
 
+#ifndef UNODE_EMBEDDED_V8_VERSION
+#define UNODE_EMBEDDED_V8_VERSION "0.0.0-node.0"
+#endif
+
+#define UNODE_STRINGIFY_HELPER(x) #x
+#define UNODE_STRINGIFY(x) UNODE_STRINGIFY_HELPER(x)
+
 struct ProcessMethodsBindingState {
   napi_ref binding_ref = nullptr;
   napi_ref hrtime_buffer_ref = nullptr;
@@ -58,6 +82,32 @@ struct ReportBindingState {
 
 std::map<napi_env, ProcessMethodsBindingState> g_process_methods_states;
 std::map<napi_env, ReportBindingState> g_report_states;
+constexpr const char kUvwasiVersion[] = "0.0.23";
+
+std::string GetOpenSslVersion() {
+  // Matches Node behavior: trim the "OpenSSL " prefix and keep the version
+  // token, with a conservative fallback for non-OpenSSL implementations.
+  const char* version = OpenSSL_version(OPENSSL_VERSION);
+  if (version == nullptr) return "0.0.0";
+  const char* first_space = std::strchr(version, ' ');
+  if (first_space == nullptr || first_space[1] == '\0') return "0.0.0";
+  const char* start = first_space + 1;
+  const char* end = std::strchr(start, ' ');
+  if (end == nullptr) return std::string(start);
+  return std::string(start, static_cast<size_t>(end - start));
+}
+
+std::string GetBrotliVersion() {
+  return std::string(UNODE_STRINGIFY(BROTLI_VERSION_MAJOR)) + "." +
+         UNODE_STRINGIFY(BROTLI_VERSION_MINOR) + "." +
+         UNODE_STRINGIFY(BROTLI_VERSION_PATCH);
+}
+
+std::string GetLlhttpVersion() {
+  return std::string(UNODE_STRINGIFY(LLHTTP_VERSION_MAJOR)) + "." +
+         UNODE_STRINGIFY(LLHTTP_VERSION_MINOR) + "." +
+         UNODE_STRINGIFY(LLHTTP_VERSION_PATCH);
+}
 
 std::string MaybePreferSiblingUnodeBinary(const std::string& detected_exec_path) {
   if (detected_exec_path.empty()) return detected_exec_path;
@@ -1859,7 +1909,7 @@ napi_status UnodeInstallProcessObject(napi_env env,
   if (status != napi_ok) return status;
 
   napi_value version_str = nullptr;
-  status = napi_create_string_utf8(env, "v24.0.0", NAPI_AUTO_LENGTH, &version_str);
+  status = napi_create_string_utf8(env, NODE_VERSION, NAPI_AUTO_LENGTH, &version_str);
   if (status != napi_ok || version_str == nullptr) return (status == napi_ok) ? napi_generic_failure : status;
   status = napi_set_named_property(env, process_obj, "version", version_str);
   if (status != napi_ok) return status;
@@ -1889,19 +1939,33 @@ napi_status UnodeInstallProcessObject(napi_env env,
   if (status != napi_ok || versions_obj == nullptr) return (status == napi_ok) ? napi_generic_failure : status;
   struct VersionEntry {
     const char* key;
-    const char* value;
+    std::string value;
   };
   const VersionEntry version_entries[] = {
-      {"node", "24.0.0"}, {"acorn", "8.15.0"}, {"ada", "2.9.2"}, {"ares", "1.34.5"},
-      {"brotli", "1.1.0"}, {"cjs_module_lexer", "2.2.0"}, {"llhttp", "9.2.1"}, {"modules", "131"},
-      {"napi", "8"}, {"nbytes", "0.1.1"}, {"ncrypto", "0.0.1"}, {"nghttp2", "1.61.0"}, {"openssl", "3.0.0"},
-      {"simdjson", "3.13.0"},
-      {"simdutf", "6.4.0"}, {"uv", "1.51.0"}, {"uvwasi", "0.0.21"}, {"v8", "14.5.201.9-node.0"},
-      {"zlib", "1.3.1"}, {"zstd", "1.5.6"},
+      {"node", NODE_VERSION_STRING},
+      {"acorn", ACORN_VERSION},
+      {"ada", ADA_VERSION},
+      {"ares", ARES_VERSION_STR},
+      {"brotli", GetBrotliVersion()},
+      {"cjs_module_lexer", CJS_MODULE_LEXER_VERSION},
+      {"llhttp", GetLlhttpVersion()},
+      {"modules", UNODE_STRINGIFY(NODE_MODULE_VERSION)},
+      {"napi", UNODE_STRINGIFY(NODE_API_DEFAULT_MODULE_API_VERSION)},
+      {"nbytes", NBYTES_VERSION},
+      {"ncrypto", NCRYPTO_VERSION},
+      {"nghttp2", NGHTTP2_VERSION},
+      {"openssl", GetOpenSslVersion()},
+      {"simdjson", SIMDJSON_VERSION},
+      {"simdutf", SIMDUTF_VERSION},
+      {"uv", uv_version_string()},
+      {"uvwasi", kUvwasiVersion},
+      {"v8", UNODE_EMBEDDED_V8_VERSION},
+      {"zlib", ZLIB_VERSION},
+      {"zstd", ZSTD_VERSION_STRING},
   };
   for (const auto& entry : version_entries) {
     napi_value value = nullptr;
-    status = napi_create_string_utf8(env, entry.value, NAPI_AUTO_LENGTH, &value);
+    status = napi_create_string_utf8(env, entry.value.c_str(), NAPI_AUTO_LENGTH, &value);
     if (status != napi_ok || value == nullptr) return (status == napi_ok) ? napi_generic_failure : status;
     napi_property_descriptor prop = {};
     prop.utf8name = entry.key;
@@ -1967,7 +2031,8 @@ napi_status UnodeInstallProcessObject(napi_env env,
   status = napi_set_named_property(env, variables_obj, "node_builtin_shareable_builtins", empty_shareable_builtins);
   if (status != napi_ok) return status;
   napi_value napi_build_version = nullptr;
-  status = napi_create_string_utf8(env, "8", NAPI_AUTO_LENGTH, &napi_build_version);
+  status = napi_create_string_utf8(
+      env, UNODE_STRINGIFY(NODE_API_DEFAULT_MODULE_API_VERSION), NAPI_AUTO_LENGTH, &napi_build_version);
   if (status != napi_ok || napi_build_version == nullptr) return (status == napi_ok) ? napi_generic_failure : status;
   status = napi_set_named_property(env, variables_obj, "napi_build_version", napi_build_version);
   if (status != napi_ok) return status;

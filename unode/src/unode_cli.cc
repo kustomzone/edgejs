@@ -6,7 +6,7 @@
 #include <string>
 #include <vector>
 
-#include "../../node/src/node_version.h"
+#include "node_version.h"
 #include "unofficial_napi.h"
 #include "unode_runtime.h"
 
