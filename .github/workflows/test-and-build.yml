@@ -45,7 +45,7 @@ jobs:
           cmake --build build-ubi -j4
       - name: Test ubi
         run: ctest --test-dir build-ubi --output-on-failure -j4
-      - name: Remove debug build:
+      - name: Remove debug build
         run: rm -rf build-ubi
 
       - name: Build ubi
