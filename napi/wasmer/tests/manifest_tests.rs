@@ -1,8 +1,8 @@
 use std::path::PathBuf;
 use std::process::Command;
 
-use serde::Deserialize;
 use napi_wasmer::run_wasix_main_capture_stdout;
+use serde::Deserialize;
 
 fn crate_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -47,8 +47,8 @@ fn build_wasix_test(name: &str) -> PathBuf {
 fn manifest_tests_match_native_and_wasix() {
     let root = crate_root();
     let manifest_path = root.join("tests/programs/manifest.json");
-    let manifest_content =
-        std::fs::read_to_string(&manifest_path).expect("failed to read test/programs/manifest.json");
+    let manifest_content = std::fs::read_to_string(&manifest_path)
+        .expect("failed to read test/programs/manifest.json");
     let manifest: TestManifest =
         serde_json::from_str(&manifest_content).expect("failed to parse test manifest json");
 
@@ -92,11 +92,7 @@ fn manifest_tests_match_native_and_wasix() {
         let wasix_path = build_wasix_test(&case.name);
         let (wasix_code, wasix_stdout) =
             run_wasix_main_capture_stdout(&wasix_path, &[]).expect("failed to run WASIX test");
-        assert_eq!(
-            wasix_code, 0,
-            "wasix test exited non-zero: {}",
-            case.name
-        );
+        assert_eq!(wasix_code, 0, "wasix test exited non-zero: {}", case.name);
         if let Some(expected) = &case.expected_stdout {
             assert_eq!(
                 &wasix_stdout, expected,

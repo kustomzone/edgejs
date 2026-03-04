@@ -1,6 +1,6 @@
 use anyhow::{bail, Result};
+use napi_wasmer::{run_wasix_main_capture_stdout, run_wasm_main_i32};
 use std::path::Path;
-use napi_wasmer::{run_wasm_main_i32, run_wasix_main_capture_stdout};
 
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
