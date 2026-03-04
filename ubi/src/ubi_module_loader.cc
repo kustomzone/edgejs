@@ -278,6 +278,25 @@ bool ResolveBuiltinPath(const std::string& specifier, const std::string& base_di
       return true;
     }
   }
+  // Internal dep modules (e.g. internal/deps/acorn/*) live under node/deps/*
+  // in this workspace, not under ubi/src/builtins.
+  if (id.rfind("internal/deps/", 0) == 0) {
+    const std::string dep_rel = id.substr(std::string("internal/deps/").size());
+    static const fs::path source_root =
+        fs::absolute(fs::path(__FILE__).parent_path() / ".." / "..").lexically_normal();
+    const std::vector<fs::path> node_deps_roots = {
+        source_root / "node" / "deps",
+        fs::current_path() / "node" / "deps",
+        fs::current_path().parent_path() / "node" / "deps",
+    };
+    for (const fs::path& deps_root : node_deps_roots) {
+      fs::path candidate = deps_root / dep_rel;
+      if (ResolveAsFile(candidate, &resolved) || ResolveAsDirectory(candidate, &resolved)) {
+        *out = resolved.lexically_normal();
+        return true;
+      }
+    }
+  }
   fs::path candidate = runtime_builtins_dir / (id + ".js");
   if (ResolveAsFile(candidate, &resolved)) {
     *out = resolved.lexically_normal();

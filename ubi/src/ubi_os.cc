@@ -664,11 +664,20 @@ napi_value CreatePriorityObject(napi_env env) {
 napi_value CreateErrnoObject(napi_env env) {
   napi_value obj = nullptr;
   if (napi_create_object(env, &obj) != napi_ok || obj == nullptr) return nullptr;
+#ifdef E2BIG
+  SetNamedInt32(env, obj, "E2BIG", E2BIG);
+#endif
 #ifdef EACCES
   SetNamedInt32(env, obj, "EACCES", EACCES);
 #endif
+#ifdef EADDRNOTAVAIL
+  SetNamedInt32(env, obj, "EADDRNOTAVAIL", EADDRNOTAVAIL);
+#endif
 #ifdef EADDRINUSE
   SetNamedInt32(env, obj, "EADDRINUSE", EADDRINUSE);
+#endif
+#ifdef EAFNOSUPPORT
+  SetNamedInt32(env, obj, "EAFNOSUPPORT", EAFNOSUPPORT);
 #endif
 #ifdef EAGAIN
   SetNamedInt32(env, obj, "EAGAIN", EAGAIN);
@@ -676,11 +685,50 @@ napi_value CreateErrnoObject(napi_env env) {
 #ifdef EBADF
   SetNamedInt32(env, obj, "EBADF", EBADF);
 #endif
+#ifdef EBUSY
+  SetNamedInt32(env, obj, "EBUSY", EBUSY);
+#endif
+#ifdef ECONNABORTED
+  SetNamedInt32(env, obj, "ECONNABORTED", ECONNABORTED);
+#endif
+#ifdef ECONNREFUSED
+  SetNamedInt32(env, obj, "ECONNREFUSED", ECONNREFUSED);
+#endif
+#ifdef ECONNRESET
+  SetNamedInt32(env, obj, "ECONNRESET", ECONNRESET);
+#endif
 #ifdef EEXIST
   SetNamedInt32(env, obj, "EEXIST", EEXIST);
 #endif
+#ifdef EFAULT
+  SetNamedInt32(env, obj, "EFAULT", EFAULT);
+#endif
+#ifdef EHOSTUNREACH
+  SetNamedInt32(env, obj, "EHOSTUNREACH", EHOSTUNREACH);
+#endif
+#ifdef EINPROGRESS
+  SetNamedInt32(env, obj, "EINPROGRESS", EINPROGRESS);
+#endif
+#ifdef EINTR
+  SetNamedInt32(env, obj, "EINTR", EINTR);
+#endif
 #ifdef EINVAL
   SetNamedInt32(env, obj, "EINVAL", EINVAL);
+#endif
+#ifdef EIO
+  SetNamedInt32(env, obj, "EIO", EIO);
+#endif
+#ifdef EISDIR
+  SetNamedInt32(env, obj, "EISDIR", EISDIR);
+#endif
+#ifdef EMFILE
+  SetNamedInt32(env, obj, "EMFILE", EMFILE);
+#endif
+#ifdef EMSGSIZE
+  SetNamedInt32(env, obj, "EMSGSIZE", EMSGSIZE);
+#endif
+#ifdef ENAMETOOLONG
+  SetNamedInt32(env, obj, "ENAMETOOLONG", ENAMETOOLONG);
 #endif
 #ifdef ENOENT
   SetNamedInt32(env, obj, "ENOENT", ENOENT);
@@ -688,11 +736,41 @@ napi_value CreateErrnoObject(napi_env env) {
 #ifdef ENOMEM
   SetNamedInt32(env, obj, "ENOMEM", ENOMEM);
 #endif
+#ifdef ENOPROTOOPT
+  SetNamedInt32(env, obj, "ENOPROTOOPT", ENOPROTOOPT);
+#endif
+#ifdef ENOSPC
+  SetNamedInt32(env, obj, "ENOSPC", ENOSPC);
+#endif
+#ifdef ENOTCONN
+  SetNamedInt32(env, obj, "ENOTCONN", ENOTCONN);
+#endif
 #ifdef ENOTDIR
   SetNamedInt32(env, obj, "ENOTDIR", ENOTDIR);
 #endif
+#ifdef ENOTSOCK
+  SetNamedInt32(env, obj, "ENOTSOCK", ENOTSOCK);
+#endif
+#ifdef ENOTTY
+  SetNamedInt32(env, obj, "ENOTTY", ENOTTY);
+#endif
+#ifdef EPROTONOSUPPORT
+  SetNamedInt32(env, obj, "EPROTONOSUPPORT", EPROTONOSUPPORT);
+#endif
 #ifdef EPERM
   SetNamedInt32(env, obj, "EPERM", EPERM);
+#endif
+#ifdef EROFS
+  SetNamedInt32(env, obj, "EROFS", EROFS);
+#endif
+#ifdef ESRCH
+  SetNamedInt32(env, obj, "ESRCH", ESRCH);
+#endif
+#ifdef ETIMEDOUT
+  SetNamedInt32(env, obj, "ETIMEDOUT", ETIMEDOUT);
+#endif
+#ifdef EXDEV
+  SetNamedInt32(env, obj, "EXDEV", EXDEV);
 #endif
   return obj;
 }
