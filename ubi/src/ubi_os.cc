@@ -12,7 +12,7 @@
 #endif
 
 #if !defined(_WIN32)
-#include <dlfcn.h>
+//#include <dlfcn.h>
 #include <signal.h>
 #endif
 

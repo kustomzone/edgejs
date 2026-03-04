@@ -579,7 +579,7 @@ napi_value UbiProcessSetEnvBinding(napi_env env, napi_callback_info info) {
 #else
       tzset();
 #endif
-      (void)unofficial_napi_notify_datetime_configuration_change(env);
+//      (void)unofficial_napi_notify_datetime_configuration_change(env);
     }
   }
   napi_value out = nullptr;
@@ -605,7 +605,7 @@ napi_value UbiProcessUnsetEnvBinding(napi_env env, napi_callback_info info) {
 #else
       tzset();
 #endif
-      (void)unofficial_napi_notify_datetime_configuration_change(env);
+//      (void)unofficial_napi_notify_datetime_configuration_change(env);
     }
   }
   napi_value out = nullptr;

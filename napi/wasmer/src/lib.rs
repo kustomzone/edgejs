@@ -1230,6 +1230,17 @@ fn guest_napi_has_named_property(
     s
 }
 
+fn guest_napi_define_properties(
+    _env: FunctionEnvMut<RuntimeEnv>,
+    _e: i32,
+    _obj: i32,
+    _property_count: i32,
+    _properties: i32,
+) -> i32 {
+    // No-op stub for import compatibility.
+    0
+}
+
 fn guest_napi_set_element(
     _env: FunctionEnvMut<RuntimeEnv>,
     _e: i32,
@@ -2820,6 +2831,16 @@ fn guest_napi_get_last_error_info(_env: FunctionEnvMut<RuntimeEnv>, _e: i32, _rp
     0
 }
 
+fn guest_napi_add_env_cleanup_hook(
+    _env: FunctionEnvMut<RuntimeEnv>,
+    _e: i32,
+    _fun: i32,
+    _arg: i32,
+) -> i32 {
+    // No-op for now: hook registration is not wired in the Wasmer host bridge yet.
+    0
+}
+
 fn guest_napi_get_version(mut env: FunctionEnvMut<RuntimeEnv>, _e: i32, rp: i32) -> i32 {
     write_guest_u32(&mut env, rp as u32, 8);
     0
@@ -2972,6 +2993,7 @@ fn register_napi_imports(store: &mut Store, fe: &FunctionEnv<RuntimeEnv>, io: &m
     reg!("napi_set_named_property", guest_napi_set_named_property);
     reg!("napi_get_named_property", guest_napi_get_named_property);
     reg!("napi_has_named_property", guest_napi_has_named_property);
+    reg!("napi_define_properties", guest_napi_define_properties);
     reg!("napi_set_element", guest_napi_set_element);
     reg!("napi_get_element", guest_napi_get_element);
     reg!("napi_has_element", guest_napi_has_element);
@@ -3080,6 +3102,10 @@ fn register_napi_imports(store: &mut Store, fe: &FunctionEnv<RuntimeEnv>, io: &m
     reg!("napi_fatal_error", guest_napi_fatal_error);
     // Misc
     reg!("napi_get_last_error_info", guest_napi_get_last_error_info);
+    reg!(
+        "napi_add_env_cleanup_hook",
+        guest_napi_add_env_cleanup_hook
+    );
     reg!("napi_get_version", guest_napi_get_version);
 }
 
