@@ -2,4 +2,9 @@
 
 export WASIXCC_WASM_EXCEPTIONS="${WASIXCC_WASM_EXCEPTIONS:-false}"
 
+# Prefer an EH sysroot variant that includes dlfcn.h when available.
+WASIX_DEFAULT_SYSROOT="$(wasixccenv print-sysroot 2>/dev/null || true)"
+WASIX_SYSROOT_PREFIX="$(dirname "${WASIX_DEFAULT_SYSROOT}")"
+export WASIXCC_SYSROOT=${WASIX_SYSROOT_PREFIX}/sysroot-exnref-ehpic
+
 exec wasixcc "$@"
