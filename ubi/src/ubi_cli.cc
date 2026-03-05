@@ -19,6 +19,7 @@
 
 #include "node_version.h"
 #include "unofficial_napi.h"
+#include "ubi_compat_exec.h"
 #include "ubi_process.h"
 #include "ubi_runtime.h"
 
@@ -185,6 +186,9 @@ int UbiRunCli(int argc, const char* const* argv, std::string* error_out) {
     if (error_out != nullptr) *error_out = kUsage;
     return 1;
   }
+  if (argc > 1 && argv[1] != nullptr && UbiShouldWrapCompatCommand(argv[1])) {
+    return UbiRunCompatCommand(argc, argv, error_out);
+  }
   if (argc > 1 && argv[1] != nullptr &&
       (std::string(argv[1]) == "-v" || std::string(argv[1]) == "--version")) {
     std::cout << NODE_VERSION << "\n";
@@ -301,4 +305,15 @@ int UbiRunCli(int argc, const char* const* argv, std::string* error_out) {
   }
   UbiSetScriptArgv(script_argv);
   return UbiRunCliScript(argv[script_index], error_out);
+}
+
+int UbiRunEnvCli(int argc, const char* const* argv, std::string* error_out) {
+  UbiInitializeCliProcess();
+  if (error_out != nullptr) {
+    error_out->clear();
+  }
+  if (argv != nullptr && argc > 0 && argv[0] != nullptr) {
+    UbiSetProcessArgv0(argv[0]);
+  }
+  return UbiRunCompatCommand(argc, argv, error_out);
 }

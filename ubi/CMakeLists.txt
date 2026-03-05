@@ -368,6 +368,7 @@ endif()
 
 add_library(ubi_cli STATIC
   src/ubi_cli.cc
+  src/ubi_compat_exec.cc
 )
 target_include_directories(ubi_cli
   PUBLIC
@@ -401,6 +402,28 @@ if(UBI_BUILD_CLI)
   endif()
   if(UBI_ALLOW_UNDEFINED_IMPORTS)
     target_link_options(ubi PRIVATE
+      "-Wl,--allow-undefined"
+      "-Wl,--import-undefined"
+    )
+  endif()
+
+  add_executable(ubienv
+    "${UBI_ROOT}/src/ubienv_main.cc"
+  )
+  target_include_directories(ubienv
+    PRIVATE
+      "${UBI_ROOT}/src"
+      "${NAPI_INCLUDE_ROOT}"
+  )
+  target_link_libraries(ubienv
+    PRIVATE
+      ubi_cli
+  )
+  if(UBI_NAPI_PROVIDER STREQUAL "bundled-v8" AND NAPI_V8_DEFINES)
+    target_compile_definitions(ubienv PRIVATE ${NAPI_V8_DEFINES})
+  endif()
+  if(UBI_ALLOW_UNDEFINED_IMPORTS)
+    target_link_options(ubienv PRIVATE
       "-Wl,--allow-undefined"
       "-Wl,--import-undefined"
     )

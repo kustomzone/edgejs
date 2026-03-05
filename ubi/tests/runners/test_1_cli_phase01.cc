@@ -32,18 +32,23 @@ void RemoveTempScript(const std::string& path) {
   std::filesystem::remove(path, ec);
 }
 
-std::filesystem::path ResolveBuiltUbiBinary() {
+std::string GetEnvOrEmpty(const char* name) {
+  const char* value = std::getenv(name);
+  return value != nullptr ? std::string(value) : std::string();
+}
+
+std::filesystem::path ResolveBuiltBinary(const char* name) {
   namespace fs = std::filesystem;
   const fs::path cwd = fs::current_path();
   const std::vector<fs::path> candidates = {
-      cwd / "ubi",
-      cwd / "build-ubi-rename" / "ubi",
-      cwd / "build-ubi" / "ubi",
-      cwd / "build" / "ubi",
-      cwd.parent_path() / "ubi",
-      cwd.parent_path() / "build-ubi-rename" / "ubi",
-      cwd.parent_path() / "build-ubi" / "ubi",
-      cwd.parent_path() / "build" / "ubi",
+      cwd / name,
+      cwd / "build-ubi-rename" / name,
+      cwd / "build-ubi" / name,
+      cwd / "build" / name,
+      cwd.parent_path() / name,
+      cwd.parent_path() / "build-ubi-rename" / name,
+      cwd.parent_path() / "build-ubi" / name,
+      cwd.parent_path() / "build" / name,
   };
   for (const auto& candidate : candidates) {
     std::error_code ec;
@@ -52,6 +57,14 @@ std::filesystem::path ResolveBuiltUbiBinary() {
     return fs::absolute(candidate).lexically_normal();
   }
   return {};
+}
+
+std::filesystem::path ResolveBuiltUbiBinary() {
+  return ResolveBuiltBinary("ubi");
+}
+
+std::filesystem::path ResolveBuiltUbienvBinary() {
+  return ResolveBuiltBinary("ubienv");
 }
 
 std::string ShellSingleQuoted(const std::string& input) {
@@ -101,6 +114,192 @@ TEST_F(Test1CliPhase01, NoArgsWithStdinEofFallsBackToStdinMode) {
   EXPECT_TRUE(stderr_output.empty()) << "stderr=" << stderr_output;
 
   std::filesystem::remove_all(temp_root, ec);
+#endif
+}
+
+TEST_F(Test1CliPhase01, CompatWrappedCommandsBypassCliParsingAndPrefixPath) {
+#if defined(_WIN32)
+  GTEST_SKIP() << "compat wrapper subprocess check is POSIX-oriented";
+#else
+  namespace fs = std::filesystem;
+  const auto ubi_path = ResolveBuiltUbiBinary();
+  ASSERT_FALSE(ubi_path.empty()) << "Failed to resolve built ubi binary";
+
+  const auto temp_root = fs::temp_directory_path() / "ubi_phase01_cli_compat_wrap";
+  const auto install_bin_dir = temp_root / "bin";
+  const auto compat_dir = temp_root / "bin-compat";
+  const auto compat_node = compat_dir / "node";
+  const auto stdout_path = temp_root / "stdout.txt";
+  const auto stderr_path = temp_root / "stderr.txt";
+  std::error_code ec;
+  fs::remove_all(temp_root, ec);
+  fs::create_directories(install_bin_dir, ec);
+  ASSERT_FALSE(ec) << "Failed to create install bin directory";
+  fs::create_directories(compat_dir, ec);
+  ASSERT_FALSE(ec) << "Failed to create compat directory";
+
+  std::ofstream compat_out(compat_node);
+  compat_out
+      << "#!/bin/sh\n"
+      << "printf 'args=%s\\n' \"$*\"\n"
+      << "printf 'path0=%s\\n' \"${PATH%%:*}\"\n";
+  compat_out.close();
+  ASSERT_TRUE(compat_out.good()) << "Failed to write compat node shim";
+  fs::permissions(
+      compat_node,
+      fs::perms::owner_read | fs::perms::owner_write | fs::perms::owner_exec |
+          fs::perms::group_read | fs::perms::group_exec |
+          fs::perms::others_read | fs::perms::others_exec,
+      fs::perm_options::replace,
+      ec);
+  ASSERT_FALSE(ec) << "Failed to chmod compat node shim";
+
+  const std::string old_path = GetEnvOrEmpty("PATH");
+  const std::string cmd =
+      "UBI_EXEC_PATH=" + ShellSingleQuoted((install_bin_dir / "ubi").string()) + " PATH=" +
+      ShellSingleQuoted(old_path) + " " + ShellSingleQuoted(ubi_path.string()) +
+      " node -p 42 >" + ShellSingleQuoted(stdout_path.string()) +
+      " 2>" + ShellSingleQuoted(stderr_path.string());
+  const int status = std::system(cmd.c_str());
+  ASSERT_NE(status, -1);
+  ASSERT_TRUE(WIFEXITED(status)) << "status=" << status;
+
+  std::ifstream stdout_in(stdout_path);
+  const std::string stdout_output((std::istreambuf_iterator<char>(stdout_in)),
+                                  std::istreambuf_iterator<char>());
+  std::ifstream stderr_in(stderr_path);
+  const std::string stderr_output((std::istreambuf_iterator<char>(stderr_in)),
+                                  std::istreambuf_iterator<char>());
+  fs::remove_all(temp_root, ec);
+
+  EXPECT_EQ(WEXITSTATUS(status), 0) << "stderr=" << stderr_output;
+  EXPECT_TRUE(stderr_output.empty()) << "stderr=" << stderr_output;
+  EXPECT_NE(stdout_output.find("args=-p 42"), std::string::npos) << stdout_output;
+  EXPECT_NE(stdout_output.find("path0=" + compat_dir.string()), std::string::npos) << stdout_output;
+#endif
+}
+
+TEST_F(Test1CliPhase01, CompatWrappedCommandsUseParentBinCompatFromBuildTreeExecPath) {
+#if defined(_WIN32)
+  GTEST_SKIP() << "compat wrapper subprocess check is POSIX-oriented";
+#else
+  namespace fs = std::filesystem;
+  const auto ubi_path = ResolveBuiltUbiBinary();
+  ASSERT_FALSE(ubi_path.empty()) << "Failed to resolve built ubi binary";
+
+  const auto temp_root = fs::temp_directory_path() / "ubi_phase01_cli_compat_build_tree";
+  const auto build_dir = temp_root / "build-ubi-rename";
+  const auto compat_dir = temp_root / "bin-compat";
+  const auto compat_node = compat_dir / "node";
+  const auto stdout_path = temp_root / "stdout.txt";
+  const auto stderr_path = temp_root / "stderr.txt";
+  std::error_code ec;
+  fs::remove_all(temp_root, ec);
+  fs::create_directories(build_dir, ec);
+  ASSERT_FALSE(ec) << "Failed to create build directory";
+  fs::create_directories(compat_dir, ec);
+  ASSERT_FALSE(ec) << "Failed to create compat directory";
+
+  std::ofstream compat_out(compat_node);
+  compat_out
+      << "#!/bin/sh\n"
+      << "printf 'args=%s\\n' \"$*\"\n"
+      << "printf 'path0=%s\\n' \"${PATH%%:*}\"\n";
+  compat_out.close();
+  ASSERT_TRUE(compat_out.good()) << "Failed to write compat node shim";
+  fs::permissions(
+      compat_node,
+      fs::perms::owner_read | fs::perms::owner_write | fs::perms::owner_exec |
+          fs::perms::group_read | fs::perms::group_exec |
+          fs::perms::others_read | fs::perms::others_exec,
+      fs::perm_options::replace,
+      ec);
+  ASSERT_FALSE(ec) << "Failed to chmod compat node shim";
+
+  const std::string old_path = GetEnvOrEmpty("PATH");
+  const std::string cmd =
+      "UBI_EXEC_PATH=" + ShellSingleQuoted((build_dir / "ubi").string()) + " PATH=" +
+      ShellSingleQuoted(old_path) + " " + ShellSingleQuoted(ubi_path.string()) +
+      " node -p 42 >" + ShellSingleQuoted(stdout_path.string()) +
+      " 2>" + ShellSingleQuoted(stderr_path.string());
+  const int status = std::system(cmd.c_str());
+  ASSERT_NE(status, -1);
+  ASSERT_TRUE(WIFEXITED(status)) << "status=" << status;
+
+  std::ifstream stdout_in(stdout_path);
+  const std::string stdout_output((std::istreambuf_iterator<char>(stdout_in)),
+                                  std::istreambuf_iterator<char>());
+  std::ifstream stderr_in(stderr_path);
+  const std::string stderr_output((std::istreambuf_iterator<char>(stderr_in)),
+                                  std::istreambuf_iterator<char>());
+  fs::remove_all(temp_root, ec);
+
+  EXPECT_EQ(WEXITSTATUS(status), 0) << "stderr=" << stderr_output;
+  EXPECT_TRUE(stderr_output.empty()) << "stderr=" << stderr_output;
+  EXPECT_NE(stdout_output.find("args=-p 42"), std::string::npos) << stdout_output;
+  EXPECT_NE(stdout_output.find("path0=" + compat_dir.string()), std::string::npos) << stdout_output;
+#endif
+}
+
+TEST_F(Test1CliPhase01, UbienvAlwaysPrefixesPathAndBypassesCliParsing) {
+#if defined(_WIN32)
+  GTEST_SKIP() << "compat wrapper subprocess check is POSIX-oriented";
+#else
+  namespace fs = std::filesystem;
+  const auto ubienv_path = ResolveBuiltUbienvBinary();
+  ASSERT_FALSE(ubienv_path.empty()) << "Failed to resolve built ubienv binary";
+
+  const auto temp_root = fs::temp_directory_path() / "ubi_phase01_ubienv_wrap";
+  const auto build_dir = temp_root / "build-ubi-rename";
+  const auto compat_dir = temp_root / "bin-compat";
+  const auto compat_tool = compat_dir / "custom-tool";
+  const auto stdout_path = temp_root / "stdout.txt";
+  const auto stderr_path = temp_root / "stderr.txt";
+  std::error_code ec;
+  fs::remove_all(temp_root, ec);
+  fs::create_directories(build_dir, ec);
+  ASSERT_FALSE(ec) << "Failed to create build directory";
+  fs::create_directories(compat_dir, ec);
+  ASSERT_FALSE(ec) << "Failed to create compat directory";
+
+  std::ofstream compat_out(compat_tool);
+  compat_out
+      << "#!/bin/sh\n"
+      << "printf 'args=%s\\n' \"$*\"\n"
+      << "printf 'path0=%s\\n' \"${PATH%%:*}\"\n";
+  compat_out.close();
+  ASSERT_TRUE(compat_out.good()) << "Failed to write compat tool shim";
+  fs::permissions(
+      compat_tool,
+      fs::perms::owner_read | fs::perms::owner_write | fs::perms::owner_exec |
+          fs::perms::group_read | fs::perms::group_exec |
+          fs::perms::others_read | fs::perms::others_exec,
+      fs::perm_options::replace,
+      ec);
+  ASSERT_FALSE(ec) << "Failed to chmod compat tool shim";
+
+  const std::string old_path = GetEnvOrEmpty("PATH");
+  const std::string cmd =
+      "UBI_EXEC_PATH=" + ShellSingleQuoted((build_dir / "ubienv").string()) + " PATH=" +
+      ShellSingleQuoted(old_path) + " " + ShellSingleQuoted(ubienv_path.string()) +
+      " custom-tool -p 42 >" + ShellSingleQuoted(stdout_path.string()) +
+      " 2>" + ShellSingleQuoted(stderr_path.string());
+  const int status = std::system(cmd.c_str());
+  ASSERT_NE(status, -1);
+  ASSERT_TRUE(WIFEXITED(status)) << "status=" << status;
+
+  std::ifstream stdout_in(stdout_path);
+  const std::string stdout_output((std::istreambuf_iterator<char>(stdout_in)),
+                                  std::istreambuf_iterator<char>());
+  std::ifstream stderr_in(stderr_path);
+  const std::string stderr_output((std::istreambuf_iterator<char>(stderr_in)),
+                                  std::istreambuf_iterator<char>());
+  fs::remove_all(temp_root, ec);
+
+  EXPECT_EQ(WEXITSTATUS(status), 0) << "stderr=" << stderr_output;
+  EXPECT_TRUE(stderr_output.empty()) << "stderr=" << stderr_output;
+  EXPECT_NE(stdout_output.find("args=-p 42"), std::string::npos) << stdout_output;
+  EXPECT_NE(stdout_output.find("path0=" + compat_dir.string()), std::string::npos) << stdout_output;
 #endif
 }
 

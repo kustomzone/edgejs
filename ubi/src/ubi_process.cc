@@ -2803,6 +2803,11 @@ void UbiSetProcessArgv0(const std::string& argv0) {
   g_ubi_argv0 = argv0;
 }
 
+std::string UbiGetProcessExecPath() {
+  if (g_ubi_exec_path.empty()) g_ubi_exec_path = DetectExecPath();
+  return g_ubi_exec_path;
+}
+
 napi_status UbiInstallProcessObject(napi_env env,
                                       const std::string& current_script_path,
                                       const std::vector<std::string>& exec_argv,
