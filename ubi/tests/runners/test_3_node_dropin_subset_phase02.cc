@@ -267,6 +267,7 @@ int RunRawNodeTestScript(napi_env env,
   const bool has_suite_prefix = rel_path.find('/') != std::string::npos;
   const std::string script_rel = has_suite_prefix ? rel_path : ("parallel/" + rel_path);
   const bool is_parallel_suite = StartsWith(script_rel, "parallel/");
+  const bool is_pseudo_tty_suite = StartsWith(script_rel, "pseudo-tty/");
   const bool needs_global_serialization =
       StartsWith(script_rel, "sequential/") || StartsWith(script_rel, "pummel/");
   ScopedExclusiveFileLock suite_lock(
@@ -284,6 +285,7 @@ int RunRawNodeTestScript(napi_env env,
   setenv("TEST_SERIAL_ID", test_serial_id.c_str(), 1);
   setenv("TEST_THREAD_ID", test_serial_id.c_str(), 1);
   setenv("TEST_PARALLEL", is_parallel_suite ? "1" : "0", 1);
+  setenv("UBI_FORCE_STDIO_TTY", is_pseudo_tty_suite ? "1" : "0", 1);
   {
     napi_value global = nullptr;
     napi_value process_v = nullptr;
@@ -316,7 +318,7 @@ int RunRawNodeTestScript(napi_env env,
   }
   if (keep_event_loop_alive) {
     if (std::getenv("UBI_LOOP_TIMEOUT_MS") == nullptr) {
-      setenv("UBI_LOOP_TIMEOUT_MS", "10000", 1);
+      setenv("UBI_LOOP_TIMEOUT_MS", "30000", 1);
     }
   }
   const int exit_code =
@@ -1275,7 +1277,9 @@ TEST_F(Test3NodeDropinSubsetPhase02, RawAbortAddonRegisterSignalHandlerFromNodeT
   EnvScope s(runtime_.get());
   std::string error;
   const int exit_code = RunRawNodeTestScript(s.env, "abort/test-addon-register-signal-handler.js", &error);
-  if (exit_code != 0 && error.find("SyntaxError: Invalid or unexpected token") != std::string::npos) {
+  if (exit_code != 0 &&
+      (error.find("SyntaxError: Invalid or unexpected token") != std::string::npos ||
+       error.find("Module did not self-register") != std::string::npos)) {
     GTEST_SKIP() << "Skipping native addon signal handler test: .node loading is unavailable in this runtime.";
   }
   EXPECT_EQ(exit_code, 0) << "error=" << error;

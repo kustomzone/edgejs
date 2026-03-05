@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "internal_binding/helpers.h"
+#include "../ubi_module_loader.h"
 
 namespace internal_binding {
 
@@ -43,6 +44,12 @@ bool IsFunction(napi_env env, napi_value value) {
   return napi_typeof(env, value, &type) == napi_ok && type == napi_function;
 }
 
+bool IsUndefinedValue(napi_env env, napi_value value) {
+  if (value == nullptr) return true;
+  napi_valuetype type = napi_undefined;
+  return napi_typeof(env, value, &type) == napi_ok && type == napi_undefined;
+}
+
 std::string ValueToUtf8(napi_env env, napi_value value) {
   if (value == nullptr) return {};
   napi_value string_value = nullptr;
@@ -68,6 +75,23 @@ void DeleteRefIfPresent(napi_env env, napi_ref* ref) {
   if (ref == nullptr || *ref == nullptr) return;
   napi_delete_reference(env, *ref);
   *ref = nullptr;
+}
+
+napi_value CreateDataCloneError(napi_env env, const char* message) {
+  napi_value msg = nullptr;
+  napi_value err = nullptr;
+  napi_create_string_utf8(env, message, NAPI_AUTO_LENGTH, &msg);
+  napi_create_error(env, nullptr, msg, &err);
+  if (err == nullptr) return nullptr;
+
+  napi_value code = nullptr;
+  napi_create_int32(env, 25, &code);
+  if (code != nullptr) napi_set_named_property(env, err, "code", code);
+
+  napi_value name = nullptr;
+  napi_create_string_utf8(env, "DataCloneError", NAPI_AUTO_LENGTH, &name);
+  if (name != nullptr) napi_set_named_property(env, err, "name", name);
+  return err;
 }
 
 napi_value GetRefValue(napi_env env, napi_ref ref) {
@@ -103,6 +127,64 @@ napi_value TryRequireModule(napi_env env, const char* module_name) {
     return nullptr;
   }
   return out;
+}
+
+napi_value GetUntransferableObjectPrivateSymbol(napi_env env) {
+  napi_value global = GetGlobal(env);
+  if (global == nullptr) return nullptr;
+
+  napi_value internal_binding = UbiGetInternalBinding(env);
+  if (!IsFunction(env, internal_binding)) {
+    internal_binding = GetNamed(env, global, "internalBinding");
+  }
+  if (!IsFunction(env, internal_binding)) return nullptr;
+
+  napi_value util_name = nullptr;
+  if (napi_create_string_utf8(env, "util", NAPI_AUTO_LENGTH, &util_name) != napi_ok || util_name == nullptr) {
+    return nullptr;
+  }
+
+  napi_value util_binding = nullptr;
+  napi_value argv[1] = {util_name};
+  if (napi_call_function(env, global, internal_binding, 1, argv, &util_binding) != napi_ok || util_binding == nullptr) {
+    ClearPendingException(env);
+    return nullptr;
+  }
+
+  napi_value private_symbols = GetNamed(env, util_binding, "privateSymbols");
+  if (private_symbols == nullptr) return nullptr;
+  return GetNamed(env, private_symbols, "untransferable_object_private_symbol");
+}
+
+bool TransferListContainsMarkedUntransferable(napi_env env, napi_value transfer_list) {
+  if (transfer_list == nullptr || IsUndefinedValue(env, transfer_list)) return false;
+
+  bool is_array = false;
+  if (napi_is_array(env, transfer_list, &is_array) != napi_ok || !is_array) return false;
+
+  napi_value marker = GetUntransferableObjectPrivateSymbol(env);
+  if (marker == nullptr || IsUndefinedValue(env, marker)) return false;
+
+  uint32_t length = 0;
+  if (napi_get_array_length(env, transfer_list, &length) != napi_ok || length == 0) return false;
+
+  for (uint32_t i = 0; i < length; ++i) {
+    napi_value item = nullptr;
+    if (napi_get_element(env, transfer_list, i, &item) != napi_ok || item == nullptr) continue;
+
+    napi_valuetype type = napi_undefined;
+    if (napi_typeof(env, item, &type) != napi_ok || (type != napi_object && type != napi_function)) continue;
+
+    bool has_marker = false;
+    if (napi_has_property(env, item, marker, &has_marker) == napi_ok && has_marker) {
+      napi_value marker_value = nullptr;
+      if (napi_get_property(env, item, marker, &marker_value) == napi_ok && !IsUndefinedValue(env, marker_value)) {
+        return true;
+      }
+    }
+  }
+
+  return false;
 }
 
 napi_value GetNoMessageSymbol(napi_env env) {
@@ -198,7 +280,10 @@ bool EnsureMessagingSymbols(napi_env env, const ResolveOptions& options) {
   }
   if (symbols == nullptr || IsUndefined(env, symbols)) {
     napi_value global = GetGlobal(env);
-    napi_value internal_binding = GetNamed(env, global, "internalBinding");
+    napi_value internal_binding = UbiGetInternalBinding(env);
+    if (!IsFunction(env, internal_binding)) {
+      internal_binding = GetNamed(env, global, "internalBinding");
+    }
     if (IsFunction(env, internal_binding)) {
       napi_value name = nullptr;
       if (napi_create_string_utf8(env, "symbols", NAPI_AUTO_LENGTH, &name) == napi_ok && name != nullptr) {
@@ -236,10 +321,18 @@ napi_value MessagePortConstructorCallback(napi_env env, napi_callback_info info)
 }
 
 napi_value MessagePortPostMessageCallback(napi_env env, napi_callback_info info) {
-  size_t argc = 1;
-  napi_value argv[1] = {nullptr};
+  size_t argc = 2;
+  napi_value argv[2] = {nullptr, nullptr};
   napi_value this_arg = nullptr;
   if (napi_get_cb_info(env, info, &argc, argv, &this_arg, nullptr) != napi_ok || this_arg == nullptr) {
+    return nullptr;
+  }
+
+  if (argc >= 2 && TransferListContainsMarkedUntransferable(env, argv[1])) {
+    napi_value err = CreateDataCloneError(env, "An ArrayBuffer is marked as untransferable");
+    if (err != nullptr) {
+      napi_throw(env, err);
+    }
     return nullptr;
   }
 

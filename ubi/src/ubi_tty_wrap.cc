@@ -108,6 +108,17 @@ std::string ValueToUtf8(napi_env env, napi_value value) {
 }
 
 bool ExtractByteSpan(napi_env env, napi_value value, const uint8_t** data, size_t* len, std::string* temp_utf8) {
+  bool is_buffer = false;
+  if (napi_is_buffer(env, value, &is_buffer) == napi_ok && is_buffer) {
+    void* raw = nullptr;
+    size_t length = 0;
+    if (napi_get_buffer_info(env, value, &raw, &length) == napi_ok && raw != nullptr) {
+      *data = static_cast<const uint8_t*>(raw);
+      *len = length;
+      return true;
+    }
+  }
+
   bool is_typedarray = false;
   if (napi_is_typedarray(env, value, &is_typedarray) == napi_ok && is_typedarray) {
     napi_typedarray_type typedarray_type;
@@ -140,6 +151,40 @@ bool ExtractByteSpan(napi_env env, napi_value value, const uint8_t** data, size_
   *data = reinterpret_cast<const uint8_t*>(temp_utf8->data());
   *len = temp_utf8->size();
   return true;
+}
+
+napi_value BufferFromWithEncoding(napi_env env, napi_value value, napi_value encoding) {
+  if (env == nullptr || value == nullptr) return value;
+
+  napi_value global = nullptr;
+  napi_value buffer_ctor = nullptr;
+  napi_value from_fn = nullptr;
+  napi_valuetype type = napi_undefined;
+  if (napi_get_global(env, &global) != napi_ok || global == nullptr ||
+      napi_get_named_property(env, global, "Buffer", &buffer_ctor) != napi_ok ||
+      buffer_ctor == nullptr ||
+      napi_get_named_property(env, buffer_ctor, "from", &from_fn) != napi_ok ||
+      from_fn == nullptr ||
+      napi_typeof(env, from_fn, &type) != napi_ok ||
+      type != napi_function) {
+    return value;
+  }
+
+  napi_value argv[2] = {value, nullptr};
+  size_t argc = 1;
+  if (encoding != nullptr) {
+    napi_valuetype enc_type = napi_undefined;
+    if (napi_typeof(env, encoding, &enc_type) == napi_ok && enc_type != napi_undefined) {
+      argv[1] = encoding;
+      argc = 2;
+    }
+  }
+
+  napi_value out = nullptr;
+  if (napi_call_function(env, buffer_ctor, from_fn, argc, argv, &out) != napi_ok || out == nullptr) {
+    return value;
+  }
+  return out;
 }
 
 void SetInitErrorContext(napi_env env, napi_value maybe_ctx, int err) {
@@ -303,7 +348,8 @@ void OnRead(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
         napi_get_undefined(wrap->env, &argv[0]);
       }
       napi_value ignored = nullptr;
-      UbiMakeCallback(wrap->env, self, onread, 1, argv, &ignored);
+      (void)UbiMakeCallback(wrap->env, self, onread, 1, argv, &ignored);
+      (void)UbiHandlePendingExceptionNow(wrap->env, nullptr);
     }
   }
 
@@ -342,6 +388,7 @@ napi_value TtyCtor(napi_env env, napi_callback_info info) {
   SetInitErrorContext(env, argc >= 2 ? argv[1] : nullptr, wrap->init_err);
 
   napi_wrap(env, self, wrap, TtyFinalize, nullptr, &wrap->wrapper_ref);
+  napi_set_named_property(env, self, "isStreamBase", MakeBool(env, true));
   napi_set_named_property(env, self, "reading", MakeBool(env, false));
   return self;
 }
@@ -378,6 +425,13 @@ napi_value TtyGetWindowSize(napi_env env, napi_callback_info info) {
   int width = 0;
   int height = 0;
   const int rc = uv_tty_get_winsize(&wrap->handle, &width, &height);
+  if (rc != 0 && wrap->fd >= 0 && wrap->fd <= 2) {
+    if (argc >= 1 && argv[0] != nullptr) {
+      napi_set_element(env, argv[0], 0, MakeInt32(env, 80));
+      napi_set_element(env, argv[0], 1, MakeInt32(env, 24));
+    }
+    return MakeInt32(env, 0);
+  }
   if (rc == 0 && argc >= 1 && argv[0] != nullptr) {
     napi_set_element(env, argv[0], 0, MakeInt32(env, width));
     napi_set_element(env, argv[0], 1, MakeInt32(env, height));
@@ -508,12 +562,27 @@ napi_value TtyWriteString(napi_env env, napi_callback_info info) {
   size_t argc = 2;
   napi_value argv[2] = {nullptr};
   napi_value self = nullptr;
-  napi_get_cb_info(env, info, &argc, argv, &self, nullptr);
+  void* data = nullptr;
+  napi_get_cb_info(env, info, &argc, argv, &self, &data);
   TtyWrap* wrap = nullptr;
   napi_unwrap(env, self, reinterpret_cast<void**>(&wrap));
   if (wrap == nullptr || argc < 2) return MakeInt32(env, UV_EINVAL);
-  std::string s = ValueToUtf8(env, argv[1]);
-  return TtyWriteBufferLike(env, wrap, argv[0], reinterpret_cast<const uint8_t*>(s.data()), s.size());
+
+  napi_value payload = argv[1];
+  const char* encoding_name = static_cast<const char*>(data);
+  if (encoding_name != nullptr && payload != nullptr) {
+    napi_value encoding = nullptr;
+    if (napi_create_string_utf8(env, encoding_name, NAPI_AUTO_LENGTH, &encoding) == napi_ok &&
+        encoding != nullptr) {
+      payload = BufferFromWithEncoding(env, payload, encoding);
+    }
+  }
+
+  const uint8_t* bytes = nullptr;
+  size_t length = 0;
+  std::string temp;
+  ExtractByteSpan(env, payload, &bytes, &length, &temp);
+  return TtyWriteBufferLike(env, wrap, argv[0], bytes, length);
 }
 
 napi_value TtyWritev(napi_env env, napi_callback_info info) {
@@ -525,17 +594,25 @@ napi_value TtyWritev(napi_env env, napi_callback_info info) {
   napi_unwrap(env, self, reinterpret_cast<void**>(&wrap));
   if (wrap == nullptr || (!wrap->initialized && !wrap->emulated) || argc < 2) return MakeInt32(env, UV_EINVAL);
   if (wrap->emulated) {
-    uint32_t n = 0;
-    napi_get_array_length(env, argv[1], &n);
+    uint32_t raw_len = 0;
+    napi_get_array_length(env, argv[1], &raw_len);
+    bool all_buffers = false;
+    if (argc > 2 && argv[2] != nullptr) napi_get_value_bool(env, argv[2], &all_buffers);
+    const uint32_t n = all_buffers ? raw_len : (raw_len / 2);
     size_t total = 0;
     for (uint32_t i = 0; i < n; i++) {
       napi_value chunk = nullptr;
-      if (argc > 2 && argv[2] != nullptr) {
-        bool all_buffers = false;
-        napi_get_value_bool(env, argv[2], &all_buffers);
-        napi_get_element(env, argv[1], all_buffers ? i : i * 2, &chunk);
-      } else {
-        napi_get_element(env, argv[1], i * 2, &chunk);
+      napi_get_element(env, argv[1], all_buffers ? i : (i * 2), &chunk);
+      if (!all_buffers) {
+        bool is_buffer = false;
+        napi_is_buffer(env, chunk, &is_buffer);
+        bool is_typed = false;
+        if (!is_buffer) napi_is_typedarray(env, chunk, &is_typed);
+        if (!is_buffer && !is_typed) {
+          napi_value encoding = nullptr;
+          napi_get_element(env, argv[1], i * 2 + 1, &encoding);
+          chunk = BufferFromWithEncoding(env, chunk, encoding);
+        }
       }
       const uint8_t* data = nullptr;
       size_t len = 0;
@@ -556,12 +633,19 @@ napi_value TtyWritev(napi_env env, napi_callback_info info) {
   bool all_buffers = false;
   if (argc > 2 && argv[2] != nullptr) napi_get_value_bool(env, argv[2], &all_buffers);
 
-  uint32_t n = 0;
-  napi_get_array_length(env, chunks, &n);
+  uint32_t raw_len = 0;
+  napi_get_array_length(env, chunks, &raw_len);
+  const uint32_t n = all_buffers ? raw_len : (raw_len / 2);
+  if (n == 0) {
+    SetState(kUbiBytesWritten, 0);
+    SetState(kUbiLastWriteWasAsync, 0);
+    return MakeInt32(env, 0);
+  }
+
   auto* req_wrap = new TtyWriteReqWrap();
   req_wrap->env = env;
   napi_create_reference(env, req_obj, 1, &req_wrap->req_obj_ref);
-  req_wrap->bufs = new uv_buf_t[n > 0 ? n : 1];
+  req_wrap->bufs = new uv_buf_t[n];
   req_wrap->nbufs = n;
   size_t total = 0;
 
@@ -571,6 +655,15 @@ napi_value TtyWritev(napi_env env, napi_callback_info info) {
       napi_get_element(env, chunks, i, &chunk);
     } else {
       napi_get_element(env, chunks, i * 2, &chunk);
+      bool is_buffer = false;
+      napi_is_buffer(env, chunk, &is_buffer);
+      bool is_typed = false;
+      if (!is_buffer) napi_is_typedarray(env, chunk, &is_typed);
+      if (!is_buffer && !is_typed) {
+        napi_value encoding = nullptr;
+        napi_get_element(env, chunks, i * 2 + 1, &encoding);
+        chunk = BufferFromWithEncoding(env, chunk, encoding);
+      }
     }
     const uint8_t* data = nullptr;
     size_t len = 0;
@@ -796,10 +889,14 @@ napi_value UbiInstallTtyWrapBinding(napi_env env) {
       {"writeBuffer", nullptr, TtyWriteBuffer, nullptr, nullptr, nullptr, kMethodAttrs, nullptr},
       {"writev", nullptr, TtyWritev, nullptr, nullptr, nullptr, kMethodAttrs, nullptr},
       {"shutdown", nullptr, TtyShutdown, nullptr, nullptr, nullptr, kMethodAttrs, nullptr},
-      {"writeLatin1String", nullptr, TtyWriteString, nullptr, nullptr, nullptr, kMethodAttrs, nullptr},
-      {"writeUtf8String", nullptr, TtyWriteString, nullptr, nullptr, nullptr, kMethodAttrs, nullptr},
-      {"writeAsciiString", nullptr, TtyWriteString, nullptr, nullptr, nullptr, kMethodAttrs, nullptr},
-      {"writeUcs2String", nullptr, TtyWriteString, nullptr, nullptr, nullptr, kMethodAttrs, nullptr},
+      {"writeLatin1String", nullptr, TtyWriteString, nullptr, nullptr, nullptr, kMethodAttrs,
+       const_cast<char*>("latin1")},
+      {"writeUtf8String", nullptr, TtyWriteString, nullptr, nullptr, nullptr, kMethodAttrs,
+       const_cast<char*>("utf8")},
+      {"writeAsciiString", nullptr, TtyWriteString, nullptr, nullptr, nullptr, kMethodAttrs,
+       const_cast<char*>("ascii")},
+      {"writeUcs2String", nullptr, TtyWriteString, nullptr, nullptr, nullptr, kMethodAttrs,
+       const_cast<char*>("ucs2")},
       {"close", nullptr, TtyClose, nullptr, nullptr, nullptr, kMethodAttrs, nullptr},
       {"ref", nullptr, TtyRef, nullptr, nullptr, nullptr, kMethodAttrs, nullptr},
       {"unref", nullptr, TtyUnref, nullptr, nullptr, nullptr, kMethodAttrs, nullptr},

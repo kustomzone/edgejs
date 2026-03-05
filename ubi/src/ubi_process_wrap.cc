@@ -164,6 +164,12 @@ void SetPidProperty(napi_env env, napi_value self, int32_t pid) {
   if (pid_value != nullptr) napi_set_named_property(env, self, "pid", pid_value);
 }
 
+void SetPidUndefined(napi_env env, napi_value self) {
+  napi_value undefined = nullptr;
+  napi_get_undefined(env, &undefined);
+  if (undefined != nullptr) napi_set_named_property(env, self, "pid", undefined);
+}
+
 void EmitOnExit(ProcessWrap* wrap, int32_t exit_code, int32_t signal_code, bool has_signal) {
   if (wrap == nullptr || wrap->env == nullptr || wrap->wrapper_ref == nullptr) return;
   napi_value self = nullptr;
@@ -240,7 +246,7 @@ napi_value ProcessCtor(napi_env env, napi_callback_info info) {
   auto* wrap = new ProcessWrap();
   wrap->env = env;
   napi_wrap(env, self, wrap, ProcessFinalize, nullptr, &wrap->wrapper_ref);
-  SetPidProperty(env, self, 0);
+  SetPidUndefined(env, self);
   return self;
 }
 
@@ -345,6 +351,12 @@ napi_value ProcessSpawn(napi_env env, napi_callback_info info) {
   std::string cwd;
   bool has_cwd = GetStringProperty(env, argv[0], "cwd", &cwd);
   bool detached = IsTruthyProperty(env, argv[0], "detached");
+  bool windows_hide = IsTruthyProperty(env, argv[0], "windowsHide");
+  bool windows_verbatim_arguments = IsTruthyProperty(env, argv[0], "windowsVerbatimArguments");
+  int32_t uid = 0;
+  int32_t gid = 0;
+  const bool has_uid = GetInt32Property(env, argv[0], "uid", &uid);
+  const bool has_gid = GetInt32Property(env, argv[0], "gid", &gid);
 
   std::vector<uv_stdio_container_t> stdio;
   bool has_stdio = false;
@@ -469,7 +481,21 @@ napi_value ProcessSpawn(napi_env env, napi_callback_info info) {
   options.args = args.data();
   options.exit_cb = OnProcessExit;
   options.flags = detached ? UV_PROCESS_DETACHED : 0;
-  if (has_cwd) options.cwd = cwd.c_str();
+  if (windows_hide) {
+    options.flags |= UV_PROCESS_WINDOWS_HIDE;
+  }
+  if (windows_verbatim_arguments) {
+    options.flags |= UV_PROCESS_WINDOWS_VERBATIM_ARGUMENTS;
+  }
+  if (has_uid) {
+    options.flags |= UV_PROCESS_SETUID;
+    options.uid = static_cast<uv_uid_t>(uid);
+  }
+  if (has_gid) {
+    options.flags |= UV_PROCESS_SETGID;
+    options.gid = static_cast<uv_gid_t>(gid);
+  }
+  if (has_cwd && !cwd.empty()) options.cwd = cwd.c_str();
   if (!envp.empty()) options.env = envp.data();
   options.stdio_count = static_cast<int>(stdio.size());
   options.stdio = stdio.data();
@@ -480,6 +506,9 @@ napi_value ProcessSpawn(napi_env env, napi_callback_info info) {
   if (rc != 0) {
     wrap->process_initialized = false;
     wrap->process_closed = false;
+    wrap->pid = 0;
+    wrap->alive = false;
+    SetPidUndefined(env, self);
     if (DebugProcessWrapEnabled()) {
       std::cerr << "[ubi-process-wrap] spawn file=" << file << " rc=" << rc << "\n";
     }
@@ -606,11 +635,11 @@ napi_value ProcessUnref(napi_env env, napi_callback_info info) {
 napi_value UbiInstallProcessWrapBinding(napi_env env) {
   if (env == nullptr) return nullptr;
   napi_property_descriptor methods[] = {
-      {"spawn", nullptr, ProcessSpawn, nullptr, nullptr, nullptr, napi_default, nullptr},
-      {"kill", nullptr, ProcessKill, nullptr, nullptr, nullptr, napi_default, nullptr},
-      {"close", nullptr, ProcessClose, nullptr, nullptr, nullptr, napi_default, nullptr},
-      {"ref", nullptr, ProcessRef, nullptr, nullptr, nullptr, napi_default, nullptr},
-      {"unref", nullptr, ProcessUnref, nullptr, nullptr, nullptr, napi_default, nullptr},
+      {"spawn", nullptr, ProcessSpawn, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+      {"kill", nullptr, ProcessKill, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+      {"close", nullptr, ProcessClose, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+      {"ref", nullptr, ProcessRef, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+      {"unref", nullptr, ProcessUnref, nullptr, nullptr, nullptr, napi_default_method, nullptr},
   };
 
   napi_value process_ctor = nullptr;

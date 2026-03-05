@@ -227,6 +227,15 @@ napi_value GuessHandleType(napi_env env, napi_callback_info info) {
   if (napi_get_value_int32(env, argv[0], &fd) != napi_ok || fd < 0) {
     return Undefined(env);
   }
+  const char* force_stdio_tty = std::getenv("UBI_FORCE_STDIO_TTY");
+  if (force_stdio_tty != nullptr && force_stdio_tty[0] == '1' && force_stdio_tty[1] == '\0' &&
+      fd >= 0 && fd <= 2) {
+    napi_value forced = nullptr;
+    if (napi_create_uint32(env, GetUVHandleTypeCode(UV_TTY), &forced) == napi_ok && forced != nullptr) {
+      return forced;
+    }
+    return Undefined(env);
+  }
   const uv_handle_type t = uv_guess_handle(static_cast<uv_file>(fd));
   napi_value result = nullptr;
   if (napi_create_uint32(env, GetUVHandleTypeCode(t), &result) != napi_ok || result == nullptr) {
@@ -253,7 +262,8 @@ napi_value IsInsideNodeModulesCallback(napi_env env, napi_callback_info info) {
   if (frame_limit < 1) frame_limit = 1;
 
   bool result = false;
-  uint32_t frames = static_cast<uint32_t>(frame_limit);
+  uint32_t frames = static_cast<uint32_t>(frame_limit + 32);
+  if (frames < 64) frames = 64;
   if (frames > 200) frames = 200;
 
   napi_value callsites = nullptr;
@@ -277,11 +287,13 @@ napi_value IsInsideNodeModulesCallback(napi_env env, napi_callback_info info) {
           if (script_name_str.empty()) continue;
           if (IsInternalScriptName(script_name_str)) continue;
 
-          result = script_name_str.find("/node_modules/") != std::string::npos ||
-                   script_name_str.find("\\node_modules\\") != std::string::npos ||
-                   script_name_str.find("/node_modules\\") != std::string::npos ||
-                   script_name_str.find("\\node_modules/") != std::string::npos;
-          break;
+          if (script_name_str.find("/node_modules/") != std::string::npos ||
+              script_name_str.find("\\node_modules\\") != std::string::npos ||
+              script_name_str.find("/node_modules\\") != std::string::npos ||
+              script_name_str.find("\\node_modules/") != std::string::npos) {
+            result = true;
+            break;
+          }
         }
       }
     }
@@ -443,6 +455,11 @@ napi_value GetOwnNonIndexPropertiesCallback(napi_env env, napi_callback_info inf
   napi_value source = argv[0];
   uint32_t filter_bits = 0;
   napi_get_value_uint32(env, argv[1], &filter_bits);
+  napi_value global = GetGlobal(env);
+  bool source_is_global = false;
+  if (global != nullptr) {
+    (void)napi_strict_equals(env, source, global, &source_is_global);
+  }
 
   napi_value keys = nullptr;
   if (napi_get_all_property_names(env,
@@ -475,6 +492,12 @@ napi_value GetOwnNonIndexPropertiesCallback(napi_env env, napi_callback_info inf
 
     const std::string text = ToUtf8(env, key);
     if (IsArrayIndexString(text)) continue;
+    // internalBinding() is bootstrap-only in Node and should not leak into
+    // REPL/global completion surfaces.
+    if (source_is_global &&
+        (text == "internalBinding" || text == "getInternalBinding" || text == "getLinkedBinding")) {
+      continue;
+    }
     napi_set_element(env, out, out_idx++, key);
   }
 

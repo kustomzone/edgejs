@@ -37,6 +37,7 @@
 #include "ubi_timers_host.h"
 
 #if defined(_WIN32)
+#include <io.h>
 #include <stdlib.h>
 extern char** _environ;
 #elif defined(__APPLE__)
@@ -59,6 +60,7 @@ namespace {
 const auto g_process_start_time = std::chrono::steady_clock::now();
 const auto g_cpu_usage_start = std::chrono::steady_clock::now();
 std::string g_ubi_exec_path;
+std::string g_ubi_argv0;
 uint32_t g_process_umask = 0022;
 
 #ifndef UBI_EMBEDDED_V8_VERSION
@@ -116,6 +118,28 @@ std::string GetLlhttpVersion() {
   return std::string(UBI_STRINGIFY(LLHTTP_VERSION_MAJOR)) + "." +
          UBI_STRINGIFY(LLHTTP_VERSION_MINOR) + "." +
          UBI_STRINGIFY(LLHTTP_VERSION_PATCH);
+}
+
+void WriteTextToFd(int fd, const std::string& text) {
+  if (text.empty()) return;
+  size_t offset = 0;
+  while (offset < text.size()) {
+#if defined(_WIN32)
+    const unsigned int remaining = static_cast<unsigned int>(text.size() - offset);
+    const int written = _write(fd, text.data() + offset, remaining);
+    if (written <= 0) break;
+    offset += static_cast<size_t>(written);
+#else
+    const size_t remaining = text.size() - offset;
+    const ssize_t written = ::write(fd, text.data() + offset, remaining);
+    if (written > 0) {
+      offset += static_cast<size_t>(written);
+      continue;
+    }
+    if (written < 0 && errno == EINTR) continue;
+    break;
+#endif
+  }
 }
 
 std::string ExtractPackageVersionFromJson(const std::string& json_text) {
@@ -592,6 +616,13 @@ bool SetNamedValue(napi_env env, napi_value obj, const char* name, napi_value va
   return napi_set_named_property(env, obj, name, value) == napi_ok;
 }
 
+bool SetFunctionPrototypeUndefined(napi_env env, napi_value fn) {
+  if (fn == nullptr) return false;
+  napi_value undefined = nullptr;
+  if (napi_get_undefined(env, &undefined) != napi_ok || undefined == nullptr) return false;
+  return napi_set_named_property(env, fn, "prototype", undefined) == napi_ok;
+}
+
 bool CopyNamedProperty(napi_env env, napi_value from, napi_value to, const char* name) {
   bool has = false;
   if (from == nullptr || to == nullptr) return false;
@@ -1042,6 +1073,277 @@ void CopyProcessEnvironmentToObject(napi_env env, napi_value env_obj) {
   }
 }
 
+bool EnvKeyFromProperty(napi_env env, napi_value property, std::string* key_out, bool* is_symbol_out) {
+  if (key_out == nullptr || is_symbol_out == nullptr) return false;
+  *key_out = "";
+  *is_symbol_out = false;
+  if (property == nullptr) return false;
+
+  napi_valuetype type = napi_undefined;
+  if (napi_typeof(env, property, &type) != napi_ok) return false;
+  if (type == napi_symbol) {
+    *is_symbol_out = true;
+    return true;
+  }
+  if (type != napi_string) {
+    if (napi_coerce_to_string(env, property, &property) != napi_ok || property == nullptr) return false;
+  }
+  *key_out = NapiValueToUtf8(env, property);
+  return true;
+}
+
+void ProcessEnvSetVariable(const std::string& key, const std::string& value) {
+  if (key.empty()) return;
+#if defined(_WIN32)
+  _putenv_s(key.c_str(), value.c_str());
+  if (key == "TZ") {
+    _tzset();
+  }
+#else
+  setenv(key.c_str(), value.c_str(), 1);
+  if (key == "TZ") {
+    tzset();
+  }
+#endif
+}
+
+void ProcessEnvUnsetVariable(const std::string& key) {
+  if (key.empty()) return;
+#if defined(_WIN32)
+  _putenv_s(key.c_str(), "");
+  if (key == "TZ") {
+    _tzset();
+  }
+#else
+  unsetenv(key.c_str());
+  if (key == "TZ") {
+    tzset();
+  }
+#endif
+}
+
+void MaybeNotifyDateTimeConfigurationChange(napi_env env, const std::string& key) {
+  if (env == nullptr || key != "TZ") return;
+  (void)unofficial_napi_notify_datetime_configuration_change(env);
+}
+
+bool GetDescriptorBool(napi_env env, napi_value descriptor, const char* name, bool* out) {
+  if (out == nullptr) return false;
+  *out = false;
+  bool has = false;
+  if (napi_has_named_property(env, descriptor, name, &has) != napi_ok || !has) return false;
+  napi_value value = nullptr;
+  if (napi_get_named_property(env, descriptor, name, &value) != napi_ok || value == nullptr) return false;
+  return napi_get_value_bool(env, value, out) == napi_ok;
+}
+
+bool DescriptorHasAccessorValue(napi_env env, napi_value descriptor, const char* name) {
+  bool has = false;
+  if (napi_has_named_property(env, descriptor, name, &has) != napi_ok || !has) return false;
+  napi_value value = nullptr;
+  if (napi_get_named_property(env, descriptor, name, &value) != napi_ok || value == nullptr) return false;
+  napi_valuetype type = napi_undefined;
+  if (napi_typeof(env, value, &type) != napi_ok) return false;
+  return type != napi_undefined;
+}
+
+napi_value ProcessEnvProxyGetTrap(napi_env env, napi_callback_info info) {
+  size_t argc = 4;
+  napi_value argv[4] = {nullptr, nullptr, nullptr, nullptr};
+  napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+  if (argc < 2 || argv[0] == nullptr) return nullptr;
+  std::string key;
+  bool is_symbol = false;
+  if (!EnvKeyFromProperty(env, argv[1], &key, &is_symbol)) return nullptr;
+  if (is_symbol) {
+    napi_value undefined = nullptr;
+    napi_get_undefined(env, &undefined);
+    return undefined;
+  }
+  if (key.empty()) {
+    napi_value undefined = nullptr;
+    napi_get_undefined(env, &undefined);
+    return undefined;
+  }
+  napi_value out = nullptr;
+  if (napi_get_property(env, argv[0], argv[1], &out) != napi_ok) return nullptr;
+  return out;
+}
+
+napi_value ProcessEnvProxySetTrap(napi_env env, napi_callback_info info) {
+  size_t argc = 4;
+  napi_value argv[4] = {nullptr, nullptr, nullptr, nullptr};
+  napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+  if (argc < 3 || argv[0] == nullptr) return nullptr;
+
+  std::string key;
+  bool is_symbol = false;
+  if (!EnvKeyFromProperty(env, argv[1], &key, &is_symbol)) return nullptr;
+  if (is_symbol) {
+    napi_value false_value = nullptr;
+    napi_get_boolean(env, false, &false_value);
+    return false_value;
+  }
+  if (key.empty()) {
+    bool deleted = false;
+    napi_delete_property(env, argv[0], argv[1], &deleted);
+    napi_value true_value = nullptr;
+    napi_get_boolean(env, true, &true_value);
+    return true_value;
+  }
+
+  napi_value coerced = nullptr;
+  if (napi_coerce_to_string(env, argv[2], &coerced) != napi_ok || coerced == nullptr) {
+    return nullptr;
+  }
+  const std::string value = NapiValueToUtf8(env, coerced);
+
+  if (napi_set_property(env, argv[0], argv[1], coerced) != napi_ok) return nullptr;
+  ProcessEnvSetVariable(key, value);
+  MaybeNotifyDateTimeConfigurationChange(env, key);
+
+  napi_value true_value = nullptr;
+  napi_get_boolean(env, true, &true_value);
+  return true_value;
+}
+
+napi_value ProcessEnvProxyHasTrap(napi_env env, napi_callback_info info) {
+  size_t argc = 2;
+  napi_value argv[2] = {nullptr, nullptr};
+  napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+  bool has = false;
+  if (argc >= 2 && argv[0] != nullptr && argv[1] != nullptr) {
+    std::string key;
+    bool is_symbol = false;
+    if (EnvKeyFromProperty(env, argv[1], &key, &is_symbol) && !is_symbol && !key.empty()) {
+      napi_has_property(env, argv[0], argv[1], &has);
+    }
+  }
+  napi_value out = nullptr;
+  napi_get_boolean(env, has, &out);
+  return out;
+}
+
+napi_value ProcessEnvProxyDeletePropertyTrap(napi_env env, napi_callback_info info) {
+  size_t argc = 2;
+  napi_value argv[2] = {nullptr, nullptr};
+  napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+  if (argc >= 2 && argv[0] != nullptr && argv[1] != nullptr) {
+    std::string key;
+    bool is_symbol = false;
+    if (EnvKeyFromProperty(env, argv[1], &key, &is_symbol) && !is_symbol) {
+      bool deleted = false;
+      napi_delete_property(env, argv[0], argv[1], &deleted);
+      if (!key.empty()) {
+        ProcessEnvUnsetVariable(key);
+        MaybeNotifyDateTimeConfigurationChange(env, key);
+      }
+    }
+  }
+  napi_value out = nullptr;
+  napi_get_boolean(env, true, &out);
+  return out;
+}
+
+napi_value ProcessEnvProxyDefinePropertyTrap(napi_env env, napi_callback_info info) {
+  size_t argc = 3;
+  napi_value argv[3] = {nullptr, nullptr, nullptr};
+  napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+  if (argc < 3 || argv[0] == nullptr || argv[1] == nullptr || argv[2] == nullptr) return nullptr;
+
+  if (DescriptorHasAccessorValue(env, argv[2], "get") || DescriptorHasAccessorValue(env, argv[2], "set")) {
+    napi_throw_type_error(env,
+                          "ERR_INVALID_OBJECT_DEFINE_PROPERTY",
+                          "'process.env' does not accept an accessor(getter/setter) descriptor");
+    return nullptr;
+  }
+
+  bool configurable = false;
+  bool writable = false;
+  bool enumerable = false;
+  if (!GetDescriptorBool(env, argv[2], "configurable", &configurable) || !configurable ||
+      !GetDescriptorBool(env, argv[2], "writable", &writable) || !writable ||
+      !GetDescriptorBool(env, argv[2], "enumerable", &enumerable) || !enumerable) {
+    napi_throw_type_error(env,
+                          "ERR_INVALID_OBJECT_DEFINE_PROPERTY",
+                          "'process.env' only accepts a configurable, writable, and enumerable data descriptor");
+    return nullptr;
+  }
+
+  std::string key;
+  bool is_symbol = false;
+  if (!EnvKeyFromProperty(env, argv[1], &key, &is_symbol)) return nullptr;
+  if (is_symbol) {
+    napi_value false_value = nullptr;
+    napi_get_boolean(env, false, &false_value);
+    return false_value;
+  }
+  if (key.empty()) {
+    bool deleted = false;
+    napi_delete_property(env, argv[0], argv[1], &deleted);
+    napi_value true_value = nullptr;
+    napi_get_boolean(env, true, &true_value);
+    return true_value;
+  }
+
+  bool has_value = false;
+  napi_has_named_property(env, argv[2], "value", &has_value);
+  napi_value value = nullptr;
+  if (has_value && napi_get_named_property(env, argv[2], "value", &value) == napi_ok && value != nullptr) {
+    napi_value coerced = nullptr;
+    if (napi_coerce_to_string(env, value, &coerced) != napi_ok || coerced == nullptr) return nullptr;
+    const std::string text = NapiValueToUtf8(env, coerced);
+    if (napi_set_property(env, argv[0], argv[1], coerced) != napi_ok) return nullptr;
+    ProcessEnvSetVariable(key, text);
+    MaybeNotifyDateTimeConfigurationChange(env, key);
+  } else {
+    napi_value undefined = nullptr;
+    napi_get_undefined(env, &undefined);
+    if (napi_set_property(env, argv[0], argv[1], undefined) != napi_ok) return nullptr;
+    ProcessEnvUnsetVariable(key);
+    MaybeNotifyDateTimeConfigurationChange(env, key);
+  }
+
+  napi_value true_value = nullptr;
+  napi_get_boolean(env, true, &true_value);
+  return true_value;
+}
+
+napi_value CreateProcessEnvObject(napi_env env) {
+  napi_value target = nullptr;
+  if (napi_create_object(env, &target) != napi_ok || target == nullptr) return nullptr;
+  CopyProcessEnvironmentToObject(env, target);
+
+  napi_value handler = nullptr;
+  if (napi_create_object(env, &handler) != napi_ok || handler == nullptr) return target;
+
+  auto set_trap = [&](const char* name, napi_callback cb) {
+    napi_value fn = nullptr;
+    if (napi_create_function(env, name, NAPI_AUTO_LENGTH, cb, nullptr, &fn) == napi_ok && fn != nullptr) {
+      napi_set_named_property(env, handler, name, fn);
+    }
+  };
+  set_trap("get", ProcessEnvProxyGetTrap);
+  set_trap("set", ProcessEnvProxySetTrap);
+  set_trap("has", ProcessEnvProxyHasTrap);
+  set_trap("deleteProperty", ProcessEnvProxyDeletePropertyTrap);
+  set_trap("defineProperty", ProcessEnvProxyDefinePropertyTrap);
+
+  napi_value global = nullptr;
+  napi_value proxy_ctor = nullptr;
+  if (napi_get_global(env, &global) != napi_ok || global == nullptr ||
+      napi_get_named_property(env, global, "Proxy", &proxy_ctor) != napi_ok ||
+      proxy_ctor == nullptr) {
+    return target;
+  }
+  napi_value argv[2] = {target, handler};
+  napi_value proxy = nullptr;
+  if (napi_new_instance(env, proxy_ctor, 2, argv, &proxy) != napi_ok || proxy == nullptr) {
+    return target;
+  }
+  return proxy;
+}
+
 void MaybeInvokeWriteCallback(napi_env env, napi_value maybe_fn) {
   if (maybe_fn == nullptr) return;
   napi_valuetype type = napi_undefined;
@@ -1062,8 +1364,7 @@ napi_value ProcessStdoutWriteCallback(napi_env env, napi_callback_info info) {
   napi_value argv[2] = {nullptr, nullptr};
   if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) == napi_ok && argc >= 1 && argv[0] != nullptr) {
     const std::string out = NapiValueToUtf8(env, argv[0]);
-    std::cout << out;
-    std::cout.flush();
+    WriteTextToFd(1, out);
   }
   if (argc >= 2) MaybeInvokeWriteCallback(env, argv[1]);
   napi_value undefined = nullptr;
@@ -1076,8 +1377,7 @@ napi_value ProcessStderrWriteCallback(napi_env env, napi_callback_info info) {
   napi_value argv[2] = {nullptr, nullptr};
   if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) == napi_ok && argc >= 1 && argv[0] != nullptr) {
     const std::string out = NapiValueToUtf8(env, argv[0]);
-    std::cerr << out;
-    std::cerr.flush();
+    WriteTextToFd(2, out);
   }
   if (argc >= 2) MaybeInvokeWriteCallback(env, argv[1]);
   napi_value undefined = nullptr;
@@ -1468,7 +1768,7 @@ napi_value ProcessExitCallback(napi_env env, napi_callback_info info) {
 }
 
 napi_value ProcessAbortCallback(napi_env env, napi_callback_info info) {
-  ThrowErrorWithCode(env, "ERR_UBI_PROCESS_ABORT", "process.abort()");
+  napi_throw_type_error(env, "ERR_INVALID_THIS", "process.abort()");
   return nullptr;
 }
 
@@ -1950,7 +2250,14 @@ napi_value ProcessMethodsGetActiveResourcesInfoCallback(napi_env env, napi_callb
       "    if (Array.isArray(reqs)) {"
       "      for (let i = 0; i < reqs.length; i++) {"
       "        const req = reqs[i];"
-      "        if (req && typeof req.type === 'string') out.push(req.type);"
+      "        if (req && typeof req.type === 'string') {"
+      "          out.push(req.type);"
+      "        } else if (req && req.constructor && typeof req.constructor.name === 'string' &&"
+      "                   req.constructor.name.length > 0) {"
+      "          out.push(req.constructor.name);"
+      "        } else if (req) {"
+      "          out.push('FSReqCallback');"
+      "        }"
       "      }"
       "    }"
       "  } catch {}"
@@ -2492,6 +2799,10 @@ void ReportBindingFinalize(napi_env env, void* data, void* hint) {
 
 }  // namespace
 
+void UbiSetProcessArgv0(const std::string& argv0) {
+  g_ubi_argv0 = argv0;
+}
+
 napi_status UbiInstallProcessObject(napi_env env,
                                       const std::string& current_script_path,
                                       const std::vector<std::string>& exec_argv,
@@ -2499,6 +2810,7 @@ napi_status UbiInstallProcessObject(napi_env env,
                                       const std::string& process_title) {
   if (env == nullptr) return napi_invalid_arg;
   if (g_ubi_exec_path.empty()) g_ubi_exec_path = DetectExecPath();
+  if (g_ubi_argv0.empty()) g_ubi_argv0 = g_ubi_exec_path;
   napi_value global = nullptr;
   napi_status status = napi_get_global(env, &global);
   if (status != napi_ok || global == nullptr) return (status == napi_ok) ? napi_generic_failure : status;
@@ -2506,12 +2818,10 @@ napi_status UbiInstallProcessObject(napi_env env,
   status = napi_create_object(env, &process_obj);
   if (status != napi_ok || process_obj == nullptr) return (status == napi_ok) ? napi_generic_failure : status;
 
-  napi_value env_obj = nullptr;
-  status = napi_create_object(env, &env_obj);
-  if (status != napi_ok || env_obj == nullptr) return (status == napi_ok) ? napi_generic_failure : status;
+  napi_value env_obj = CreateProcessEnvObject(env);
+  if (env_obj == nullptr) return napi_generic_failure;
   status = napi_set_named_property(env, process_obj, "env", env_obj);
   if (status != napi_ok) return status;
-  CopyProcessEnvironmentToObject(env, env_obj);
 
   napi_value argv_arr = nullptr;
   const bool has_script_path = !current_script_path.empty();
@@ -2519,7 +2829,7 @@ napi_status UbiInstallProcessObject(napi_env env,
   status = napi_create_array_with_length(env, argv_len, &argv_arr);
   if (status != napi_ok || argv_arr == nullptr) return (status == napi_ok) ? napi_generic_failure : status;
   napi_value exec_argv0 = nullptr;
-  napi_create_string_utf8(env, g_ubi_exec_path.c_str(), NAPI_AUTO_LENGTH, &exec_argv0);
+  napi_create_string_utf8(env, g_ubi_argv0.c_str(), NAPI_AUTO_LENGTH, &exec_argv0);
   if (exec_argv0 != nullptr) napi_set_element(env, argv_arr, 0, exec_argv0);
   if (has_script_path) {
     napi_value script_argv1 = nullptr;
@@ -2564,7 +2874,7 @@ napi_status UbiInstallProcessObject(napi_env env,
   if (status != napi_ok) return status;
 
   napi_value argv0_value = nullptr;
-  status = napi_create_string_utf8(env, g_ubi_exec_path.c_str(), NAPI_AUTO_LENGTH, &argv0_value);
+  status = napi_create_string_utf8(env, g_ubi_argv0.c_str(), NAPI_AUTO_LENGTH, &argv0_value);
   if (status != napi_ok || argv0_value == nullptr) return (status == napi_ok) ? napi_generic_failure : status;
   status = napi_set_named_property(env, process_obj, "argv0", argv0_value);
   if (status != napi_ok) return status;
@@ -2630,6 +2940,7 @@ napi_status UbiInstallProcessObject(napi_env env,
   napi_value abort_fn = nullptr;
   status = napi_create_function(env, "abort", NAPI_AUTO_LENGTH, ProcessAbortCallback, nullptr, &abort_fn);
   if (status != napi_ok || abort_fn == nullptr) return (status == napi_ok) ? napi_generic_failure : status;
+  if (!SetFunctionPrototypeUndefined(env, abort_fn)) return napi_generic_failure;
   status = napi_set_named_property(env, process_obj, "abort", abort_fn);
   if (status != napi_ok) return status;
 
@@ -2882,6 +3193,9 @@ napi_status UbiInstallProcessObject(napi_env env,
       if (napi_create_function(env, method.name, NAPI_AUTO_LENGTH, method.cb, nullptr, &fn) != napi_ok ||
           fn == nullptr ||
           napi_set_named_property(env, binding, method.name, fn) != napi_ok) {
+        return napi_generic_failure;
+      }
+      if (std::strcmp(method.name, "abort") == 0 && !SetFunctionPrototypeUndefined(env, fn)) {
         return napi_generic_failure;
       }
     }

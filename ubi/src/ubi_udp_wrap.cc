@@ -11,6 +11,7 @@
 
 #include <uv.h>
 #if !defined(_WIN32)
+#include <net/if.h>
 #include <sys/socket.h>
 #endif
 
@@ -26,6 +27,8 @@ struct UdpSendReqWrap {
   napi_ref req_obj_ref = nullptr;
   uv_buf_t* bufs = nullptr;
   uint32_t nbufs = 0;
+  size_t msg_size = 0;
+  bool have_callback = false;
   UdpWrap* udp = nullptr;
 };
 
@@ -80,6 +83,122 @@ std::string ValueToUtf8(napi_env env, napi_value value) {
   if (napi_get_value_string_utf8(env, value, out.data(), out.size(), &copied) != napi_ok) return {};
   out.resize(copied);
   return out;
+}
+
+std::string FormatIPv6AddressWithScope(const sockaddr_in6* a6) {
+  if (a6 == nullptr) return "";
+  char ip[INET6_ADDRSTRLEN] = {0};
+  uv_ip6_name(a6, ip, sizeof(ip));
+  std::string out(ip);
+  if (a6->sin6_scope_id == 0) return out;
+#if defined(_WIN32)
+  out += "%";
+  out += std::to_string(static_cast<unsigned int>(a6->sin6_scope_id));
+#else
+  char ifname[IF_NAMESIZE] = {0};
+  if (if_indextoname(a6->sin6_scope_id, ifname) != nullptr && ifname[0] != '\0') {
+    out += "%";
+    out += ifname;
+  } else {
+    out += "%";
+    out += std::to_string(static_cast<unsigned int>(a6->sin6_scope_id));
+  }
+#endif
+  return out;
+}
+
+size_t TypedArrayElementSize(napi_typedarray_type type) {
+  switch (type) {
+    case napi_int8_array:
+    case napi_uint8_array:
+    case napi_uint8_clamped_array:
+      return 1;
+    case napi_int16_array:
+    case napi_uint16_array:
+      return 2;
+    case napi_int32_array:
+    case napi_uint32_array:
+    case napi_float32_array:
+      return 4;
+    case napi_float64_array:
+    case napi_bigint64_array:
+    case napi_biguint64_array:
+      return 8;
+    default:
+      return 1;
+  }
+}
+
+bool ReadUint32Property(napi_env env, napi_value obj, const char* key, uint32_t* out) {
+  if (obj == nullptr || out == nullptr) return false;
+  napi_value v = nullptr;
+  if (napi_get_named_property(env, obj, key, &v) != napi_ok || v == nullptr) return false;
+  return napi_get_value_uint32(env, v, out) == napi_ok;
+}
+
+bool ExtractArrayBufferViewBytes(napi_env env, napi_value value, const char** src, size_t* len) {
+  if (value == nullptr || src == nullptr || len == nullptr) return false;
+  *src = nullptr;
+  *len = 0;
+
+  bool is_typed = false;
+  if (napi_is_typedarray(env, value, &is_typed) == napi_ok && is_typed) {
+    napi_typedarray_type tt = napi_uint8_array;
+    size_t element_len = 0;
+    void* data = nullptr;
+    napi_value ab = nullptr;
+    size_t off = 0;
+    if (napi_get_typedarray_info(env, value, &tt, &element_len, &data, &ab, &off) != napi_ok || data == nullptr) {
+      return false;
+    }
+    *src = static_cast<const char*>(data);
+    uint32_t byte_len = 0;
+    if (ReadUint32Property(env, value, "byteLength", &byte_len)) {
+      *len = static_cast<size_t>(byte_len);
+    } else {
+      *len = element_len * TypedArrayElementSize(tt);
+    }
+    return true;
+  }
+
+  bool is_dataview = false;
+  if (napi_is_dataview(env, value, &is_dataview) == napi_ok && is_dataview) {
+    void* data = nullptr;
+    napi_value ab = nullptr;
+    size_t off = 0;
+    if (napi_get_dataview_info(env, value, len, &data, &ab, &off) != napi_ok || data == nullptr) return false;
+    *src = static_cast<const char*>(data);
+    return true;
+  }
+
+  napi_value ab = nullptr;
+  if (napi_get_named_property(env, value, "buffer", &ab) == napi_ok && ab != nullptr) {
+    bool is_arraybuffer = false;
+    if (napi_is_arraybuffer(env, ab, &is_arraybuffer) == napi_ok && is_arraybuffer) {
+      void* base = nullptr;
+      size_t ab_len = 0;
+      if (napi_get_arraybuffer_info(env, ab, &base, &ab_len) == napi_ok && base != nullptr) {
+        uint32_t byte_offset = 0;
+        uint32_t byte_len = 0;
+        if (!ReadUint32Property(env, value, "byteOffset", &byte_offset)) byte_offset = 0;
+        if (!ReadUint32Property(env, value, "byteLength", &byte_len)) return false;
+        if (static_cast<size_t>(byte_offset) + static_cast<size_t>(byte_len) > ab_len) return false;
+        *src = static_cast<const char*>(base) + byte_offset;
+        *len = static_cast<size_t>(byte_len);
+        return true;
+      }
+    }
+  }
+
+  bool is_arraybuffer = false;
+  if (napi_is_arraybuffer(env, value, &is_arraybuffer) == napi_ok && is_arraybuffer) {
+    void* data = nullptr;
+    if (napi_get_arraybuffer_info(env, value, &data, len) != napi_ok || data == nullptr) return false;
+    *src = static_cast<const char*>(data);
+    return true;
+  }
+
+  return false;
 }
 
 void SetReqError(napi_env env, napi_value req_obj, int status) {
@@ -153,24 +272,25 @@ napi_value UdpCtor(napi_env env, napi_callback_info info) {
   return self;
 }
 
-void InvokeReqOnComplete(napi_env env, napi_value req_obj, int status) {
+void InvokeReqOnComplete(napi_env env, napi_value req_obj, int status, uint32_t sent, bool have_callback) {
   if (req_obj == nullptr) return;
   SetReqError(env, req_obj, status);
+  if (!have_callback) return;
   napi_value oncomplete = nullptr;
   if (napi_get_named_property(env, req_obj, "oncomplete", &oncomplete) != napi_ok || oncomplete == nullptr) return;
   napi_valuetype t = napi_undefined;
   napi_typeof(env, oncomplete, &t);
   if (t != napi_function) return;
-  napi_value argv[1] = {MakeInt32(env, status)};
+  napi_value argv[2] = {MakeInt32(env, status), MakeInt32(env, static_cast<int32_t>(sent))};
   napi_value ignored = nullptr;
-  UbiMakeCallback(env, req_obj, oncomplete, 1, argv, &ignored);
+  UbiMakeCallback(env, req_obj, oncomplete, 2, argv, &ignored);
 }
 
 void OnSendDone(uv_udp_send_t* req, int status) {
   auto* sr = static_cast<UdpSendReqWrap*>(req->data);
   if (sr == nullptr) return;
   napi_value req_obj = GetRefValue(sr->env, sr->req_obj_ref);
-  InvokeReqOnComplete(sr->env, req_obj, status);
+  InvokeReqOnComplete(sr->env, req_obj, status, static_cast<uint32_t>(sr->msg_size), sr->have_callback);
   if (sr->bufs != nullptr) {
     for (uint32_t i = 0; i < sr->nbufs; i++) free(sr->bufs[i].base);
     delete[] sr->bufs;
@@ -187,8 +307,11 @@ void OnAlloc(uv_handle_t* /*h*/, size_t suggested_size, uv_buf_t* buf) {
 napi_value MakeBufferFromBytes(napi_env env, const char* data, size_t len) {
   void* out = nullptr;
   napi_value ab = nullptr;
-  if (napi_create_arraybuffer(env, len, &out, &ab) != napi_ok || out == nullptr || ab == nullptr) return nullptr;
-  if (len > 0) memcpy(out, data, len);
+  if (napi_create_arraybuffer(env, len, &out, &ab) != napi_ok || ab == nullptr) return nullptr;
+  if (len > 0) {
+    if (out == nullptr || data == nullptr) return nullptr;
+    memcpy(out, data, len);
+  }
   napi_value view = nullptr;
   if (napi_create_typedarray(env, napi_uint8_array, len, ab, 0, &view) != napi_ok || view == nullptr) return nullptr;
 
@@ -213,6 +336,12 @@ void OnRecv(uv_udp_t* handle, ssize_t nread, const uv_buf_t* buf, const sockaddr
     if (buf && buf->base) free(buf->base);
     return;
   }
+  // Mirror Node/libuv behavior: ignore empty probe reads that have no address.
+  // Zero-length datagrams still have an address and should be delivered.
+  if (nread == 0 && addr == nullptr) {
+    if (buf && buf->base) free(buf->base);
+    return;
+  }
   napi_value self = GetRefValue(wrap->env, wrap->wrapper_ref);
   napi_value onmessage = nullptr;
   if (self != nullptr &&
@@ -222,37 +351,44 @@ void OnRecv(uv_udp_t* handle, ssize_t nread, const uv_buf_t* buf, const sockaddr
     napi_typeof(wrap->env, onmessage, &t);
     if (t == napi_function) {
       napi_value argv[4] = {MakeInt32(wrap->env, static_cast<int32_t>(nread)), self, nullptr, nullptr};
-      if (nread > 0 && buf != nullptr && buf->base != nullptr) {
+      if (nread >= 0 && buf != nullptr && buf->base != nullptr) {
         argv[2] = MakeBufferFromBytes(wrap->env, buf->base, static_cast<size_t>(nread));
+        if (argv[2] == nullptr) napi_get_undefined(wrap->env, &argv[2]);
       } else {
         napi_get_undefined(wrap->env, &argv[2]);
       }
       napi_value rinfo = nullptr;
       napi_create_object(wrap->env, &rinfo);
       if (addr != nullptr) {
-        char ip[INET6_ADDRSTRLEN] = {0};
+        std::string ip;
         int port = 0;
         const char* fam = "IPv4";
         if (addr->sa_family == AF_INET6) {
           auto* a6 = reinterpret_cast<const sockaddr_in6*>(addr);
-          uv_ip6_name(a6, ip, sizeof(ip));
+          ip = FormatIPv6AddressWithScope(a6);
           port = ntohs(a6->sin6_port);
           fam = "IPv6";
         } else {
+          char ip4[INET6_ADDRSTRLEN] = {0};
           auto* a4 = reinterpret_cast<const sockaddr_in*>(addr);
-          uv_ip4_name(a4, ip, sizeof(ip));
+          uv_ip4_name(a4, ip4, sizeof(ip4));
+          ip = ip4;
           port = ntohs(a4->sin_port);
         }
         napi_value ip_v = nullptr;
         napi_value fam_v = nullptr;
         napi_value port_v = nullptr;
-        napi_create_string_utf8(wrap->env, ip, NAPI_AUTO_LENGTH, &ip_v);
+        napi_value size_v = nullptr;
+        napi_create_string_utf8(wrap->env, ip.c_str(), NAPI_AUTO_LENGTH, &ip_v);
         napi_create_string_utf8(wrap->env, fam, NAPI_AUTO_LENGTH, &fam_v);
         napi_create_int32(wrap->env, port, &port_v);
+        napi_create_int32(wrap->env, nread >= 0 ? static_cast<int32_t>(nread) : 0, &size_v);
         if (ip_v) napi_set_named_property(wrap->env, rinfo, "address", ip_v);
         if (fam_v) napi_set_named_property(wrap->env, rinfo, "family", fam_v);
         if (port_v) napi_set_named_property(wrap->env, rinfo, "port", port_v);
+        if (size_v) napi_set_named_property(wrap->env, rinfo, "size", size_v);
       }
+      if (rinfo == nullptr) napi_get_undefined(wrap->env, &rinfo);
       argv[3] = rinfo;
       napi_value ignored = nullptr;
       UbiMakeCallback(wrap->env, self, onmessage, 4, argv, &ignored);
@@ -408,51 +544,85 @@ napi_value UdpSend(napi_env env, napi_callback_info info) {
   sr->udp = wrap;
   sr->req.data = sr;
   sr->nbufs = list_len;
+  sr->msg_size = 0;
+  bool have_callback = false;
+  if (argc >= 6 && argv[5] != nullptr) {
+    napi_get_value_bool(env, argv[5], &have_callback);
+  } else if (argc >= 4 && argv[3] != nullptr) {
+    napi_get_value_bool(env, argv[3], &have_callback);
+  }
+  sr->have_callback = have_callback;
   sr->bufs = new uv_buf_t[list_len > 0 ? list_len : 1];
   napi_create_reference(env, req_obj, 1, &sr->req_obj_ref);
 
   for (uint32_t i = 0; i < list_len; i++) {
     napi_value chunk = nullptr;
     napi_get_element(env, list, i, &chunk);
-    bool is_typed = false;
-    napi_is_typedarray(env, chunk, &is_typed);
     const char* src = nullptr;
     size_t len = 0;
     std::string tmp;
-    if (is_typed) {
-      napi_typedarray_type tt;
-      void* data = nullptr;
-      napi_value ab;
-      size_t off;
-      napi_get_typedarray_info(env, chunk, &tt, &len, &data, &ab, &off);
-      src = static_cast<const char*>(data);
-    } else {
+    if (!ExtractArrayBufferViewBytes(env, chunk, &src, &len)) {
       tmp = ValueToUtf8(env, chunk);
       src = tmp.data();
       len = tmp.size();
     }
-    char* copy = static_cast<char*>(malloc(len));
+    // Keep a stable non-null base pointer even for zero-length datagrams.
+    // Some libuv/platform paths may still dereference base regardless of len.
+    char* copy = static_cast<char*>(malloc(len > 0 ? len : 1));
     if (len > 0 && src != nullptr) memcpy(copy, src, len);
     sr->bufs[i] = uv_buf_init(copy, static_cast<unsigned int>(len));
+    sr->msg_size += len;
   }
 
+  sockaddr_storage ss{};
+  const sockaddr* send_addr = nullptr;
   int rc = 0;
   if (argc >= 5 && argv[3] != nullptr && argv[4] != nullptr) {
     int32_t port = 0;
     napi_get_value_int32(env, argv[3], &port);
     std::string ip = ValueToUtf8(env, argv[4]);
-    sockaddr_storage ss{};
     if (ip.find(':') != std::string::npos) {
       auto* a6 = reinterpret_cast<sockaddr_in6*>(&ss);
       uv_ip6_addr(ip.c_str(), port, a6);
-      rc = uv_udp_send(&sr->req, &wrap->handle, sr->bufs, sr->nbufs, reinterpret_cast<const sockaddr*>(a6), OnSendDone);
+      send_addr = reinterpret_cast<const sockaddr*>(a6);
     } else {
       auto* a4 = reinterpret_cast<sockaddr_in*>(&ss);
       uv_ip4_addr(ip.c_str(), port, a4);
-      rc = uv_udp_send(&sr->req, &wrap->handle, sr->bufs, sr->nbufs, reinterpret_cast<const sockaddr*>(a4), OnSendDone);
+      send_addr = reinterpret_cast<const sockaddr*>(a4);
+    }
+  }
+  uv_buf_t* send_bufs = sr->bufs;
+  uint32_t send_count = sr->nbufs;
+  if (sr->msg_size > 0) {
+    rc = uv_udp_try_send(&wrap->handle, send_bufs, send_count, send_addr);
+    if (rc == UV_ENOSYS || rc == UV_EAGAIN) {
+      rc = 0;
+    } else if (rc >= 0) {
+      size_t sent = static_cast<size_t>(rc);
+      while (send_count > 0 && send_bufs->len <= sent) {
+        sent -= send_bufs->len;
+        send_bufs++;
+        send_count--;
+      }
+      if (send_count == 0) {
+        const int32_t sync_success = static_cast<int32_t>(sr->msg_size + 1);
+        for (uint32_t i = 0; i < sr->nbufs; i++) free(sr->bufs[i].base);
+        delete[] sr->bufs;
+        napi_delete_reference(env, sr->req_obj_ref);
+        delete sr;
+        return MakeInt32(env, sync_success);
+      }
+      if (sent > 0) {
+        send_bufs->base += sent;
+        send_bufs->len -= sent;
+      }
+      rc = 0;
     }
   } else {
-    rc = uv_udp_send(&sr->req, &wrap->handle, sr->bufs, sr->nbufs, nullptr, OnSendDone);
+    rc = 0;
+  }
+  if (rc == 0) {
+    rc = uv_udp_send(&sr->req, &wrap->handle, send_bufs, send_count, send_addr, OnSendDone);
   }
   if (rc != 0) {
     SetReqError(env, req_obj, rc);
@@ -480,23 +650,25 @@ napi_value UdpGetSockName(napi_env env, napi_callback_info info) {
   int len = sizeof(ss);
   int rc = uv_udp_getsockname(&wrap->handle, reinterpret_cast<sockaddr*>(&ss), &len);
   if (rc == 0) {
-    char ip[INET6_ADDRSTRLEN] = {0};
+    std::string ip;
     int port = 0;
     const char* fam = "IPv4";
     if (ss.ss_family == AF_INET6) {
       auto* a6 = reinterpret_cast<sockaddr_in6*>(&ss);
-      uv_ip6_name(a6, ip, sizeof(ip));
+      ip = FormatIPv6AddressWithScope(a6);
       port = ntohs(a6->sin6_port);
       fam = "IPv6";
     } else {
+      char ip4[INET6_ADDRSTRLEN] = {0};
       auto* a4 = reinterpret_cast<sockaddr_in*>(&ss);
-      uv_ip4_name(a4, ip, sizeof(ip));
+      uv_ip4_name(a4, ip4, sizeof(ip4));
+      ip = ip4;
       port = ntohs(a4->sin_port);
     }
     napi_value ip_v = nullptr;
     napi_value fam_v = nullptr;
     napi_value port_v = nullptr;
-    napi_create_string_utf8(env, ip, NAPI_AUTO_LENGTH, &ip_v);
+    napi_create_string_utf8(env, ip.c_str(), NAPI_AUTO_LENGTH, &ip_v);
     napi_create_string_utf8(env, fam, NAPI_AUTO_LENGTH, &fam_v);
     napi_create_int32(env, port, &port_v);
     if (ip_v) napi_set_named_property(env, argv[0], "address", ip_v);
@@ -825,23 +997,25 @@ napi_value UdpGetPeerName(napi_env env, napi_callback_info info) {
   int len = sizeof(ss);
   int rc = uv_udp_getpeername(&wrap->handle, reinterpret_cast<sockaddr*>(&ss), &len);
   if (rc == 0) {
-    char ip[INET6_ADDRSTRLEN] = {0};
+    std::string ip;
     int port = 0;
     const char* fam = "IPv4";
     if (ss.ss_family == AF_INET6) {
       auto* a6 = reinterpret_cast<sockaddr_in6*>(&ss);
-      uv_ip6_name(a6, ip, sizeof(ip));
+      ip = FormatIPv6AddressWithScope(a6);
       port = ntohs(a6->sin6_port);
       fam = "IPv6";
     } else {
+      char ip4[INET6_ADDRSTRLEN] = {0};
       auto* a4 = reinterpret_cast<sockaddr_in*>(&ss);
-      uv_ip4_name(a4, ip, sizeof(ip));
+      uv_ip4_name(a4, ip4, sizeof(ip4));
+      ip = ip4;
       port = ntohs(a4->sin_port);
     }
     napi_value ip_v = nullptr;
     napi_value fam_v = nullptr;
     napi_value port_v = nullptr;
-    napi_create_string_utf8(env, ip, NAPI_AUTO_LENGTH, &ip_v);
+    napi_create_string_utf8(env, ip.c_str(), NAPI_AUTO_LENGTH, &ip_v);
     napi_create_string_utf8(env, fam, NAPI_AUTO_LENGTH, &fam_v);
     napi_create_int32(env, port, &port_v);
     if (ip_v) napi_set_named_property(env, argv[0], "address", ip_v);
@@ -941,41 +1115,41 @@ napi_value UbiInstallUdpWrapBinding(napi_env env) {
   if (napi_create_object(env, &binding) != napi_ok || binding == nullptr) return nullptr;
 
   napi_property_descriptor udp_props[] = {
-      {"open", nullptr, UdpOpen, nullptr, nullptr, nullptr, napi_default, nullptr},
-      {"bind", nullptr, UdpBind, nullptr, nullptr, nullptr, napi_default, nullptr},
-      {"bind6", nullptr, UdpBind6, nullptr, nullptr, nullptr, napi_default, nullptr},
-      {"send", nullptr, UdpSend, nullptr, nullptr, nullptr, napi_default, nullptr},
-      {"send6", nullptr, UdpSend6, nullptr, nullptr, nullptr, napi_default, nullptr},
-      {"recvStart", nullptr, UdpRecvStart, nullptr, nullptr, nullptr, napi_default, nullptr},
-      {"recvStop", nullptr, UdpRecvStop, nullptr, nullptr, nullptr, napi_default, nullptr},
-      {"getsockname", nullptr, UdpGetSockName, nullptr, nullptr, nullptr, napi_default, nullptr},
-      {"getpeername", nullptr, UdpGetPeerName, nullptr, nullptr, nullptr, napi_default, nullptr},
-      {"close", nullptr, UdpClose, nullptr, nullptr, nullptr, napi_default, nullptr},
-      {"setBroadcast", nullptr, UdpSetBroadcast, nullptr, nullptr, nullptr, napi_default, nullptr},
-      {"setTTL", nullptr, UdpSetTTL, nullptr, nullptr, nullptr, napi_default, nullptr},
-      {"setMulticastTTL", nullptr, UdpSetMulticastTTL, nullptr, nullptr, nullptr, napi_default, nullptr},
-      {"setMulticastLoopback", nullptr, UdpSetMulticastLoopback, nullptr, nullptr, nullptr, napi_default, nullptr},
-      {"setMulticastInterface", nullptr, UdpSetMulticastInterface, nullptr, nullptr, nullptr, napi_default, nullptr},
-      {"addMembership", nullptr, UdpAddMembership, nullptr, nullptr, nullptr, napi_default, nullptr},
-      {"dropMembership", nullptr, UdpDropMembership, nullptr, nullptr, nullptr, napi_default, nullptr},
-      {"addSourceSpecificMembership", nullptr, UdpAddSourceSpecificMembership, nullptr, nullptr, nullptr, napi_default, nullptr},
-      {"dropSourceSpecificMembership", nullptr, UdpDropSourceSpecificMembership, nullptr, nullptr, nullptr, napi_default, nullptr},
-      {"setMulticastAll", nullptr, UdpSetMulticastAll, nullptr, nullptr, nullptr, napi_default, nullptr},
-      {"bufferSize", nullptr, UdpBufferSize, nullptr, nullptr, nullptr, napi_default, nullptr},
-      {"setRecvBufferSize", nullptr, UdpSetRecvBufferSize, nullptr, nullptr, nullptr, napi_default, nullptr},
-      {"setSendBufferSize", nullptr, UdpSetSendBufferSize, nullptr, nullptr, nullptr, napi_default, nullptr},
-      {"getRecvBufferSize", nullptr, UdpGetRecvBufferSize, nullptr, nullptr, nullptr, napi_default, nullptr},
-      {"getSendBufferSize", nullptr, UdpGetSendBufferSize, nullptr, nullptr, nullptr, napi_default, nullptr},
-      {"connect", nullptr, UdpConnect, nullptr, nullptr, nullptr, napi_default, nullptr},
-      {"connect6", nullptr, UdpConnect6, nullptr, nullptr, nullptr, napi_default, nullptr},
-      {"disconnect", nullptr, UdpDisconnect, nullptr, nullptr, nullptr, napi_default, nullptr},
-      {"ref", nullptr, UdpRef, nullptr, nullptr, nullptr, napi_default, nullptr},
-      {"unref", nullptr, UdpUnref, nullptr, nullptr, nullptr, napi_default, nullptr},
-      {"hasRef", nullptr, UdpHasRef, nullptr, nullptr, nullptr, napi_default, nullptr},
-      {"getAsyncId", nullptr, UdpGetAsyncId, nullptr, nullptr, nullptr, napi_default, nullptr},
+      {"open", nullptr, UdpOpen, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+      {"bind", nullptr, UdpBind, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+      {"bind6", nullptr, UdpBind6, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+      {"send", nullptr, UdpSend, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+      {"send6", nullptr, UdpSend6, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+      {"recvStart", nullptr, UdpRecvStart, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+      {"recvStop", nullptr, UdpRecvStop, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+      {"getsockname", nullptr, UdpGetSockName, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+      {"getpeername", nullptr, UdpGetPeerName, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+      {"close", nullptr, UdpClose, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+      {"setBroadcast", nullptr, UdpSetBroadcast, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+      {"setTTL", nullptr, UdpSetTTL, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+      {"setMulticastTTL", nullptr, UdpSetMulticastTTL, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+      {"setMulticastLoopback", nullptr, UdpSetMulticastLoopback, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+      {"setMulticastInterface", nullptr, UdpSetMulticastInterface, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+      {"addMembership", nullptr, UdpAddMembership, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+      {"dropMembership", nullptr, UdpDropMembership, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+      {"addSourceSpecificMembership", nullptr, UdpAddSourceSpecificMembership, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+      {"dropSourceSpecificMembership", nullptr, UdpDropSourceSpecificMembership, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+      {"setMulticastAll", nullptr, UdpSetMulticastAll, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+      {"bufferSize", nullptr, UdpBufferSize, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+      {"setRecvBufferSize", nullptr, UdpSetRecvBufferSize, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+      {"setSendBufferSize", nullptr, UdpSetSendBufferSize, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+      {"getRecvBufferSize", nullptr, UdpGetRecvBufferSize, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+      {"getSendBufferSize", nullptr, UdpGetSendBufferSize, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+      {"connect", nullptr, UdpConnect, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+      {"connect6", nullptr, UdpConnect6, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+      {"disconnect", nullptr, UdpDisconnect, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+      {"ref", nullptr, UdpRef, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+      {"unref", nullptr, UdpUnref, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+      {"hasRef", nullptr, UdpHasRef, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+      {"getAsyncId", nullptr, UdpGetAsyncId, nullptr, nullptr, nullptr, napi_default_method, nullptr},
       {"fd", nullptr, nullptr, UdpFdGetter, nullptr, nullptr, napi_default, nullptr},
-      {"getSendQueueSize", nullptr, UdpGetSendQueueSize, nullptr, nullptr, nullptr, napi_default, nullptr},
-      {"getSendQueueCount", nullptr, UdpGetSendQueueCount, nullptr, nullptr, nullptr, napi_default, nullptr},
+      {"getSendQueueSize", nullptr, UdpGetSendQueueSize, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+      {"getSendQueueCount", nullptr, UdpGetSendQueueCount, nullptr, nullptr, nullptr, napi_default_method, nullptr},
   };
   napi_value udp_ctor = nullptr;
   if (napi_define_class(env,
@@ -1008,4 +1182,17 @@ napi_value UbiInstallUdpWrapBinding(napi_env env) {
   napi_set_named_property(env, binding, "constants", constants);
 
   return binding;
+}
+
+napi_value UbiGetUdpWrapConstructor(napi_env env) {
+  if (env == nullptr || g_udp_ctor_ref == nullptr) return nullptr;
+  return GetRefValue(env, g_udp_ctor_ref);
+}
+
+uv_handle_t* UbiUdpWrapGetHandle(napi_env env, napi_value value) {
+  if (env == nullptr || value == nullptr) return nullptr;
+  void* raw = nullptr;
+  if (napi_unwrap(env, value, &raw) != napi_ok || raw == nullptr) return nullptr;
+  auto* wrap = static_cast<UdpWrap*>(raw);
+  return reinterpret_cast<uv_handle_t*>(&wrap->handle);
 }

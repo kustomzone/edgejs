@@ -47,6 +47,7 @@ void EnsureMeasureMemoryConstants(napi_env env, napi_value binding) {
 }
 
 napi_value ContextifyMeasureMemoryFallback(napi_env env, napi_callback_info info) {
+  (void)info;
   napi_deferred deferred = nullptr;
   napi_value promise = nullptr;
   if (napi_create_promise(env, &deferred, &promise) != napi_ok || promise == nullptr) return Undefined(env);
@@ -57,58 +58,22 @@ napi_value ContextifyMeasureMemoryFallback(napi_env env, napi_callback_info info
 }
 
 napi_value ContextifyStartSigintWatchdogFallback(napi_env env, napi_callback_info info) {
-  return Undefined(env);
+  (void)info;
+  napi_value out = nullptr;
+  napi_get_boolean(env, true, &out);
+  return out != nullptr ? out : Undefined(env);
 }
 
 napi_value ContextifyStopSigintWatchdogFallback(napi_env env, napi_callback_info info) {
+  (void)info;
   return Undefined(env);
 }
 
 napi_value ContextifyWatchdogHasPendingSigintFallback(napi_env env, napi_callback_info info) {
+  (void)info;
   napi_value out = nullptr;
   napi_get_boolean(env, false, &out);
   return out != nullptr ? out : Undefined(env);
-}
-
-napi_value ContextifyMakeContextFallback(napi_env env, napi_callback_info info) {
-  size_t argc = 7;
-  napi_value argv[7] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
-  napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
-  napi_value sandbox = argc >= 1 && argv[0] != nullptr ? argv[0] : nullptr;
-  napi_valuetype type = napi_undefined;
-  if (sandbox == nullptr || napi_typeof(env, sandbox, &type) != napi_ok || (type != napi_object && type != napi_function)) {
-    napi_create_object(env, &sandbox);
-  }
-
-  napi_value util = nullptr;
-  napi_value global = GetGlobal(env);
-  if (global != nullptr) {
-    napi_get_named_property(env, global, "internalBinding", &util);
-  }
-  napi_value private_symbols = nullptr;
-  if (util != nullptr && !IsUndefined(env, util)) {
-    napi_valuetype t = napi_undefined;
-    if (napi_typeof(env, util, &t) == napi_ok && t == napi_function) {
-      napi_value util_name = nullptr;
-      napi_create_string_utf8(env, "util", NAPI_AUTO_LENGTH, &util_name);
-      napi_value util_binding = nullptr;
-      napi_call_function(env, global, util, 1, &util_name, &util_binding);
-      if (util_binding != nullptr && !IsUndefined(env, util_binding)) {
-        napi_get_named_property(env, util_binding, "privateSymbols", &private_symbols);
-      }
-    }
-  }
-  napi_value context_symbol = nullptr;
-  if (private_symbols != nullptr) {
-    napi_get_named_property(env, private_symbols, "contextify_context_private_symbol", &context_symbol);
-  }
-  if (context_symbol == nullptr || IsUndefined(env, context_symbol)) {
-    napi_value desc = nullptr;
-    napi_create_string_utf8(env, "contextify_context_private_symbol", NAPI_AUTO_LENGTH, &desc);
-    napi_create_symbol(env, desc, &context_symbol);
-  }
-  napi_set_property(env, sandbox, context_symbol, sandbox);
-  return sandbox != nullptr ? sandbox : Undefined(env);
 }
 
 void EnsureMethod(napi_env env, napi_value binding, const char* name, napi_callback cb) {
@@ -128,12 +93,10 @@ napi_value ResolveContextify(napi_env env, const ResolveOptions& options) {
   if (out == nullptr || IsUndefined(env, out)) return Undefined(env);
 
   EnsureMeasureMemoryConstants(env, out);
-  EnsureMethod(env, out, "makeContext", ContextifyMakeContextFallback);
   EnsureMethod(env, out, "measureMemory", ContextifyMeasureMemoryFallback);
   EnsureMethod(env, out, "startSigintWatchdog", ContextifyStartSigintWatchdogFallback);
   EnsureMethod(env, out, "stopSigintWatchdog", ContextifyStopSigintWatchdogFallback);
   EnsureMethod(env, out, "watchdogHasPendingSigint", ContextifyWatchdogHasPendingSigintFallback);
-
   return out;
 }
 

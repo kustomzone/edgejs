@@ -3,10 +3,15 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <cerrno>
+#include <chrono>
 #include <string>
 #include <sstream>
+#include <thread>
 #if !defined(_WIN32)
 #include <unistd.h>
+#else
+#include <io.h>
 #endif
 
 #include <uv.h>
@@ -14,6 +19,7 @@
 #include "ubi_runtime.h"
 #include "ubi_stream_wrap.h"
 #include "ubi_tcp_wrap.h"
+#include "ubi_udp_wrap.h"
 
 namespace {
 
@@ -34,7 +40,8 @@ struct PipeWriteReqWrap {
   uv_write_t req{};
   napi_env env = nullptr;
   napi_ref req_obj_ref = nullptr;
-  uv_buf_t buf{};
+  uv_buf_t* bufs = nullptr;
+  uint32_t nbufs = 0;
 };
 
 struct PipeShutdownReqWrap {
@@ -49,6 +56,7 @@ struct PipeWrap {
   napi_ref wrapper_ref = nullptr;
   napi_ref close_cb_ref = nullptr;
   uv_pipe_t handle{};
+  int opened_fd = -1;
   bool closed = false;
   bool finalized = false;
   bool delete_on_close = false;
@@ -59,6 +67,32 @@ struct PipeWrap {
 
 napi_ref g_pipe_ctor_ref = nullptr;
 int64_t g_next_pipe_async_id = 100000;
+
+int WriteAllToFd(int fd, const char* data, size_t length) {
+  if (data == nullptr && length != 0) return UV_EINVAL;
+  size_t offset = 0;
+  while (offset < length) {
+#if defined(_WIN32)
+    const int written = _write(fd, data + offset, static_cast<unsigned int>(length - offset));
+    if (written < 0) {
+      return uv_translate_sys_error(errno);
+    }
+#else
+    const ssize_t written = ::write(fd, data + offset, length - offset);
+    if (written < 0) {
+      if (errno == EINTR) continue;
+      if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        continue;
+      }
+      return uv_translate_sys_error(errno);
+    }
+#endif
+    if (written == 0) return UV_EIO;
+    offset += static_cast<size_t>(written);
+  }
+  return 0;
+}
 
 napi_value GetRefValue(napi_env env, napi_ref ref) {
   if (ref == nullptr) return nullptr;
@@ -106,6 +140,56 @@ std::string ValueToUtf8(napi_env env, napi_value value) {
   return out;
 }
 
+napi_value BufferFromWithEncoding(napi_env env, napi_value value, napi_value encoding) {
+  if (env == nullptr || value == nullptr) return value;
+
+  napi_value global = nullptr;
+  napi_value buffer_ctor = nullptr;
+  napi_value from_fn = nullptr;
+  napi_valuetype type = napi_undefined;
+  if (napi_get_global(env, &global) != napi_ok || global == nullptr ||
+      napi_get_named_property(env, global, "Buffer", &buffer_ctor) != napi_ok ||
+      buffer_ctor == nullptr ||
+      napi_get_named_property(env, buffer_ctor, "from", &from_fn) != napi_ok ||
+      from_fn == nullptr ||
+      napi_typeof(env, from_fn, &type) != napi_ok ||
+      type != napi_function) {
+    return value;
+  }
+
+  napi_value argv[2] = {value, nullptr};
+  size_t argc = 1;
+  if (encoding != nullptr) {
+    napi_valuetype enc_type = napi_undefined;
+    if (napi_typeof(env, encoding, &enc_type) == napi_ok && enc_type != napi_undefined) {
+      argv[1] = encoding;
+      argc = 2;
+    }
+  }
+
+  napi_value out = nullptr;
+  if (napi_call_function(env, buffer_ctor, from_fn, argc, argv, &out) != napi_ok || out == nullptr) {
+    return value;
+  }
+  return out;
+}
+
+void FreeWriteReq(PipeWriteReqWrap* wr) {
+  if (wr == nullptr) return;
+  if (wr->bufs != nullptr) {
+    for (uint32_t i = 0; i < wr->nbufs; ++i) {
+      if (wr->bufs[i].base != nullptr) free(wr->bufs[i].base);
+    }
+    delete[] wr->bufs;
+    wr->bufs = nullptr;
+  }
+  if (wr->req_obj_ref != nullptr) {
+    napi_delete_reference(wr->env, wr->req_obj_ref);
+    wr->req_obj_ref = nullptr;
+  }
+  delete wr;
+}
+
 void InvokeReqOnComplete(napi_env env, napi_value req_obj, int status, napi_value* argv, size_t argc) {
   if (req_obj == nullptr) return;
   SetReqError(env, req_obj, status);
@@ -124,9 +208,7 @@ void OnWriteDone(uv_write_t* req, int status) {
   napi_value req_obj = GetRefValue(wr->env, wr->req_obj_ref);
   napi_value argv[1] = {MakeInt32(wr->env, status)};
   InvokeReqOnComplete(wr->env, req_obj, status, argv, 1);
-  if (wr->buf.base) free(wr->buf.base);
-  if (wr->req_obj_ref) napi_delete_reference(wr->env, wr->req_obj_ref);
-  delete wr;
+  FreeWriteReq(wr);
 }
 
 void OnShutdownDone(uv_shutdown_t* req, int status) {
@@ -162,6 +244,8 @@ void OnAlloc(uv_handle_t* /*h*/, size_t suggested_size, uv_buf_t* buf) {
   *buf = uv_buf_init(base, static_cast<unsigned int>(suggested_size));
 }
 
+napi_value AcceptPendingHandleForIpc(napi_env env, PipeWrap* wrap);
+
 void OnRead(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
   auto* wrap = static_cast<PipeWrap*>(stream->data);
   if (wrap == nullptr) {
@@ -175,6 +259,14 @@ void OnRead(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
   napi_value self = GetRefValue(wrap->env, wrap->wrapper_ref);
   napi_value onread = nullptr;
   if (self != nullptr && napi_get_named_property(wrap->env, self, "onread", &onread) == napi_ok) {
+    napi_value pending_handle = AcceptPendingHandleForIpc(wrap->env, wrap);
+    if (pending_handle != nullptr) {
+      napi_valuetype pending_type = napi_undefined;
+      if (napi_typeof(wrap->env, pending_handle, &pending_type) == napi_ok &&
+          pending_type != napi_undefined) {
+        napi_set_named_property(wrap->env, self, "pendingHandle", pending_handle);
+      }
+    }
     napi_valuetype t = napi_undefined;
     napi_typeof(wrap->env, onread, &t);
     if (t == napi_function) {
@@ -191,6 +283,7 @@ void OnRead(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
       }
       napi_value ignored = nullptr;
       UbiMakeCallback(wrap->env, self, onread, 1, argv, &ignored);
+      (void)UbiHandlePendingExceptionNow(wrap->env, nullptr);
     }
   }
   if (buf && buf->base) free(buf->base);
@@ -256,6 +349,8 @@ napi_value PipeCtor(napi_env env, napi_callback_info info) {
   uv_pipe_init(uv_default_loop(), &wrap->handle, ipc);
   wrap->handle.data = wrap;
   napi_wrap(env, self, wrap, PipeFinalize, nullptr, &wrap->wrapper_ref);
+  napi_set_named_property(env, self, "isStreamBase", MakeBool(env, true));
+  napi_set_named_property(env, self, "reading", MakeBool(env, false));
   return self;
 }
 
@@ -269,6 +364,7 @@ napi_value PipeOpen(napi_env env, napi_callback_info info) {
   if (!wrap || argc < 1) return MakeInt32(env, UV_EINVAL);
   int32_t fd = -1;
   napi_get_value_int32(env, argv[0], &fd);
+  wrap->opened_fd = fd;
   int rc = uv_pipe_open(&wrap->handle, static_cast<uv_file>(fd));
   return MakeInt32(env, rc);
 }
@@ -394,91 +490,299 @@ napi_value PipeWriteBuffer(napi_env env, napi_callback_info info) {
   size_t length = 0;
   void* raw = nullptr;
   std::string temp_utf8;
+  bool is_buffer = false;
+  napi_is_buffer(env, argv[1], &is_buffer);
+  if (is_buffer) {
+    napi_get_buffer_info(env, argv[1], &raw, &length);
+  }
   bool is_typed = false;
-  napi_is_typedarray(env, argv[1], &is_typed);
+  if (!is_buffer) napi_is_typedarray(env, argv[1], &is_typed);
   if (is_typed) {
     napi_typedarray_type tt;
     napi_value ab;
     size_t off;
     napi_get_typedarray_info(env, argv[1], &tt, &length, &raw, &ab, &off);
-  } else {
+  } else if (!is_buffer) {
     temp_utf8 = ValueToUtf8(env, argv[1]);
     length = temp_utf8.size();
     raw = const_cast<char*>(temp_utf8.data());
   }
 
-  auto* wr = new PipeWriteReqWrap();
-  wr->env = env;
-  napi_create_reference(env, argv[0], 1, &wr->req_obj_ref);
-  char* copy = static_cast<char*>(malloc(length));
-  if (length > 0 && raw != nullptr) memcpy(copy, raw, length);
-  wr->buf = uv_buf_init(copy, static_cast<unsigned int>(length));
-  wr->req.data = wr;
-  wrap->bytes_written += length;
-  SetState(kUbiBytesWritten, static_cast<int32_t>(length));
-  SetState(kUbiLastWriteWasAsync, 1);
   uv_stream_t* send_handle = nullptr;
   if (argc >= 3 && argv[2] != nullptr) {
     send_handle = UbiTcpWrapGetStream(env, argv[2]);
     if (send_handle == nullptr) send_handle = UbiPipeWrapGetStream(env, argv[2]);
+    if (send_handle == nullptr) {
+      uv_handle_t* udp_handle = UbiUdpWrapGetHandle(env, argv[2]);
+      send_handle = reinterpret_cast<uv_stream_t*>(udp_handle);
+    }
   }
+
+  const bool is_stdio_fd = (wrap->opened_fd == 1 || wrap->opened_fd == 2);
+  if (send_handle == nullptr && is_stdio_fd) {
+    const char* bytes = static_cast<const char*>(raw);
+    const int rc = WriteAllToFd(wrap->opened_fd, bytes, length);
+    if (rc == 0) {
+      wrap->bytes_written += length;
+      SetState(kUbiBytesWritten, static_cast<int32_t>(length));
+      SetState(kUbiLastWriteWasAsync, 0);
+    } else {
+      SetState(kUbiBytesWritten, 0);
+      SetState(kUbiLastWriteWasAsync, 0);
+      SetReqError(env, argv[0], rc);
+    }
+    return MakeInt32(env, rc);
+  }
+
+  auto* wr = new PipeWriteReqWrap();
+  wr->env = env;
+  napi_create_reference(env, argv[0], 1, &wr->req_obj_ref);
+  wr->nbufs = 1;
+  wr->bufs = new uv_buf_t[1];
+  char* copy = static_cast<char*>(malloc(length));
+  if (length > 0 && raw != nullptr) memcpy(copy, raw, length);
+  wr->bufs[0] = uv_buf_init(copy, static_cast<unsigned int>(length));
+  wr->req.data = wr;
+  wrap->bytes_written += length;
+  SetState(kUbiBytesWritten, static_cast<int32_t>(length));
+  SetState(kUbiLastWriteWasAsync, 1);
   int rc;
   if (send_handle != nullptr) {
-    rc = uv_write2(&wr->req, reinterpret_cast<uv_stream_t*>(&wrap->handle), &wr->buf, 1, send_handle, OnWriteDone);
+    rc = uv_write2(&wr->req,
+                   reinterpret_cast<uv_stream_t*>(&wrap->handle),
+                   wr->bufs,
+                   wr->nbufs,
+                   send_handle,
+                   OnWriteDone);
   } else {
-    rc = uv_write(&wr->req, reinterpret_cast<uv_stream_t*>(&wrap->handle), &wr->buf, 1, OnWriteDone);
+    rc = uv_write(&wr->req,
+                  reinterpret_cast<uv_stream_t*>(&wrap->handle),
+                  wr->bufs,
+                  wr->nbufs,
+                  OnWriteDone);
   }
   if (rc != 0) {
     napi_value req_obj = GetRefValue(env, wr->req_obj_ref);
     SetReqError(env, req_obj, rc);
-    if (wr->buf.base) free(wr->buf.base);
-    if (wr->req_obj_ref) napi_delete_reference(env, wr->req_obj_ref);
-    delete wr;
+    FreeWriteReq(wr);
   }
   return MakeInt32(env, rc);
 }
 
 napi_value PipeWriteString(napi_env env, napi_callback_info info) {
-  return PipeWriteBuffer(env, info);
+  size_t argc = 3;
+  napi_value argv[3] = {nullptr};
+  napi_value self = nullptr;
+  void* data = nullptr;
+  napi_get_cb_info(env, info, &argc, argv, &self, &data);
+  PipeWrap* wrap = nullptr;
+  napi_unwrap(env, self, reinterpret_cast<void**>(&wrap));
+  if (!wrap || argc < 2) return MakeInt32(env, UV_EINVAL);
+
+  napi_value payload = argv[1];
+  const char* encoding_name = static_cast<const char*>(data);
+  if (encoding_name != nullptr && payload != nullptr) {
+    napi_value encoding = nullptr;
+    if (napi_create_string_utf8(env, encoding_name, NAPI_AUTO_LENGTH, &encoding) == napi_ok &&
+        encoding != nullptr) {
+      payload = BufferFromWithEncoding(env, payload, encoding);
+    }
+  }
+
+  size_t length = 0;
+  void* raw = nullptr;
+  std::string temp_utf8;
+  bool is_buffer = false;
+  napi_is_buffer(env, payload, &is_buffer);
+  if (is_buffer) {
+    napi_get_buffer_info(env, payload, &raw, &length);
+  }
+  bool is_typed = false;
+  if (!is_buffer) napi_is_typedarray(env, payload, &is_typed);
+  if (is_typed) {
+    napi_typedarray_type tt;
+    napi_value ab;
+    size_t off;
+    napi_get_typedarray_info(env, payload, &tt, &length, &raw, &ab, &off);
+  } else if (!is_buffer) {
+    temp_utf8 = ValueToUtf8(env, payload);
+    length = temp_utf8.size();
+    raw = const_cast<char*>(temp_utf8.data());
+  }
+
+  uv_stream_t* send_handle = nullptr;
+  if (argc >= 3 && argv[2] != nullptr) {
+    send_handle = UbiTcpWrapGetStream(env, argv[2]);
+    if (send_handle == nullptr) send_handle = UbiPipeWrapGetStream(env, argv[2]);
+    if (send_handle == nullptr) {
+      uv_handle_t* udp_handle = UbiUdpWrapGetHandle(env, argv[2]);
+      send_handle = reinterpret_cast<uv_stream_t*>(udp_handle);
+    }
+  }
+
+  const bool is_stdio_fd = (wrap->opened_fd == 1 || wrap->opened_fd == 2);
+  if (send_handle == nullptr && is_stdio_fd) {
+    const char* bytes = static_cast<const char*>(raw);
+    const int rc = WriteAllToFd(wrap->opened_fd, bytes, length);
+    if (rc == 0) {
+      wrap->bytes_written += length;
+      SetState(kUbiBytesWritten, static_cast<int32_t>(length));
+      SetState(kUbiLastWriteWasAsync, 0);
+    } else {
+      SetState(kUbiBytesWritten, 0);
+      SetState(kUbiLastWriteWasAsync, 0);
+      SetReqError(env, argv[0], rc);
+    }
+    return MakeInt32(env, rc);
+  }
+
+  auto* wr = new PipeWriteReqWrap();
+  wr->env = env;
+  napi_create_reference(env, argv[0], 1, &wr->req_obj_ref);
+  wr->nbufs = 1;
+  wr->bufs = new uv_buf_t[1];
+  char* copy = static_cast<char*>(malloc(length));
+  if (length > 0 && raw != nullptr) memcpy(copy, raw, length);
+  wr->bufs[0] = uv_buf_init(copy, static_cast<unsigned int>(length));
+  wr->req.data = wr;
+  wrap->bytes_written += length;
+  SetState(kUbiBytesWritten, static_cast<int32_t>(length));
+  SetState(kUbiLastWriteWasAsync, 1);
+  int rc;
+  if (send_handle != nullptr) {
+    rc = uv_write2(&wr->req,
+                   reinterpret_cast<uv_stream_t*>(&wrap->handle),
+                   wr->bufs,
+                   wr->nbufs,
+                   send_handle,
+                   OnWriteDone);
+  } else {
+    rc = uv_write(&wr->req,
+                  reinterpret_cast<uv_stream_t*>(&wrap->handle),
+                  wr->bufs,
+                  wr->nbufs,
+                  OnWriteDone);
+  }
+  if (rc != 0) {
+    napi_value req_obj = GetRefValue(env, wr->req_obj_ref);
+    SetReqError(env, req_obj, rc);
+    FreeWriteReq(wr);
+  }
+  return MakeInt32(env, rc);
 }
 
 napi_value PipeWritev(napi_env env, napi_callback_info info) {
-  // Minimal fallback: write first chunk only.
   size_t argc = 3;
   napi_value argv[3] = {nullptr};
   napi_value self = nullptr;
   napi_get_cb_info(env, info, &argc, argv, &self, nullptr);
-  if (argc < 2) return MakeInt32(env, UV_EINVAL);
-  napi_value first = nullptr;
-  uint32_t len = 0;
-  napi_get_array_length(env, argv[1], &len);
-  if (len == 0) return MakeInt32(env, 0);
-  napi_get_element(env, argv[1], 0, &first);
-  napi_value fake_argv[2] = {argv[0], first};
-  napi_value ignored = nullptr;
-  size_t fake_argc = 2;
-  // Re-route through writeBuffer contract.
-  napi_callback_info fake_info = info;
-  (void)fake_info;
-  // Not possible to synthesize napi_callback_info; call directly logic instead.
-  // Duplicate minimal path:
-  std::string s = ValueToUtf8(env, first);
-  auto* wr = new PipeWriteReqWrap();
   PipeWrap* wrap = nullptr;
   napi_unwrap(env, self, reinterpret_cast<void**>(&wrap));
+  if (!wrap || argc < 2) return MakeInt32(env, UV_EINVAL);
+
+  const napi_value req_obj = argv[0];
+  const napi_value chunks = argv[1];
+  bool all_buffers = false;
+  if (argc > 2 && argv[2] != nullptr) napi_get_value_bool(env, argv[2], &all_buffers);
+
+  uint32_t raw_len = 0;
+  napi_get_array_length(env, chunks, &raw_len);
+  const uint32_t nbufs = all_buffers ? raw_len : (raw_len / 2);
+  if (nbufs == 0) {
+    SetState(kUbiBytesWritten, 0);
+    SetState(kUbiLastWriteWasAsync, 0);
+    return MakeInt32(env, 0);
+  }
+
+  auto* wr = new PipeWriteReqWrap();
   wr->env = env;
-  napi_create_reference(env, argv[0], 1, &wr->req_obj_ref);
-  char* copy = static_cast<char*>(malloc(s.size()));
-  if (!s.empty()) memcpy(copy, s.data(), s.size());
-  wr->buf = uv_buf_init(copy, static_cast<unsigned int>(s.size()));
+  napi_create_reference(env, req_obj, 1, &wr->req_obj_ref);
+  wr->nbufs = nbufs;
+  wr->bufs = new uv_buf_t[nbufs];
+  size_t total = 0;
+
+  for (uint32_t i = 0; i < nbufs; ++i) {
+    napi_value chunk = nullptr;
+    napi_get_element(env, chunks, all_buffers ? i : (i * 2), &chunk);
+    if (!all_buffers) {
+      bool is_buffer = false;
+      napi_is_buffer(env, chunk, &is_buffer);
+      bool is_typed = false;
+      if (!is_buffer) napi_is_typedarray(env, chunk, &is_typed);
+      if (!is_buffer && !is_typed) {
+        napi_value encoding = nullptr;
+        napi_get_element(env, chunks, i * 2 + 1, &encoding);
+        chunk = BufferFromWithEncoding(env, chunk, encoding);
+      }
+    }
+    bool is_buffer = false;
+    napi_is_buffer(env, chunk, &is_buffer);
+    bool is_typed = false;
+    if (!is_buffer) napi_is_typedarray(env, chunk, &is_typed);
+    size_t length = 0;
+    void* raw = nullptr;
+    std::string temp_utf8;
+    if (is_buffer) {
+      napi_get_buffer_info(env, chunk, &raw, &length);
+    } else if (is_typed) {
+      napi_typedarray_type tt;
+      napi_value ab = nullptr;
+      size_t off = 0;
+      if (napi_get_typedarray_info(env, chunk, &tt, &length, &raw, &ab, &off) != napi_ok) {
+        raw = nullptr;
+        length = 0;
+      }
+    } else {
+      temp_utf8 = ValueToUtf8(env, chunk);
+      raw = const_cast<char*>(temp_utf8.data());
+      length = temp_utf8.size();
+    }
+    char* copy = static_cast<char*>(malloc(length));
+    if (length > 0 && raw != nullptr) memcpy(copy, raw, length);
+    wr->bufs[i] = uv_buf_init(copy, static_cast<unsigned int>(length));
+    total += length;
+  }
+
   wr->req.data = wr;
-  wrap->bytes_written += s.size();
-  SetState(kUbiBytesWritten, static_cast<int32_t>(s.size()));
+  const bool is_stdio_fd = (wrap->opened_fd == 1 || wrap->opened_fd == 2);
+  if (is_stdio_fd) {
+    int rc = 0;
+    size_t written_total = 0;
+    for (uint32_t i = 0; i < wr->nbufs; ++i) {
+      const uv_buf_t& b = wr->bufs[i];
+      const int part = WriteAllToFd(wrap->opened_fd, b.base, b.len);
+      if (part != 0) {
+        rc = part;
+        break;
+      }
+      written_total += b.len;
+    }
+    if (rc == 0) {
+      wrap->bytes_written += written_total;
+      SetState(kUbiBytesWritten, static_cast<int32_t>(written_total));
+      SetState(kUbiLastWriteWasAsync, 0);
+    } else {
+      SetState(kUbiBytesWritten, static_cast<int32_t>(written_total));
+      SetState(kUbiLastWriteWasAsync, 0);
+      SetReqError(env, req_obj, rc);
+    }
+    FreeWriteReq(wr);
+    return MakeInt32(env, rc);
+  }
+
+  wrap->bytes_written += total;
+  SetState(kUbiBytesWritten, static_cast<int32_t>(total));
   SetState(kUbiLastWriteWasAsync, 1);
-  int rc = uv_write(&wr->req, reinterpret_cast<uv_stream_t*>(&wrap->handle), &wr->buf, 1, OnWriteDone);
-  (void)ignored;
-  (void)fake_argv;
-  (void)fake_argc;
+
+  int rc = uv_write(&wr->req,
+                    reinterpret_cast<uv_stream_t*>(&wrap->handle),
+                    wr->bufs,
+                    wr->nbufs,
+                    OnWriteDone);
+  if (rc != 0) {
+    SetReqError(env, req_obj, rc);
+    FreeWriteReq(wr);
+  }
   return MakeInt32(env, rc);
 }
 
@@ -666,17 +970,13 @@ napi_value PipeGetPeerName(napi_env env, napi_callback_info info) {
   return MakeInt32(env, rc);
 }
 
-napi_value PipeAcceptPendingHandle(napi_env env, napi_callback_info info) {
-  napi_value self = nullptr;
-  size_t argc = 0;
-  napi_get_cb_info(env, info, &argc, nullptr, &self, nullptr);
-  PipeWrap* wrap = nullptr;
-  napi_unwrap(env, self, reinterpret_cast<void**>(&wrap));
-  if (!wrap) {
+napi_value AcceptPendingHandleForIpc(napi_env env, PipeWrap* wrap) {
+  if (env == nullptr || wrap == nullptr) {
     napi_value u = nullptr;
     napi_get_undefined(env, &u);
     return u;
   }
+
   int count = uv_pipe_pending_count(&wrap->handle);
   if (count <= 0) {
     napi_value u = nullptr;
@@ -686,12 +986,11 @@ napi_value PipeAcceptPendingHandle(napi_env env, napi_callback_info info) {
 
   uv_handle_type pending_type = uv_pipe_pending_type(&wrap->handle);
   napi_value handle_obj = nullptr;
-  uv_stream_t* stream = nullptr;
+  uv_stream_t* accept_target = nullptr;
 
   if (pending_type == UV_TCP) {
-    napi_value tcp_ctor = nullptr;
+    napi_value tcp_ctor = UbiGetTcpWrapConstructor(env);
     napi_value arg = nullptr;
-    tcp_ctor = UbiGetTcpWrapConstructor(env);
     if (tcp_ctor == nullptr ||
         napi_create_int32(env, 0, &arg) != napi_ok ||
         arg == nullptr ||
@@ -701,7 +1000,7 @@ napi_value PipeAcceptPendingHandle(napi_env env, napi_callback_info info) {
       napi_get_undefined(env, &u);
       return u;
     }
-    stream = UbiTcpWrapGetStream(env, handle_obj);
+    accept_target = UbiTcpWrapGetStream(env, handle_obj);
   } else if (pending_type == UV_NAMED_PIPE) {
     napi_value ctor = GetRefValue(env, g_pipe_ctor_ref);
     napi_value arg = nullptr;
@@ -714,26 +1013,46 @@ napi_value PipeAcceptPendingHandle(napi_env env, napi_callback_info info) {
       napi_get_undefined(env, &u);
       return u;
     }
-    stream = UbiPipeWrapGetStream(env, handle_obj);
+    accept_target = UbiPipeWrapGetStream(env, handle_obj);
+  } else if (pending_type == UV_UDP) {
+    napi_value udp_ctor = UbiGetUdpWrapConstructor(env);
+    if (udp_ctor == nullptr ||
+        napi_new_instance(env, udp_ctor, 0, nullptr, &handle_obj) != napi_ok ||
+        handle_obj == nullptr) {
+      napi_value u = nullptr;
+      napi_get_undefined(env, &u);
+      return u;
+    }
+    uv_handle_t* udp_handle = UbiUdpWrapGetHandle(env, handle_obj);
+    accept_target = reinterpret_cast<uv_stream_t*>(udp_handle);
   } else {
     napi_value u = nullptr;
     napi_get_undefined(env, &u);
     return u;
   }
 
-  if (stream == nullptr) {
+  if (accept_target == nullptr) {
     napi_value u = nullptr;
     napi_get_undefined(env, &u);
     return u;
   }
 
-  int rc = uv_accept(reinterpret_cast<uv_stream_t*>(&wrap->handle), stream);
+  int rc = uv_accept(reinterpret_cast<uv_stream_t*>(&wrap->handle), accept_target);
   if (rc != 0) {
     napi_value u = nullptr;
     napi_get_undefined(env, &u);
     return u;
   }
   return handle_obj;
+}
+
+napi_value PipeAcceptPendingHandle(napi_env env, napi_callback_info info) {
+  napi_value self = nullptr;
+  size_t argc = 0;
+  napi_get_cb_info(env, info, &argc, nullptr, &self, nullptr);
+  PipeWrap* wrap = nullptr;
+  napi_unwrap(env, self, reinterpret_cast<void**>(&wrap));
+  return AcceptPendingHandleForIpc(env, wrap);
 }
 
 napi_value PipeBytesReadGetter(napi_env env, napi_callback_info info) {
@@ -816,29 +1135,33 @@ napi_value UbiInstallPipeWrapBinding(napi_env env) {
   if (napi_create_object(env, &binding) != napi_ok || binding == nullptr) return nullptr;
 
   napi_property_descriptor pipe_props[] = {
-      {"open", nullptr, PipeOpen, nullptr, nullptr, nullptr, napi_default, nullptr},
-      {"bind", nullptr, PipeBind, nullptr, nullptr, nullptr, napi_default, nullptr},
-      {"listen", nullptr, PipeListen, nullptr, nullptr, nullptr, napi_default, nullptr},
-      {"connect", nullptr, PipeConnect, nullptr, nullptr, nullptr, napi_default, nullptr},
-      {"close", nullptr, PipeClose, nullptr, nullptr, nullptr, napi_default, nullptr},
-      {"readStart", nullptr, PipeReadStart, nullptr, nullptr, nullptr, napi_default, nullptr},
-      {"readStop", nullptr, PipeReadStop, nullptr, nullptr, nullptr, napi_default, nullptr},
-      {"writeBuffer", nullptr, PipeWriteBuffer, nullptr, nullptr, nullptr, napi_default, nullptr},
-      {"writev", nullptr, PipeWritev, nullptr, nullptr, nullptr, napi_default, nullptr},
-      {"writeLatin1String", nullptr, PipeWriteString, nullptr, nullptr, nullptr, napi_default, nullptr},
-      {"writeUtf8String", nullptr, PipeWriteString, nullptr, nullptr, nullptr, napi_default, nullptr},
-      {"writeAsciiString", nullptr, PipeWriteString, nullptr, nullptr, nullptr, napi_default, nullptr},
-      {"writeUcs2String", nullptr, PipeWriteString, nullptr, nullptr, nullptr, napi_default, nullptr},
-      {"shutdown", nullptr, PipeShutdown, nullptr, nullptr, nullptr, napi_default, nullptr},
-      {"setPendingInstances", nullptr, PipeSetPendingInstances, nullptr, nullptr, nullptr, napi_default, nullptr},
-      {"fchmod", nullptr, PipeFchmod, nullptr, nullptr, nullptr, napi_default, nullptr},
-      {"useUserBuffer", nullptr, PipeUseUserBuffer, nullptr, nullptr, nullptr, napi_default, nullptr},
-      {"acceptPendingHandle", nullptr, PipeAcceptPendingHandle, nullptr, nullptr, nullptr, napi_default, nullptr},
-      {"ref", nullptr, PipeRef, nullptr, nullptr, nullptr, napi_default, nullptr},
-      {"unref", nullptr, PipeUnref, nullptr, nullptr, nullptr, napi_default, nullptr},
-      {"getAsyncId", nullptr, PipeGetAsyncId, nullptr, nullptr, nullptr, napi_default, nullptr},
-      {"getProviderType", nullptr, PipeGetProviderType, nullptr, nullptr, nullptr, napi_default, nullptr},
-      {"asyncReset", nullptr, PipeAsyncReset, nullptr, nullptr, nullptr, napi_default, nullptr},
+      {"open", nullptr, PipeOpen, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+      {"bind", nullptr, PipeBind, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+      {"listen", nullptr, PipeListen, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+      {"connect", nullptr, PipeConnect, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+      {"close", nullptr, PipeClose, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+      {"readStart", nullptr, PipeReadStart, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+      {"readStop", nullptr, PipeReadStop, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+      {"writeBuffer", nullptr, PipeWriteBuffer, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+      {"writev", nullptr, PipeWritev, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+      {"writeLatin1String", nullptr, PipeWriteString, nullptr, nullptr, nullptr, napi_default_method,
+       const_cast<char*>("latin1")},
+      {"writeUtf8String", nullptr, PipeWriteString, nullptr, nullptr, nullptr, napi_default_method,
+       const_cast<char*>("utf8")},
+      {"writeAsciiString", nullptr, PipeWriteString, nullptr, nullptr, nullptr, napi_default_method,
+       const_cast<char*>("ascii")},
+      {"writeUcs2String", nullptr, PipeWriteString, nullptr, nullptr, nullptr, napi_default_method,
+       const_cast<char*>("ucs2")},
+      {"shutdown", nullptr, PipeShutdown, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+      {"setPendingInstances", nullptr, PipeSetPendingInstances, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+      {"fchmod", nullptr, PipeFchmod, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+      {"useUserBuffer", nullptr, PipeUseUserBuffer, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+      {"acceptPendingHandle", nullptr, PipeAcceptPendingHandle, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+      {"ref", nullptr, PipeRef, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+      {"unref", nullptr, PipeUnref, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+      {"getAsyncId", nullptr, PipeGetAsyncId, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+      {"getProviderType", nullptr, PipeGetProviderType, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+      {"asyncReset", nullptr, PipeAsyncReset, nullptr, nullptr, nullptr, napi_default_method, nullptr},
       {"bytesRead", nullptr, nullptr, PipeBytesReadGetter, nullptr, nullptr, napi_default, nullptr},
       {"bytesWritten", nullptr, nullptr, PipeBytesWrittenGetter, nullptr, nullptr, napi_default, nullptr},
       {"writeQueueSize", nullptr, nullptr, PipeWriteQueueSizeGetter, nullptr, nullptr, napi_default, nullptr},

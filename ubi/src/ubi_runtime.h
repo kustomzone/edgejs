@@ -47,5 +47,6 @@ napi_status UbiMakeCallback(napi_env env,
                               size_t argc,
                               napi_value* argv,
                               napi_value* result);
+bool UbiHandlePendingExceptionNow(napi_env env, bool* handled_out);
 
 #endif  // UBI_RUNTIME_H_

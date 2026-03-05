@@ -23,7 +23,115 @@ namespace {
 void ThrowUVExceptionCopyFile(napi_env env, int errorno, const char* src,
                               const char* dest);
 
+void ThrowInvalidArgType(napi_env env, const char* name, const char* expected) {
+  std::string message = "The \"";
+  message += (name != nullptr ? name : "value");
+  message += "\" argument must be of type ";
+  message += (expected != nullptr ? expected : "valid type");
+  napi_throw_type_error(env, "ERR_INVALID_ARG_TYPE", message.c_str());
+}
+
+void ThrowOutOfRangeFd(napi_env env, int32_t value) {
+  std::string message =
+      "The value of \"fd\" is out of range. It must be >= 0 && <= 2147483647. Received ";
+  message += std::to_string(value);
+  napi_throw_range_error(env, "ERR_OUT_OF_RANGE", message.c_str());
+}
+
 std::string PathFromValue(napi_env env, napi_value value) {
+  if (value == nullptr) {
+    ThrowInvalidArgType(env, "path", "string or Buffer");
+    return "";
+  }
+  napi_valuetype type = napi_undefined;
+  if (napi_typeof(env, value, &type) != napi_ok) {
+    ThrowInvalidArgType(env, "path", "string or Buffer");
+    return "";
+  }
+  if (type == napi_string) {
+    size_t length = 0;
+    if (napi_get_value_string_utf8(env, value, nullptr, 0, &length) != napi_ok) {
+      ThrowInvalidArgType(env, "path", "string or Buffer");
+      return "";
+    }
+    std::string out(length + 1, '\0');
+    size_t copied = 0;
+    if (napi_get_value_string_utf8(env, value, out.data(), out.size(), &copied) !=
+        napi_ok) {
+      ThrowInvalidArgType(env, "path", "string or Buffer");
+      return "";
+    }
+    out.resize(copied);
+    return out;
+  }
+
+  bool is_buffer = false;
+  if (napi_is_buffer(env, value, &is_buffer) == napi_ok && is_buffer) {
+    void* data = nullptr;
+    size_t length = 0;
+    if (napi_get_buffer_info(env, value, &data, &length) != napi_ok || data == nullptr) {
+      ThrowInvalidArgType(env, "path", "string or Buffer");
+      return "";
+    }
+    return std::string(static_cast<const char*>(data), length);
+  }
+
+  bool is_typedarray = false;
+  if (napi_is_typedarray(env, value, &is_typedarray) == napi_ok && is_typedarray) {
+    napi_typedarray_type ta_type = napi_uint8_array;
+    size_t length = 0;
+    void* data = nullptr;
+    napi_value arraybuffer = nullptr;
+    size_t byte_offset = 0;
+    if (napi_get_typedarray_info(env,
+                                 value,
+                                 &ta_type,
+                                 &length,
+                                 &data,
+                                 &arraybuffer,
+                                 &byte_offset) != napi_ok ||
+        data == nullptr) {
+      ThrowInvalidArgType(env, "path", "string or Buffer");
+      return "";
+    }
+    if (ta_type != napi_uint8_array && ta_type != napi_uint8_clamped_array) {
+      ThrowInvalidArgType(env, "path", "string or Buffer");
+      return "";
+    }
+    return std::string(static_cast<const char*>(data), length);
+  }
+
+  ThrowInvalidArgType(env, "path", "string or Buffer");
+  return "";
+}
+
+bool PathFromValueStrict(napi_env env, napi_value value, std::string* out) {
+  if (out == nullptr) return false;
+  *out = PathFromValue(env, value);
+  bool has_exception = false;
+  if (napi_is_exception_pending(env, &has_exception) == napi_ok && has_exception) return false;
+  return true;
+}
+
+bool ValueToBool(napi_env env, napi_value value, bool* out) {
+  if (out == nullptr) return false;
+  if (napi_get_value_bool(env, value, out) == napi_ok) return true;
+  napi_valuetype type = napi_undefined;
+  if (napi_typeof(env, value, &type) == napi_ok &&
+      (type == napi_undefined || type == napi_null)) {
+    *out = false;
+    return true;
+  }
+  return false;
+}
+
+bool ValueToDouble(napi_env env, napi_value value, double* out) {
+  if (out == nullptr) return false;
+  if (napi_get_value_double(env, value, out) == napi_ok) return true;
+  return false;
+}
+
+std::string PathFromValueUnchecked(napi_env env, napi_value value) {
   size_t length = 0;
   if (napi_get_value_string_utf8(env, value, nullptr, 0, &length) != napi_ok) {
     return "";
@@ -277,10 +385,22 @@ napi_value BindingWriteFileUtf8(napi_env env, napi_callback_info info) {
       argc < 4) {
     return nullptr;
   }
-  std::string path = PathFromValue(env, argv[0]);
-  if (path.empty()) {
-    return nullptr;
+
+  bool path_is_fd = false;
+  int32_t fd = -1;
+  std::string path;
+  napi_valuetype path_type = napi_undefined;
+  if (napi_typeof(env, argv[0], &path_type) == napi_ok &&
+      path_type == napi_number &&
+      napi_get_value_int32(env, argv[0], &fd) == napi_ok) {
+    path_is_fd = true;
+  } else {
+    path = PathFromValue(env, argv[0]);
+    if (path.empty()) {
+      return nullptr;
+    }
   }
+
   size_t data_len = 0;
   if (napi_get_value_string_utf8(env, argv[1], nullptr, 0, &data_len) !=
       napi_ok) {
@@ -301,12 +421,18 @@ napi_value BindingWriteFileUtf8(napi_env env, napi_callback_info info) {
   }
 
   uv_fs_t req;
-  uv_file file =
-      uv_fs_open(nullptr, &req, path.c_str(), flags, mode, nullptr);
-  uv_fs_req_cleanup(&req);
-  if (file < 0) {
-    ThrowUVException(env, static_cast<int>(file), "open", path.c_str());
-    return nullptr;
+  uv_file file = -1;
+  bool close_file = false;
+  if (path_is_fd) {
+    file = static_cast<uv_file>(fd);
+  } else {
+    file = uv_fs_open(nullptr, &req, path.c_str(), flags, mode, nullptr);
+    uv_fs_req_cleanup(&req);
+    if (file < 0) {
+      ThrowUVException(env, static_cast<int>(file), "open", path.c_str());
+      return nullptr;
+    }
+    close_file = true;
   }
 
   size_t offset = 0;
@@ -319,17 +445,21 @@ napi_value BindingWriteFileUtf8(napi_env env, napi_callback_info info) {
     ssize_t bytes_written = req.result;
     uv_fs_req_cleanup(&req);
     if (bytes_written < 0) {
-      uv_fs_close(nullptr, &req, file, nullptr);
-      uv_fs_req_cleanup(&req);
+      if (close_file) {
+        uv_fs_close(nullptr, &req, file, nullptr);
+        uv_fs_req_cleanup(&req);
+      }
       ThrowUVException(env, static_cast<int>(bytes_written), "write",
-                       path.c_str());
+                       path_is_fd ? nullptr : path.c_str());
       return nullptr;
     }
     offset += static_cast<size_t>(bytes_written);
   }
 
-  uv_fs_close(nullptr, &req, file, nullptr);
-  uv_fs_req_cleanup(&req);
+  if (close_file) {
+    uv_fs_close(nullptr, &req, file, nullptr);
+    uv_fs_req_cleanup(&req);
+  }
   return nullptr;
 }
 
@@ -737,6 +867,11 @@ napi_value BindingFstat(napi_env env, napi_callback_info info) {
   }
   int32_t fd = 0;
   if (napi_get_value_int32(env, argv[0], &fd) != napi_ok) {
+    ThrowInvalidArgType(env, "fd", "number");
+    return nullptr;
+  }
+  if (fd < 0) {
+    ThrowOutOfRangeFd(env, fd);
     return nullptr;
   }
 
@@ -885,6 +1020,13 @@ static bool BufferFromValue(napi_env env, napi_value value, void** data,
   return true;
 }
 
+static bool IsNullOrUndefined(napi_env env, napi_value value) {
+  if (value == nullptr) return true;
+  napi_valuetype type = napi_undefined;
+  if (napi_typeof(env, value, &type) != napi_ok) return false;
+  return type == napi_null || type == napi_undefined;
+}
+
 napi_value BindingReadSync(napi_env env, napi_callback_info info) {
   size_t argc = 5;
   napi_value argv[5] = {nullptr};
@@ -913,9 +1055,9 @@ napi_value BindingReadSync(napi_env env, napi_callback_info info) {
     }
   }
   if (argc >= 5 && argv[4] != nullptr) {
-    double pos_d = 0;
-    if (napi_get_value_double(env, argv[4], &pos_d) != napi_ok) return nullptr;
-    position = static_cast<int64_t>(pos_d);
+    if (!IsNullOrUndefined(env, argv[4])) {
+      if (napi_get_value_int64(env, argv[4], &position) != napi_ok) return nullptr;
+    }
   }
   if (offset > buf_byte_length || length > buf_byte_length - offset) {
     return nullptr;
@@ -965,7 +1107,10 @@ napi_value BindingWriteSync(napi_env env, napi_callback_info info) {
     if (napi_get_value_int64(env, argv[3], &length_i) != napi_ok) return nullptr;
   }
   if (argc >= 5 && argv[4] != nullptr) {
-    if (napi_get_value_int64(env, argv[4], &position) != napi_ok) return nullptr;
+    if (!IsNullOrUndefined(env, argv[4]) &&
+        napi_get_value_int64(env, argv[4], &position) != napi_ok) {
+      return nullptr;
+    }
   }
   if (offset_i < 0 || length_i < 0 ||
       static_cast<size_t>(offset_i) > buf_byte_length ||
@@ -1061,12 +1206,8 @@ napi_value BindingWriteBuffer(napi_env env, napi_callback_info info) {
     return nullptr;
   }
   if (argc >= 5 && argv[4] != nullptr) {
-    bool is_null = false;
-    napi_value null_value = nullptr;
-    if (napi_get_null(env, &null_value) == napi_ok && null_value != nullptr) {
-      napi_strict_equals(env, argv[4], null_value, &is_null);
-    }
-    if (!is_null && napi_get_value_int64(env, argv[4], &position) != napi_ok) {
+    if (!IsNullOrUndefined(env, argv[4]) &&
+        napi_get_value_int64(env, argv[4], &position) != napi_ok) {
       return nullptr;
     }
   }
@@ -1305,8 +1446,14 @@ napi_value BindingUtimes(napi_env env, napi_callback_info info) {
   std::string path = PathFromValue(env, argv[0]);
   if (path.empty()) return nullptr;
   double atime = 0, mtime = 0;
-  if (napi_get_value_double(env, argv[1], &atime) != napi_ok) return nullptr;
-  if (napi_get_value_double(env, argv[2], &mtime) != napi_ok) return nullptr;
+  if (!ValueToDouble(env, argv[1], &atime)) {
+    ThrowInvalidArgType(env, "atime", "number");
+    return nullptr;
+  }
+  if (!ValueToDouble(env, argv[2], &mtime)) {
+    ThrowInvalidArgType(env, "mtime", "number");
+    return nullptr;
+  }
   uv_fs_t req;
   int err = uv_fs_utime(nullptr, &req, path.c_str(), atime, mtime, nullptr);
   uv_fs_req_cleanup(&req);
@@ -1325,10 +1472,23 @@ napi_value BindingFutimes(napi_env env, napi_callback_info info) {
     return nullptr;
   }
   int32_t fd = 0;
-  if (napi_get_value_int32(env, argv[0], &fd) != napi_ok) return nullptr;
+  if (napi_get_value_int32(env, argv[0], &fd) != napi_ok) {
+    ThrowInvalidArgType(env, "fd", "number");
+    return nullptr;
+  }
+  if (fd < 0) {
+    ThrowOutOfRangeFd(env, fd);
+    return nullptr;
+  }
   double atime = 0, mtime = 0;
-  if (napi_get_value_double(env, argv[1], &atime) != napi_ok) return nullptr;
-  if (napi_get_value_double(env, argv[2], &mtime) != napi_ok) return nullptr;
+  if (!ValueToDouble(env, argv[1], &atime)) {
+    ThrowInvalidArgType(env, "atime", "number");
+    return nullptr;
+  }
+  if (!ValueToDouble(env, argv[2], &mtime)) {
+    ThrowInvalidArgType(env, "mtime", "number");
+    return nullptr;
+  }
   uv_fs_t req;
   int err = uv_fs_futime(nullptr, &req, fd, atime, mtime, nullptr);
   uv_fs_req_cleanup(&req);
@@ -1349,8 +1509,14 @@ napi_value BindingLutimes(napi_env env, napi_callback_info info) {
   std::string path = PathFromValue(env, argv[0]);
   if (path.empty()) return nullptr;
   double atime = 0, mtime = 0;
-  if (napi_get_value_double(env, argv[1], &atime) != napi_ok) return nullptr;
-  if (napi_get_value_double(env, argv[2], &mtime) != napi_ok) return nullptr;
+  if (!ValueToDouble(env, argv[1], &atime)) {
+    ThrowInvalidArgType(env, "atime", "number");
+    return nullptr;
+  }
+  if (!ValueToDouble(env, argv[2], &mtime)) {
+    ThrowInvalidArgType(env, "mtime", "number");
+    return nullptr;
+  }
   uv_fs_t req;
   int err = uv_fs_lutime(nullptr, &req, path.c_str(), atime, mtime, nullptr);
   uv_fs_req_cleanup(&req);

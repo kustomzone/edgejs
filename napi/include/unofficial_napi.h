@@ -65,6 +65,76 @@ NAPI_EXTERN napi_status unofficial_napi_notify_datetime_configuration_change(nap
 NAPI_EXTERN napi_status unofficial_napi_create_serdes_binding(napi_env env,
                                                               napi_value* result_out);
 
+// Unofficial helpers for implementing internalBinding('contextify') on embedders.
+// These are engine-specific APIs and are not part of the public Node-API.
+NAPI_EXTERN napi_status unofficial_napi_contextify_make_context(
+    napi_env env,
+    napi_value sandbox_or_symbol,
+    napi_value name,
+    napi_value origin_or_undefined,
+    bool allow_code_gen_strings,
+    bool allow_code_gen_wasm,
+    bool own_microtask_queue,
+    napi_value host_defined_option_id,
+    napi_value* result_out);
+
+NAPI_EXTERN napi_status unofficial_napi_contextify_run_script(
+    napi_env env,
+    napi_value sandbox_or_null,
+    napi_value source,
+    napi_value filename,
+    int32_t line_offset,
+    int32_t column_offset,
+    int64_t timeout,
+    bool display_errors,
+    bool break_on_sigint,
+    bool break_on_first_line,
+    napi_value host_defined_option_id,
+    napi_value* result_out);
+
+NAPI_EXTERN napi_status unofficial_napi_contextify_dispose_context(
+    napi_env env,
+    napi_value sandbox_or_context_global);
+
+NAPI_EXTERN napi_status unofficial_napi_contextify_compile_function(
+    napi_env env,
+    napi_value code,
+    napi_value filename,
+    int32_t line_offset,
+    int32_t column_offset,
+    napi_value cached_data_or_undefined,
+    bool produce_cached_data,
+    napi_value parsing_context_or_undefined,
+    napi_value context_extensions_or_undefined,
+    napi_value params_or_undefined,
+    napi_value host_defined_option_id,
+    napi_value* result_out);
+
+NAPI_EXTERN napi_status unofficial_napi_contextify_compile_function_for_cjs_loader(
+    napi_env env,
+    napi_value code,
+    napi_value filename,
+    bool is_sea_main,
+    bool should_detect_module,
+    napi_value* result_out);
+
+NAPI_EXTERN napi_status unofficial_napi_contextify_contains_module_syntax(
+    napi_env env,
+    napi_value code,
+    napi_value filename,
+    napi_value resource_name_or_undefined,
+    bool cjs_var_in_scope,
+    bool* result_out);
+
+NAPI_EXTERN napi_status unofficial_napi_contextify_create_cached_data(
+    napi_env env,
+    napi_value code,
+    napi_value filename,
+    int32_t line_offset,
+    int32_t column_offset,
+    napi_value host_defined_option_id,
+    napi_value* cached_data_buffer_out);
+
 #ifdef __cplusplus
 }  // extern "C"
 #endif

@@ -8,41 +8,12 @@
 
 #include "node_version.h"
 #include "unofficial_napi.h"
+#include "ubi_process.h"
 #include "ubi_runtime.h"
 
 namespace {
 
 constexpr const char kUsage[] = "Usage: ubi <script.js>";
-
-std::string JsonQuote(const std::string& text) {
-  std::string out;
-  out.reserve(text.size() + 2);
-  out.push_back('"');
-  for (char ch : text) {
-    switch (ch) {
-      case '\\':
-        out += "\\\\";
-        break;
-      case '"':
-        out += "\\\"";
-        break;
-      case '\n':
-        out += "\\n";
-        break;
-      case '\r':
-        out += "\\r";
-        break;
-      case '\t':
-        out += "\\t";
-        break;
-      default:
-        out.push_back(ch);
-        break;
-    }
-  }
-  out.push_back('"');
-  return out;
-}
 
 int RunWithFreshEnv(const std::function<int(napi_env)>& runner, std::string* error_out) {
   napi_env env = nullptr;
@@ -83,6 +54,38 @@ std::string ResolveCliScriptPath(const char* script_path) {
   return direct.string();
 }
 
+std::vector<std::string> NormalizeCliOptionVector(const std::vector<std::string>& raw_args) {
+  std::vector<std::string> out;
+  out.reserve(raw_args.size());
+
+  for (size_t i = 0; i < raw_args.size(); ++i) {
+    const std::string& token = raw_args[i];
+
+    if ((token == "-e" || token == "--eval") && i + 1 < raw_args.size()) {
+      out.push_back("--eval=" + raw_args[++i]);
+      continue;
+    }
+
+    if (token == "-p" || token == "--print") {
+      out.push_back("--print");
+      if (i + 1 < raw_args.size()) {
+        out.push_back("--eval=" + raw_args[++i]);
+      }
+      continue;
+    }
+
+    if ((token == "-pe" || token == "-ep") && i + 1 < raw_args.size()) {
+      out.push_back("--print");
+      out.push_back("--eval=" + raw_args[++i]);
+      continue;
+    }
+
+    out.push_back(token);
+  }
+
+  return out;
+}
+
 }  // namespace
 
 int UbiRunCliScript(const char* script_path, std::string* error_out) {
@@ -107,6 +110,9 @@ int UbiRunCliScript(const char* script_path, std::string* error_out) {
 int UbiRunCli(int argc, const char* const* argv, std::string* error_out) {
   if (error_out != nullptr) {
     error_out->clear();
+  }
+  if (argv != nullptr && argc > 0 && argv[0] != nullptr) {
+    UbiSetProcessArgv0(argv[0]);
   }
   if (argv == nullptr || argc < 2) {
     UbiSetExecArgv({});
@@ -146,10 +152,17 @@ int UbiRunCli(int argc, const char* const* argv, std::string* error_out) {
         return 1;
       }
     }
-    if (error_out != nullptr) {
-      *error_out = "Interactive mode is not implemented";
+    std::vector<std::string> raw_exec_argv;
+    raw_exec_argv.reserve(static_cast<size_t>(argc - 1));
+    for (int i = 1; i < argc; ++i) {
+      if (argv[i] != nullptr) raw_exec_argv.emplace_back(argv[i]);
     }
-    return 1;
+    UbiSetExecArgv(NormalizeCliOptionVector(raw_exec_argv));
+    UbiSetScriptArgv({});
+    static constexpr const char kInteractiveMain[] = "require('internal/main/repl');";
+    return RunWithFreshEnv(
+        [&](napi_env env) { return UbiRunScriptSourceWithLoop(env, kInteractiveMain, error_out, true); },
+        error_out);
   }
 
   const bool is_eval_mode = (mode == "-e" || mode == "--eval" || mode == "-pe" || mode == "-ep");
@@ -168,52 +181,17 @@ int UbiRunCli(int argc, const char* const* argv, std::string* error_out) {
         script_argv.emplace_back(argv[i]);
       }
     }
-    std::vector<std::string> exec_argv;
-    exec_argv.reserve(static_cast<size_t>(mode_index));
-    for (int i = 1; i < mode_index; ++i) {
-      if (argv[i] == nullptr) continue;
-      const std::string token(argv[i]);
-      if (!token.empty() && token[0] == '-') exec_argv.push_back(token);
+    std::vector<std::string> raw_exec_argv;
+    raw_exec_argv.reserve(static_cast<size_t>(mode_index + 1));
+    for (int i = 1; i <= mode_index + 1 && i < argc; ++i) {
+      if (argv[i] != nullptr) raw_exec_argv.emplace_back(argv[i]);
     }
-    UbiSetExecArgv(exec_argv);
+    UbiSetExecArgv(NormalizeCliOptionVector(raw_exec_argv));
     UbiSetScriptArgv(script_argv);
-    const std::string code = argv[mode_index + 1];
-    std::string flags_line;
-    for (int i = 1; i < mode_index; ++i) {
-      if (argv[i] == nullptr) continue;
-      const std::string token(argv[i]);
-      if (!token.empty() && token[0] == '-') {
-        if (flags_line.empty()) flags_line = "// Flags:";
-        flags_line += " " + token;
-      }
-    }
-    std::string source;
-    if (is_print_mode) {
-      const std::string quoted = JsonQuote(code);
-      source =
-          "(function(){"
-          "const __ubiVm=require('vm');"
-          "try { if (typeof globalThis.http === 'undefined') globalThis.http = require('http'); } catch (_) {}"
-          "const __hadVm=Object.prototype.hasOwnProperty.call(globalThis,'vm');"
-          "const __oldVm=globalThis.vm;"
-          "globalThis.vm=__ubiVm;"
-          "const __ubiExpr=" + quoted + ";"
-          "try {"
-          "const __ubiResult=globalThis.eval(__ubiExpr);"
-          "if (__ubiResult!==undefined) console.log(__ubiResult);"
-          "} finally {"
-          "if (__hadVm) globalThis.vm=__oldVm; else delete globalThis.vm;"
-          "}"
-          "})();";
-    } else {
-      source = code;
-    }
-    if (!flags_line.empty()) {
-      source = flags_line + "\n" + source;
-    }
+    static constexpr const char kEvalStringMain[] = "require('internal/main/eval_string');";
     return RunWithFreshEnv(
         [&](napi_env env) {
-          return UbiRunScriptSourceWithLoop(env, source.c_str(), error_out, true);
+          return UbiRunScriptSourceWithLoop(env, kEvalStringMain, error_out, true);
         },
         error_out);
   }

@@ -239,6 +239,7 @@ void OnRead(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
       }
       napi_value ignored = nullptr;
       UbiMakeCallback(wrap->env, self, onread, 1, argv, &ignored);
+      (void)UbiHandlePendingExceptionNow(wrap->env, nullptr);
     }
   }
 
@@ -300,7 +301,7 @@ napi_value TcpCtor(napi_env env, napi_callback_info info) {
   wrap->initialized = true;
   wrap->handle.data = wrap;
   napi_wrap(env, self, wrap, TcpFinalize, nullptr, &wrap->wrapper_ref);
-  const char* mutable_methods[] = {"setNoDelay", "setKeepAlive", "ref", "unref"};
+  const char* mutable_methods[] = {"setNoDelay", "setKeepAlive", "ref", "unref", "close"};
   for (const char* key : mutable_methods) {
     napi_value fn = nullptr;
     if (napi_get_named_property(env, self, key, &fn) == napi_ok && fn != nullptr) {
@@ -310,10 +311,24 @@ napi_value TcpCtor(napi_env env, napi_callback_info info) {
       napi_define_properties(env, self, 1, &desc);
     }
   }
+  napi_set_named_property(env, self, "isStreamBase", MakeBool(env, true));
+  napi_set_named_property(env, self, "reading", MakeBool(env, false));
   return self;
 }
 
 bool ExtractByteSpan(napi_env env, napi_value v, const uint8_t** data, size_t* len, std::string* temp_utf8) {
+  bool is_buffer = false;
+  napi_is_buffer(env, v, &is_buffer);
+  if (is_buffer) {
+    void* raw = nullptr;
+    size_t length = 0;
+    if (napi_get_buffer_info(env, v, &raw, &length) == napi_ok && raw != nullptr) {
+      *data = static_cast<const uint8_t*>(raw);
+      *len = length;
+      return true;
+    }
+  }
+
   bool is_typed = false;
   napi_is_typedarray(env, v, &is_typed);
   if (is_typed) {
@@ -334,27 +349,96 @@ bool ExtractByteSpan(napi_env env, napi_value v, const uint8_t** data, size_t* l
   return true;
 }
 
+napi_value BufferFromWithEncoding(napi_env env, napi_value value, napi_value encoding) {
+  if (env == nullptr || value == nullptr) return value;
+
+  napi_value global = nullptr;
+  napi_value buffer_ctor = nullptr;
+  napi_value from_fn = nullptr;
+  napi_valuetype type = napi_undefined;
+  if (napi_get_global(env, &global) != napi_ok || global == nullptr ||
+      napi_get_named_property(env, global, "Buffer", &buffer_ctor) != napi_ok ||
+      buffer_ctor == nullptr ||
+      napi_get_named_property(env, buffer_ctor, "from", &from_fn) != napi_ok ||
+      from_fn == nullptr ||
+      napi_typeof(env, from_fn, &type) != napi_ok ||
+      type != napi_function) {
+    return value;
+  }
+
+  napi_value argv[2] = {value, nullptr};
+  size_t argc = 1;
+  if (encoding != nullptr) {
+    napi_valuetype enc_type = napi_undefined;
+    if (napi_typeof(env, encoding, &enc_type) == napi_ok && enc_type != napi_undefined) {
+      argv[1] = encoding;
+      argc = 2;
+    }
+  }
+
+  napi_value out = nullptr;
+  if (napi_call_function(env, buffer_ctor, from_fn, argc, argv, &out) != napi_ok || out == nullptr) {
+    return value;
+  }
+  return out;
+}
+
 napi_value TcpWriteBufferLike(napi_env env, TcpWrap* wrap, napi_value req_obj, const uint8_t* data, size_t len) {
+  uv_stream_t* stream = reinterpret_cast<uv_stream_t*>(&wrap->handle);
+  size_t sync_written = 0;
+
+  if (len > 0 && data != nullptr) {
+    uv_buf_t try_buf =
+        uv_buf_init(const_cast<char*>(reinterpret_cast<const char*>(data)), static_cast<unsigned int>(len));
+    const int try_rc = uv_try_write(stream, &try_buf, 1);
+    if (try_rc == static_cast<int>(len)) {
+      wrap->bytes_written += len;
+      SetState(kUbiBytesWritten, static_cast<int32_t>(len));
+      SetState(kUbiLastWriteWasAsync, 0);
+      return MakeInt32(env, 0);
+    }
+    if (try_rc > 0) {
+      sync_written = static_cast<size_t>(try_rc);
+      wrap->bytes_written += sync_written;
+    } else if (try_rc < 0 && try_rc != UV_EAGAIN && try_rc != UV_ENOSYS) {
+      SetState(kUbiBytesWritten, 0);
+      SetState(kUbiLastWriteWasAsync, 0);
+      SetReqError(env, req_obj, try_rc);
+      return MakeInt32(env, try_rc);
+    }
+  }
+
+  const size_t remaining = (len >= sync_written) ? (len - sync_written) : 0;
+  if (remaining == 0) {
+    SetState(kUbiBytesWritten, static_cast<int32_t>(sync_written));
+    SetState(kUbiLastWriteWasAsync, 0);
+    return MakeInt32(env, 0);
+  }
+
   auto* wr = new WriteReqWrap();
   wr->env = env;
   napi_create_reference(env, req_obj, 1, &wr->req_obj_ref);
   wr->nbufs = 1;
   wr->bufs = new uv_buf_t[1];
-  char* copy = static_cast<char*>(malloc(len));
-  if (len > 0 && copy != nullptr && data != nullptr) memcpy(copy, data, len);
-  wr->bufs[0] = uv_buf_init(copy, static_cast<unsigned int>(len));
+  char* copy = static_cast<char*>(malloc(remaining));
+  if (remaining > 0 && copy != nullptr && data != nullptr) memcpy(copy, data + sync_written, remaining);
+  wr->bufs[0] = uv_buf_init(copy, static_cast<unsigned int>(remaining));
   wr->req.data = wr;
 
-  wrap->bytes_written += len;
   SetState(kUbiBytesWritten, static_cast<int32_t>(len));
   SetState(kUbiLastWriteWasAsync, 1);
 
-  int rc = uv_write(&wr->req, reinterpret_cast<uv_stream_t*>(&wrap->handle), wr->bufs, 1, OnWriteDone);
+  int rc = uv_write(&wr->req, stream, wr->bufs, 1, OnWriteDone);
   if (rc != 0) {
+    SetState(kUbiBytesWritten, static_cast<int32_t>(sync_written));
+    SetState(kUbiLastWriteWasAsync, 0);
     SetReqError(env, req_obj, rc);
     FreeWriteReq(wr);
+    return MakeInt32(env, rc);
   }
-  return MakeInt32(env, rc);
+
+  wrap->bytes_written += remaining;
+  return MakeInt32(env, 0);
 }
 
 napi_value TcpWriteBuffer(napi_env env, napi_callback_info info) {
@@ -373,11 +457,30 @@ napi_value TcpWriteBuffer(napi_env env, napi_callback_info info) {
 napi_value TcpWriteString(napi_env env, napi_callback_info info) {
   size_t argc = 2;
   napi_value argv[2] = {nullptr};
+  napi_value self = nullptr;
+  void* data = nullptr;
+  napi_get_cb_info(env, info, &argc, argv, &self, &data);
   TcpWrap* wrap = nullptr;
-  GetThis(env, info, &argc, argv, &wrap);
+  if (self != nullptr) {
+    napi_unwrap(env, self, reinterpret_cast<void**>(&wrap));
+  }
   if (wrap == nullptr || argc < 2) return MakeInt32(env, UV_EINVAL);
-  std::string s = ValueToUtf8(env, argv[1]);
-  return TcpWriteBufferLike(env, wrap, argv[0], reinterpret_cast<const uint8_t*>(s.data()), s.size());
+
+  const char* encoding_name = static_cast<const char*>(data);
+  napi_value encoded = argv[1];
+  if (encoding_name != nullptr && argv[1] != nullptr) {
+    napi_value encoding = nullptr;
+    if (napi_create_string_utf8(env, encoding_name, NAPI_AUTO_LENGTH, &encoding) == napi_ok &&
+        encoding != nullptr) {
+      encoded = BufferFromWithEncoding(env, argv[1], encoding);
+    }
+  }
+
+  const uint8_t* bytes = nullptr;
+  size_t length = 0;
+  std::string temp;
+  ExtractByteSpan(env, encoded, &bytes, &length, &temp);
+  return TcpWriteBufferLike(env, wrap, argv[0], bytes, length);
 }
 
 napi_value TcpWritev(napi_env env, napi_callback_info info) {
@@ -391,12 +494,19 @@ napi_value TcpWritev(napi_env env, napi_callback_info info) {
   bool all_buffers = false;
   if (argc > 2 && argv[2] != nullptr) napi_get_value_bool(env, argv[2], &all_buffers);
 
-  uint32_t n = 0;
-  napi_get_array_length(env, chunks, &n);
+  uint32_t raw_len = 0;
+  napi_get_array_length(env, chunks, &raw_len);
+  const uint32_t n = all_buffers ? raw_len : (raw_len / 2);
+  if (n == 0) {
+    SetState(kUbiBytesWritten, 0);
+    SetState(kUbiLastWriteWasAsync, 0);
+    return MakeInt32(env, 0);
+  }
+
   auto* wr = new WriteReqWrap();
   wr->env = env;
   napi_create_reference(env, req_obj, 1, &wr->req_obj_ref);
-  wr->bufs = new uv_buf_t[n > 0 ? n : 1];
+  wr->bufs = new uv_buf_t[n];
   wr->nbufs = n;
   size_t total = 0;
 
@@ -406,6 +516,15 @@ napi_value TcpWritev(napi_env env, napi_callback_info info) {
       napi_get_element(env, chunks, i, &chunk);
     } else {
       napi_get_element(env, chunks, i * 2, &chunk);
+      bool is_buffer = false;
+      napi_is_buffer(env, chunk, &is_buffer);
+      bool is_typed_array = false;
+      if (!is_buffer) napi_is_typedarray(env, chunk, &is_typed_array);
+      if (!is_buffer && !is_typed_array) {
+        napi_value encoding = nullptr;
+        napi_get_element(env, chunks, i * 2 + 1, &encoding);
+        chunk = BufferFromWithEncoding(env, chunk, encoding);
+      }
     }
     const uint8_t* data = nullptr;
     size_t len = 0;
@@ -909,39 +1028,43 @@ napi_value UbiInstallTcpWrapBinding(napi_env env) {
   if (napi_create_object(env, &binding) != napi_ok || binding == nullptr) return nullptr;
 
   napi_property_descriptor tcp_props[] = {
-      {"open", nullptr, TcpOpen, nullptr, nullptr, nullptr, napi_default, nullptr},
-      {"setBlocking", nullptr, TcpSetBlocking, nullptr, nullptr, nullptr, napi_default, nullptr},
-      {"bind", nullptr, TcpBind, nullptr, nullptr, nullptr, napi_default, nullptr},
-      {"bind6", nullptr, TcpBind6, nullptr, nullptr, nullptr, napi_default, nullptr},
-      {"listen", nullptr, TcpListen, nullptr, nullptr, nullptr, napi_default, nullptr},
-      {"connect", nullptr, TcpConnect, nullptr, nullptr, nullptr, napi_default, nullptr},
-      {"connect6", nullptr, TcpConnect6, nullptr, nullptr, nullptr, napi_default, nullptr},
-      {"shutdown", nullptr, TcpShutdown, nullptr, nullptr, nullptr, napi_default, nullptr},
-      {"close", nullptr, TcpClose, nullptr, nullptr, nullptr, napi_default, nullptr},
-      {"readStart", nullptr, TcpReadStart, nullptr, nullptr, nullptr, napi_default, nullptr},
-      {"readStop", nullptr, TcpReadStop, nullptr, nullptr, nullptr, napi_default, nullptr},
-      {"writeBuffer", nullptr, TcpWriteBuffer, nullptr, nullptr, nullptr, napi_default, nullptr},
-      {"writev", nullptr, TcpWritev, nullptr, nullptr, nullptr, napi_default, nullptr},
-      {"writeLatin1String", nullptr, TcpWriteString, nullptr, nullptr, nullptr, napi_default, nullptr},
-      {"writeUtf8String", nullptr, TcpWriteString, nullptr, nullptr, nullptr, napi_default, nullptr},
-      {"writeAsciiString", nullptr, TcpWriteString, nullptr, nullptr, nullptr, napi_default, nullptr},
-      {"writeUcs2String", nullptr, TcpWriteString, nullptr, nullptr, nullptr, napi_default, nullptr},
+      {"open", nullptr, TcpOpen, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+      {"setBlocking", nullptr, TcpSetBlocking, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+      {"bind", nullptr, TcpBind, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+      {"bind6", nullptr, TcpBind6, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+      {"listen", nullptr, TcpListen, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+      {"connect", nullptr, TcpConnect, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+      {"connect6", nullptr, TcpConnect6, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+      {"shutdown", nullptr, TcpShutdown, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+      {"close", nullptr, TcpClose, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+      {"readStart", nullptr, TcpReadStart, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+      {"readStop", nullptr, TcpReadStop, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+      {"writeBuffer", nullptr, TcpWriteBuffer, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+      {"writev", nullptr, TcpWritev, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+      {"writeLatin1String", nullptr, TcpWriteString, nullptr, nullptr, nullptr, napi_default_method,
+       const_cast<char*>("latin1")},
+      {"writeUtf8String", nullptr, TcpWriteString, nullptr, nullptr, nullptr, napi_default_method,
+       const_cast<char*>("utf8")},
+      {"writeAsciiString", nullptr, TcpWriteString, nullptr, nullptr, nullptr, napi_default_method,
+       const_cast<char*>("ascii")},
+      {"writeUcs2String", nullptr, TcpWriteString, nullptr, nullptr, nullptr, napi_default_method,
+       const_cast<char*>("ucs2")},
       {"setNoDelay", nullptr, TcpSetNoDelay, nullptr, nullptr, nullptr,
        static_cast<napi_property_attributes>(napi_writable | napi_configurable), nullptr},
       {"setKeepAlive", nullptr, TcpSetKeepAlive, nullptr, nullptr, nullptr,
        static_cast<napi_property_attributes>(napi_writable | napi_configurable), nullptr},
-      {"getsockname", nullptr, TcpGetSockName, nullptr, nullptr, nullptr, napi_default, nullptr},
-      {"getpeername", nullptr, TcpGetPeerName, nullptr, nullptr, nullptr, napi_default, nullptr},
+      {"getsockname", nullptr, TcpGetSockName, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+      {"getpeername", nullptr, TcpGetPeerName, nullptr, nullptr, nullptr, napi_default_method, nullptr},
       {"ref", nullptr, TcpRef, nullptr, nullptr, nullptr,
        static_cast<napi_property_attributes>(napi_writable | napi_configurable), nullptr},
       {"unref", nullptr, TcpUnref, nullptr, nullptr, nullptr,
        static_cast<napi_property_attributes>(napi_writable | napi_configurable), nullptr},
-      {"getAsyncId", nullptr, TcpGetAsyncId, nullptr, nullptr, nullptr, napi_default, nullptr},
-      {"getProviderType", nullptr, TcpGetProviderType, nullptr, nullptr, nullptr, napi_default, nullptr},
-      {"asyncReset", nullptr, TcpAsyncReset, nullptr, nullptr, nullptr, napi_default, nullptr},
-      {"reset", nullptr, TcpReset, nullptr, nullptr, nullptr, napi_default, nullptr},
-      {"fchmod", nullptr, TcpFchmod, nullptr, nullptr, nullptr, napi_default, nullptr},
-      {"useUserBuffer", nullptr, TcpUseUserBuffer, nullptr, nullptr, nullptr, napi_default, nullptr},
+      {"getAsyncId", nullptr, TcpGetAsyncId, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+      {"getProviderType", nullptr, TcpGetProviderType, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+      {"asyncReset", nullptr, TcpAsyncReset, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+      {"reset", nullptr, TcpReset, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+      {"fchmod", nullptr, TcpFchmod, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+      {"useUserBuffer", nullptr, TcpUseUserBuffer, nullptr, nullptr, nullptr, napi_default_method, nullptr},
       {"bytesRead", nullptr, nullptr, TcpBytesReadGetter, nullptr, nullptr, napi_default, nullptr},
       {"bytesWritten", nullptr, nullptr, TcpBytesWrittenGetter, nullptr, nullptr, napi_default, nullptr},
       {"fd", nullptr, nullptr, TcpFdGetter, nullptr, nullptr, napi_default, nullptr},

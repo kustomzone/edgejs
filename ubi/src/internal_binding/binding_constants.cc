@@ -2,6 +2,9 @@
 
 #include <unordered_map>
 
+#include <openssl/ec.h>
+#include <openssl/rsa.h>
+
 #include "internal_binding/helpers.h"
 
 namespace internal_binding {
@@ -106,52 +109,6 @@ void CopyOwnProperties(napi_env env, napi_value src, napi_value dst) {
   }
 }
 
-napi_value TryRequireModule(napi_env env, const char* module_name) {
-  const napi_value undefined = Undefined(env);
-  const napi_value global = GetGlobal(env);
-  if (global == nullptr) return undefined;
-
-  napi_value require_fn = nullptr;
-  if (napi_get_named_property(env, global, "require", &require_fn) != napi_ok || require_fn == nullptr) {
-    return undefined;
-  }
-  napi_valuetype require_type = napi_undefined;
-  if (napi_typeof(env, require_fn, &require_type) != napi_ok || require_type != napi_function) {
-    return undefined;
-  }
-
-  napi_value module_name_v = nullptr;
-  if (napi_create_string_utf8(env, module_name, NAPI_AUTO_LENGTH, &module_name_v) != napi_ok ||
-      module_name_v == nullptr) {
-    return undefined;
-  }
-
-  napi_value argv[1] = {module_name_v};
-  napi_value module = nullptr;
-  if (napi_call_function(env, global, require_fn, 1, argv, &module) != napi_ok || module == nullptr) {
-    bool pending = false;
-    if (napi_is_exception_pending(env, &pending) == napi_ok && pending) {
-      napi_value ignored = nullptr;
-      napi_get_and_clear_last_exception(env, &ignored);
-    }
-    return undefined;
-  }
-  return module;
-}
-
-napi_value TryGetModuleConstants(napi_env env, const char* module_name) {
-  const napi_value undefined = Undefined(env);
-  const napi_value module = TryRequireModule(env, module_name);
-  if (IsUndefined(env, module) || !IsObjectLike(env, module)) return undefined;
-
-  napi_value constants = nullptr;
-  if (napi_get_named_property(env, module, "constants", &constants) != napi_ok ||
-      constants == nullptr || !IsObjectLike(env, constants)) {
-    return undefined;
-  }
-  return constants;
-}
-
 bool CopyNumericOwnProperties(napi_env env, napi_value src, napi_value dst) {
   napi_value keys = nullptr;
   if (napi_get_property_names(env, src, &keys) != napi_ok || keys == nullptr) return false;
@@ -242,9 +199,107 @@ void NormalizeConstantsShape(napi_env env, napi_value constants) {
   // Keep zlib constants minimally non-empty so zlib.js can compute
   // parameter-array bounds during module initialization.
   napi_value zlib_obj = EnsureObjectProperty(env, constants, "zlib");
+  EnsureInt32Default(env, zlib_obj, "Z_NO_FLUSH", 0);
+  EnsureInt32Default(env, zlib_obj, "Z_PARTIAL_FLUSH", 1);
+  EnsureInt32Default(env, zlib_obj, "Z_SYNC_FLUSH", 2);
+  EnsureInt32Default(env, zlib_obj, "Z_FULL_FLUSH", 3);
+  EnsureInt32Default(env, zlib_obj, "Z_FINISH", 4);
+  EnsureInt32Default(env, zlib_obj, "Z_BLOCK", 5);
+  EnsureInt32Default(env, zlib_obj, "Z_OK", 0);
+  EnsureInt32Default(env, zlib_obj, "Z_STREAM_END", 1);
+  EnsureInt32Default(env, zlib_obj, "Z_NEED_DICT", 2);
+  EnsureInt32Default(env, zlib_obj, "Z_ERRNO", -1);
+  EnsureInt32Default(env, zlib_obj, "Z_STREAM_ERROR", -2);
+  EnsureInt32Default(env, zlib_obj, "Z_DATA_ERROR", -3);
+  EnsureInt32Default(env, zlib_obj, "Z_MEM_ERROR", -4);
+  EnsureInt32Default(env, zlib_obj, "Z_BUF_ERROR", -5);
+  EnsureInt32Default(env, zlib_obj, "Z_VERSION_ERROR", -6);
+  EnsureInt32Default(env, zlib_obj, "Z_NO_COMPRESSION", 0);
+  EnsureInt32Default(env, zlib_obj, "Z_BEST_SPEED", 1);
+  EnsureInt32Default(env, zlib_obj, "Z_BEST_COMPRESSION", 9);
+  EnsureInt32Default(env, zlib_obj, "Z_DEFAULT_COMPRESSION", -1);
+  EnsureInt32Default(env, zlib_obj, "Z_DEFAULT_LEVEL", -1);
+  EnsureInt32Default(env, zlib_obj, "Z_FILTERED", 1);
+  EnsureInt32Default(env, zlib_obj, "Z_HUFFMAN_ONLY", 2);
+  EnsureInt32Default(env, zlib_obj, "Z_RLE", 3);
+  EnsureInt32Default(env, zlib_obj, "Z_FIXED", 4);
+  EnsureInt32Default(env, zlib_obj, "Z_DEFAULT_STRATEGY", 0);
+  EnsureInt32Default(env, zlib_obj, "DEFLATE", 1);
+  EnsureInt32Default(env, zlib_obj, "INFLATE", 2);
+  EnsureInt32Default(env, zlib_obj, "GZIP", 3);
+  EnsureInt32Default(env, zlib_obj, "GUNZIP", 4);
+  EnsureInt32Default(env, zlib_obj, "DEFLATERAW", 5);
+  EnsureInt32Default(env, zlib_obj, "INFLATERAW", 6);
+  EnsureInt32Default(env, zlib_obj, "UNZIP", 7);
+  EnsureInt32Default(env, zlib_obj, "BROTLI_DECODE", 8);
+  EnsureInt32Default(env, zlib_obj, "BROTLI_ENCODE", 9);
+  EnsureInt32Default(env, zlib_obj, "ZSTD_COMPRESS", 10);
+  EnsureInt32Default(env, zlib_obj, "ZSTD_DECOMPRESS", 11);
+  EnsureInt32Default(env, zlib_obj, "Z_MIN_WINDOWBITS", 8);
+  EnsureInt32Default(env, zlib_obj, "Z_MAX_WINDOWBITS", 15);
+  EnsureInt32Default(env, zlib_obj, "Z_DEFAULT_WINDOWBITS", 15);
+  EnsureInt32Default(env, zlib_obj, "Z_MIN_CHUNK", 64);
+  EnsureInt32Default(env, zlib_obj, "Z_MAX_CHUNK", 2147483647);
+  EnsureInt32Default(env, zlib_obj, "Z_DEFAULT_CHUNK", 16384);
+  EnsureInt32Default(env, zlib_obj, "Z_MIN_MEMLEVEL", 1);
+  EnsureInt32Default(env, zlib_obj, "Z_MAX_MEMLEVEL", 9);
+  EnsureInt32Default(env, zlib_obj, "Z_DEFAULT_MEMLEVEL", 8);
+  EnsureInt32Default(env, zlib_obj, "Z_MIN_LEVEL", -1);
+  EnsureInt32Default(env, zlib_obj, "Z_MAX_LEVEL", 9);
+  EnsureInt32Default(env, zlib_obj, "BROTLI_OPERATION_PROCESS", 0);
+  EnsureInt32Default(env, zlib_obj, "BROTLI_OPERATION_FLUSH", 1);
+  EnsureInt32Default(env, zlib_obj, "BROTLI_OPERATION_FINISH", 2);
+  EnsureInt32Default(env, zlib_obj, "BROTLI_OPERATION_EMIT_METADATA", 3);
   EnsureInt32Default(env, zlib_obj, "BROTLI_PARAM_QUALITY", 1);
+  EnsureInt32Default(env, zlib_obj, "BROTLI_PARAM_MODE", 0);
+  EnsureInt32Default(env, zlib_obj, "BROTLI_PARAM_LGWIN", 2);
+  EnsureInt32Default(env, zlib_obj, "BROTLI_PARAM_LGBLOCK", 3);
+  EnsureInt32Default(env, zlib_obj, "BROTLI_PARAM_DISABLE_LITERAL_CONTEXT_MODELING", 4);
+  EnsureInt32Default(env, zlib_obj, "BROTLI_PARAM_SIZE_HINT", 5);
+  EnsureInt32Default(env, zlib_obj, "BROTLI_PARAM_LARGE_WINDOW", 6);
+  EnsureInt32Default(env, zlib_obj, "BROTLI_PARAM_NPOSTFIX", 7);
+  EnsureInt32Default(env, zlib_obj, "BROTLI_PARAM_NDIRECT", 8);
+  EnsureInt32Default(env, zlib_obj, "ZSTD_e_continue", 0);
+  EnsureInt32Default(env, zlib_obj, "ZSTD_e_flush", 1);
+  EnsureInt32Default(env, zlib_obj, "ZSTD_e_end", 2);
   EnsureInt32Default(env, zlib_obj, "ZSTD_c_compressionLevel", 1);
   EnsureInt32Default(env, zlib_obj, "ZSTD_d_windowLogMax", 1);
+
+  // Keep critical crypto constants aligned with Node's constants module shape.
+  napi_value crypto_obj = EnsureObjectProperty(env, constants, "crypto");
+#ifdef RSA_PKCS1_PADDING
+  EnsureInt32Default(env, crypto_obj, "RSA_PKCS1_PADDING", RSA_PKCS1_PADDING);
+#endif
+#ifdef RSA_NO_PADDING
+  EnsureInt32Default(env, crypto_obj, "RSA_NO_PADDING", RSA_NO_PADDING);
+#endif
+#ifdef RSA_PKCS1_OAEP_PADDING
+  EnsureInt32Default(env, crypto_obj, "RSA_PKCS1_OAEP_PADDING", RSA_PKCS1_OAEP_PADDING);
+#endif
+#ifdef RSA_X931_PADDING
+  EnsureInt32Default(env, crypto_obj, "RSA_X931_PADDING", RSA_X931_PADDING);
+#endif
+#ifdef RSA_PKCS1_PSS_PADDING
+  EnsureInt32Default(env, crypto_obj, "RSA_PKCS1_PSS_PADDING", RSA_PKCS1_PSS_PADDING);
+#endif
+#ifdef RSA_PSS_SALTLEN_DIGEST
+  EnsureInt32Default(env, crypto_obj, "RSA_PSS_SALTLEN_DIGEST", RSA_PSS_SALTLEN_DIGEST);
+#endif
+#ifdef RSA_PSS_SALTLEN_MAX_SIGN
+  EnsureInt32Default(env, crypto_obj, "RSA_PSS_SALTLEN_MAX_SIGN", RSA_PSS_SALTLEN_MAX_SIGN);
+#endif
+#ifdef RSA_PSS_SALTLEN_AUTO
+  EnsureInt32Default(env, crypto_obj, "RSA_PSS_SALTLEN_AUTO", RSA_PSS_SALTLEN_AUTO);
+#endif
+#ifdef POINT_CONVERSION_COMPRESSED
+  EnsureInt32Default(env, crypto_obj, "POINT_CONVERSION_COMPRESSED", POINT_CONVERSION_COMPRESSED);
+#endif
+#ifdef POINT_CONVERSION_UNCOMPRESSED
+  EnsureInt32Default(env, crypto_obj, "POINT_CONVERSION_UNCOMPRESSED", POINT_CONVERSION_UNCOMPRESSED);
+#endif
+#ifdef POINT_CONVERSION_HYBRID
+  EnsureInt32Default(env, crypto_obj, "POINT_CONVERSION_HYBRID", POINT_CONVERSION_HYBRID);
+#endif
 }
 
 }  // namespace
@@ -286,17 +341,18 @@ napi_value ResolveConstants(napi_env env, const ResolveOptions& options) {
     }
   }
 
-  // Fill high-impact constant surfaces from public module constants when available.
-  SetNamedObjectIfValid(env, out, "zlib", TryGetModuleConstants(env, "zlib"));
-  SetNamedObjectIfValid(env, out, "crypto", TryGetModuleConstants(env, "crypto"));
-
-  napi_value os_module_constants = TryGetModuleConstants(env, "os");
-  if (!IsUndefined(env, os_module_constants) && IsObjectLike(env, os_module_constants)) {
-    SetNamedObjectIfValid(env, out, "os", os_module_constants);
+  // Derive crypto constants from the native crypto binding surface to avoid
+  // requiring JS modules while constants are initializing.
+  napi_value crypto_binding = nullptr;
+  if (options.callbacks.resolve_binding != nullptr) {
+    crypto_binding = options.callbacks.resolve_binding(env, options.state, "crypto");
   }
-  napi_value fs_module_constants = TryGetModuleConstants(env, "fs");
-  if (!IsUndefined(env, fs_module_constants) && IsObjectLike(env, fs_module_constants)) {
-    SetNamedObjectIfValid(env, out, "fs", fs_module_constants);
+  if (!IsUndefined(env, crypto_binding) && IsObjectLike(env, crypto_binding)) {
+    napi_value crypto_constants_obj = nullptr;
+    if (napi_create_object(env, &crypto_constants_obj) == napi_ok && crypto_constants_obj != nullptr) {
+      CopyNumericOwnProperties(env, crypto_binding, crypto_constants_obj);
+      SetNamedObjectIfValid(env, out, "crypto", crypto_constants_obj);
+    }
   }
 
   SetNamedObjectIfValid(env, out, "internal", CreateInternalConstants(env));

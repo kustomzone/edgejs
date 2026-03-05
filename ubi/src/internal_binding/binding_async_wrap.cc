@@ -39,6 +39,12 @@ struct AsyncWrapState {
   std::vector<double> overflow_stack;
 };
 
+struct DestroyHookData {
+  napi_env env = nullptr;
+  double async_id = 0;
+  napi_ref destroyed_ref = nullptr;
+};
+
 std::unordered_map<napi_env, AsyncWrapState> g_async_wrap_states;
 
 AsyncWrapState* GetState(napi_env env) {
@@ -52,6 +58,50 @@ napi_value GetRefValue(napi_env env, napi_ref ref) {
   napi_value out = nullptr;
   if (napi_get_reference_value(env, ref, &out) != napi_ok || out == nullptr) return nullptr;
   return out;
+}
+
+bool IsDestroyHookAlreadyHandled(napi_env env, napi_ref destroyed_ref) {
+  if (env == nullptr || destroyed_ref == nullptr) return false;
+  napi_value destroyed_obj = GetRefValue(env, destroyed_ref);
+  if (destroyed_obj == nullptr) return false;
+  bool has_flag = false;
+  if (napi_has_named_property(env, destroyed_obj, "destroyed", &has_flag) != napi_ok || !has_flag) return false;
+  napi_value flag = nullptr;
+  if (napi_get_named_property(env, destroyed_obj, "destroyed", &flag) != napi_ok || flag == nullptr) return false;
+  bool handled = false;
+  napi_get_value_bool(env, flag, &handled);
+  return handled;
+}
+
+void EmitDestroyHookForAsyncId(napi_env env, double async_id) {
+  AsyncWrapState* state = GetState(env);
+  if (state == nullptr || state->hooks_ref == nullptr) return;
+  napi_value hooks = GetRefValue(env, state->hooks_ref);
+  if (hooks == nullptr) return;
+  napi_value destroy_fn = nullptr;
+  if (napi_get_named_property(env, hooks, "destroy", &destroy_fn) != napi_ok || destroy_fn == nullptr) return;
+  napi_valuetype type = napi_undefined;
+  if (napi_typeof(env, destroy_fn, &type) != napi_ok || type != napi_function) return;
+  napi_value async_id_value = nullptr;
+  if (napi_create_double(env, async_id, &async_id_value) != napi_ok || async_id_value == nullptr) return;
+  napi_value ignored = nullptr;
+  napi_call_function(env, hooks, destroy_fn, 1, &async_id_value, &ignored);
+}
+
+void DestroyHookFinalizer(napi_env env, void* data, void* /*hint*/) {
+  auto* hook = static_cast<DestroyHookData*>(data);
+  if (hook == nullptr) return;
+  napi_env cb_env = env != nullptr ? env : hook->env;
+  if (cb_env != nullptr) {
+    if (!IsDestroyHookAlreadyHandled(cb_env, hook->destroyed_ref)) {
+      EmitDestroyHookForAsyncId(cb_env, hook->async_id);
+    }
+    if (hook->destroyed_ref != nullptr) {
+      napi_delete_reference(cb_env, hook->destroyed_ref);
+      hook->destroyed_ref = nullptr;
+    }
+  }
+  delete hook;
 }
 
 bool GetTypedArrayView(napi_env env,
@@ -346,7 +396,37 @@ napi_value AsyncWrapGetPromiseHooks(napi_env env, napi_callback_info /*info*/) {
   return out;
 }
 
-napi_value AsyncWrapRegisterDestroyHook(napi_env env, napi_callback_info /*info*/) {
+napi_value AsyncWrapRegisterDestroyHook(napi_env env, napi_callback_info info) {
+  size_t argc = 3;
+  napi_value argv[3] = {nullptr, nullptr, nullptr};
+  napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+  if (argc < 2 || argv[0] == nullptr || argv[1] == nullptr) return Undefined(env);
+
+  napi_valuetype target_type = napi_undefined;
+  if (napi_typeof(env, argv[0], &target_type) != napi_ok ||
+      (target_type != napi_object && target_type != napi_function)) {
+    return Undefined(env);
+  }
+
+  double async_id = 0;
+  if (napi_get_value_double(env, argv[1], &async_id) != napi_ok) return Undefined(env);
+
+  auto* hook = new DestroyHookData();
+  hook->env = env;
+  hook->async_id = async_id;
+
+  if (argc >= 3 && argv[2] != nullptr) {
+    napi_valuetype destroyed_type = napi_undefined;
+    if (napi_typeof(env, argv[2], &destroyed_type) == napi_ok &&
+        (destroyed_type == napi_object || destroyed_type == napi_function)) {
+      napi_create_reference(env, argv[2], 1, &hook->destroyed_ref);
+    }
+  }
+
+  if (napi_add_finalizer(env, argv[0], hook, DestroyHookFinalizer, nullptr, nullptr) != napi_ok) {
+    if (hook->destroyed_ref != nullptr) napi_delete_reference(env, hook->destroyed_ref);
+    delete hook;
+  }
   return Undefined(env);
 }
 

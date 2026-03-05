@@ -367,6 +367,9 @@ if(NAPI_V8_LIBRARY)
     runners/test_64_node_worker_terminate_finalization.cc
     ${NAPI_TESTS_ROOT}/node-api/test_worker_terminate_finalization/test_worker_terminate_finalization.c
   )
+  add_fixture_test(napi_v8_test_65_unofficial_contextify
+    runners/test_65_unofficial_contextify.cc
+  )
 else()
   message(STATUS "Skipping napi_v8_tier1_tests: set NAPI_V8_LIBRARY to link V8 runtime")
 endif()

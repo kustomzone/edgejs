@@ -251,8 +251,23 @@ napi_value BuildHeadersArray(Parser* p) {
     napi_value k = nullptr;
     napi_value v = nullptr;
     const std::string& key = i < p->fields.size() ? p->fields[i] : std::string();
+    const std::string& raw_value = p->values[i];
+    size_t value_start = 0;
+    size_t value_end = raw_value.size();
+    while (value_start < value_end &&
+           (raw_value[value_start] == ' ' || raw_value[value_start] == '\t')) {
+      value_start++;
+    }
+    while (value_end > value_start &&
+           (raw_value[value_end - 1] == ' ' || raw_value[value_end - 1] == '\t')) {
+      value_end--;
+    }
     napi_create_string_utf8(p->env, key.c_str(), key.size(), &k);
-    napi_create_string_utf8(p->env, p->values[i].c_str(), p->values[i].size(), &v);
+    // Node decodes header values as Latin-1 bytes, not UTF-8.
+    napi_create_string_latin1(p->env,
+                              raw_value.c_str() + value_start,
+                              value_end - value_start,
+                              &v);
     if (k != nullptr) napi_set_element(p->env, arr, static_cast<uint32_t>(i * 2), k);
     if (v != nullptr) napi_set_element(p->env, arr, static_cast<uint32_t>(i * 2 + 1), v);
   }
@@ -383,7 +398,9 @@ int ParserOnMessageComplete(llhttp_t* llp) {
     p->list->all.insert(p);
   }
   if (!p->fields.empty()) {
-    // _http_common tolerates one-shot headers array.
+    // Trailing headers are delivered through kOnHeaders and consumed in
+    // _http_common parserOnMessageComplete via parser._headers.
+    if (FlushHeadersToJs(p) != 0) return HPE_USER;
   }
   return CallIndexedNoArgs(p, kOnMessageComplete, true);
 }
@@ -550,14 +567,25 @@ napi_value ParserExecuteCommon(Parser* p, const char* data, size_t len) {
     return nullptr;
   }
   if (llhttp_get_upgrade(&p->parser) == 0 && err != HPE_OK) {
-    const char* reason = llhttp_get_error_reason(&p->parser);
-    const char* code = llhttp_errno_name(err);
-    std::string message = "Parse Error: ";
-    message += (reason != nullptr) ? reason : "Unknown error";
+    const char* raw_reason = llhttp_get_error_reason(&p->parser);
+    std::string reason = (raw_reason != nullptr) ? raw_reason : "Unknown error";
+    std::string code = llhttp_errno_name(err) != nullptr ? llhttp_errno_name(err) : "HPE_UNKNOWN";
+    if (err == HPE_USER && raw_reason != nullptr && std::strncmp(raw_reason, "HPE_", 4) == 0) {
+      const char* colon = std::strchr(raw_reason, ':');
+      if (colon != nullptr && colon > raw_reason) {
+        code.assign(raw_reason, static_cast<size_t>(colon - raw_reason));
+        reason.assign(colon + 1);
+      }
+    }
+    std::string message = "Parse Error";
+    if (!reason.empty()) {
+      message += ": ";
+      message += reason;
+    }
     return MakeError(p->env,
                      message.c_str(),
-                     code != nullptr ? code : "HPE_UNKNOWN",
-                     reason,
+                     code.c_str(),
+                     reason.c_str(),
                      static_cast<uint32_t>(nread),
                      data,
                      len);
@@ -655,12 +683,52 @@ napi_value ParserResume(napi_env env, napi_callback_info info) {
 }
 
 napi_value ParserConsume(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1] = {nullptr};
+  napi_value self = nullptr;
+  Parser* p = Unwrap<Parser>(env, info, &self);
+  if (p == nullptr) return nullptr;
+  if (napi_get_cb_info(env, info, &argc, argv, &self, nullptr) == napi_ok) {
+    // Keep JS-visible consume state aligned with Node's stream consume contract.
+    // Server/http code uses this marker to avoid duplicate consume/unconsume flows.
+    if (argc >= 1 && argv[0] != nullptr) {
+      napi_value consumed = nullptr;
+      if (napi_get_boolean(env, true, &consumed) == napi_ok && consumed != nullptr) {
+        napi_set_named_property(env, argv[0], "_consumed", consumed);
+      }
+    }
+    if (self != nullptr) {
+      napi_value consumed = nullptr;
+      if (napi_get_boolean(env, true, &consumed) == napi_ok && consumed != nullptr) {
+        napi_set_named_property(env, self, "_consumed", consumed);
+      }
+    }
+  }
   napi_value undefined = nullptr;
   napi_get_undefined(env, &undefined);
   return undefined;
 }
 
 napi_value ParserUnconsume(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1] = {nullptr};
+  napi_value self = nullptr;
+  Parser* p = Unwrap<Parser>(env, info, &self);
+  if (p == nullptr) return nullptr;
+  if (napi_get_cb_info(env, info, &argc, argv, &self, nullptr) == napi_ok) {
+    if (argc >= 1 && argv[0] != nullptr) {
+      napi_value consumed = nullptr;
+      if (napi_get_boolean(env, false, &consumed) == napi_ok && consumed != nullptr) {
+        napi_set_named_property(env, argv[0], "_consumed", consumed);
+      }
+    }
+    if (self != nullptr) {
+      napi_value consumed = nullptr;
+      if (napi_get_boolean(env, false, &consumed) == napi_ok && consumed != nullptr) {
+        napi_set_named_property(env, self, "_consumed", consumed);
+      }
+    }
+  }
   napi_value undefined = nullptr;
   napi_get_undefined(env, &undefined);
   return undefined;
@@ -843,17 +911,17 @@ napi_value UbiInstallHttpParserBinding(napi_env env) {
   if (napi_create_object(env, &binding) != napi_ok || binding == nullptr) return nullptr;
 
   napi_property_descriptor parser_props[] = {
-      {"close", nullptr, ParserClose, nullptr, nullptr, nullptr, napi_default, nullptr},
-      {"free", nullptr, ParserFree, nullptr, nullptr, nullptr, napi_default, nullptr},
-      {"remove", nullptr, ParserRemove, nullptr, nullptr, nullptr, napi_default, nullptr},
-      {"execute", nullptr, ParserExecute, nullptr, nullptr, nullptr, napi_default, nullptr},
-      {"finish", nullptr, ParserFinish, nullptr, nullptr, nullptr, napi_default, nullptr},
-      {"initialize", nullptr, ParserInitialize, nullptr, nullptr, nullptr, napi_default, nullptr},
-      {"pause", nullptr, ParserPause, nullptr, nullptr, nullptr, napi_default, nullptr},
-      {"resume", nullptr, ParserResume, nullptr, nullptr, nullptr, napi_default, nullptr},
-      {"consume", nullptr, ParserConsume, nullptr, nullptr, nullptr, napi_default, nullptr},
-      {"unconsume", nullptr, ParserUnconsume, nullptr, nullptr, nullptr, napi_default, nullptr},
-      {"getCurrentBuffer", nullptr, ParserGetCurrentBuffer, nullptr, nullptr, nullptr, napi_default, nullptr},
+      {"close", nullptr, ParserClose, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+      {"free", nullptr, ParserFree, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+      {"remove", nullptr, ParserRemove, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+      {"execute", nullptr, ParserExecute, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+      {"finish", nullptr, ParserFinish, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+      {"initialize", nullptr, ParserInitialize, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+      {"pause", nullptr, ParserPause, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+      {"resume", nullptr, ParserResume, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+      {"consume", nullptr, ParserConsume, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+      {"unconsume", nullptr, ParserUnconsume, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+      {"getCurrentBuffer", nullptr, ParserGetCurrentBuffer, nullptr, nullptr, nullptr, napi_default_method, nullptr},
   };
 
   napi_value parser_ctor = nullptr;
@@ -894,10 +962,10 @@ napi_value UbiInstallHttpParserBinding(napi_env env) {
   SetNamedU32(env, parser_ctor, "kLenientAll", kLenientAll);
 
   napi_property_descriptor list_props[] = {
-      {"all", nullptr, ConnectionsListAll, nullptr, nullptr, nullptr, napi_default, nullptr},
-      {"idle", nullptr, ConnectionsListIdle, nullptr, nullptr, nullptr, napi_default, nullptr},
-      {"active", nullptr, ConnectionsListActive, nullptr, nullptr, nullptr, napi_default, nullptr},
-      {"expired", nullptr, ConnectionsListExpired, nullptr, nullptr, nullptr, napi_default, nullptr},
+      {"all", nullptr, ConnectionsListAll, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+      {"idle", nullptr, ConnectionsListIdle, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+      {"active", nullptr, ConnectionsListActive, nullptr, nullptr, nullptr, napi_default_method, nullptr},
+      {"expired", nullptr, ConnectionsListExpired, nullptr, nullptr, nullptr, napi_default_method, nullptr},
   };
   napi_value list_ctor = nullptr;
   if (napi_define_class(env,

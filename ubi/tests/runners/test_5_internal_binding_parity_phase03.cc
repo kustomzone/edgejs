@@ -302,11 +302,11 @@ assert.ok(Array.isArray(cryptoBinding.getUserRootCertificates()));
 assert.strictEqual(typeof cryptoBinding.getCachedAliases(), 'object');
 assert.strictEqual(typeof cryptoBinding.getOpenSSLSecLevelCrypto(), 'number');
 const secureHeap = cryptoBinding.secureHeapUsed();
-assert.ok(secureHeap && typeof secureHeap === 'object');
-assert.strictEqual(typeof secureHeap.total, 'number');
-assert.strictEqual(typeof secureHeap.used, 'number');
-assert.strictEqual(typeof secureHeap.utilization, 'number');
-assert.strictEqual(typeof secureHeap.min, 'number');
+assert.ok(
+  secureHeap === undefined ||
+  typeof secureHeap === 'number' ||
+  typeof secureHeap === 'bigint'
+);
 assert.strictEqual(
   cryptoBinding.oneShotDigest('sha256', -1, {}, Buffer.from('abc'), 'hex', 0),
   'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad',

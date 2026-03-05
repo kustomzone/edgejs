@@ -215,23 +215,52 @@ napi_value CredentialsSafeGetenv(napi_env env, napi_callback_info info) {
 
 napi_value CredentialsGetTempDir(napi_env env, napi_callback_info /*info*/) {
   const char* candidates[] = {"TMPDIR", "TMP", "TEMP"};
-  const char* fallback =
-#if defined(_WIN32)
-      "C:\\Temp";
-#else
-      "/tmp";
-#endif
+  std::string value_storage;
   const char* value = nullptr;
   for (const char* key : candidates) {
+    napi_value js_env_value = ReadProcessEnv(env, key);
+    if (js_env_value != nullptr) {
+      napi_valuetype type = napi_undefined;
+      if (napi_typeof(env, js_env_value, &type) == napi_ok &&
+          type != napi_undefined &&
+          type != napi_null) {
+        napi_value coerced = nullptr;
+        if (napi_coerce_to_string(env, js_env_value, &coerced) == napi_ok && coerced != nullptr) {
+          value_storage = ValueToUtf8(env, coerced);
+          if (!value_storage.empty()) {
+            value = value_storage.c_str();
+            break;
+          }
+        }
+      }
+
+      // Match Node semantics: once process.env has an entry for this key,
+      // do not fall back to the host environment's value for the same key.
+      continue;
+    }
+
     const char* candidate = std::getenv(key);
     if (candidate != nullptr && *candidate != '\0') {
       value = candidate;
       break;
     }
   }
+
+  const char* fallback =
+#if defined(_WIN32)
+      "C:\\Temp";
+#else
+      "/tmp";
+#endif
   if (value == nullptr) value = fallback;
+  std::string normalized = value;
+#if !defined(_WIN32)
+  if (normalized.size() > 1 && normalized.back() == '/') {
+    normalized.pop_back();
+  }
+#endif
   napi_value out = nullptr;
-  napi_create_string_utf8(env, value, NAPI_AUTO_LENGTH, &out);
+  napi_create_string_utf8(env, normalized.c_str(), NAPI_AUTO_LENGTH, &out);
   return out != nullptr ? out : Undefined(env);
 }
 

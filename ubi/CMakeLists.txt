@@ -253,6 +253,7 @@ add_library(ubi_runtime STATIC
   src/internal_binding/dispatch.cc
   src/internal_binding/binding_async_context_frame.cc
   src/internal_binding/binding_async_wrap.cc
+  src/internal_binding/binding_block_list.cc
   src/internal_binding/binding_blob.cc
   src/internal_binding/binding_buffer.cc
   src/internal_binding/binding_builtins.cc
@@ -268,6 +269,7 @@ add_library(ubi_runtime STATIC
   src/internal_binding/binding_fs.cc
   src/internal_binding/binding_heap_utils.cc
   src/internal_binding/binding_http_parser.cc
+  src/internal_binding/binding_js_stream.cc
   src/internal_binding/binding_internal_only_v8.cc
   src/internal_binding/binding_module_wrap.cc
   src/internal_binding/binding_modules.cc
@@ -289,6 +291,7 @@ add_library(ubi_runtime STATIC
   src/internal_binding/binding_symbols.cc
   src/internal_binding/binding_task_queue.cc
   src/internal_binding/binding_tcp_wrap.cc
+  src/internal_binding/binding_tls_wrap.cc
   src/internal_binding/binding_timers.cc
   src/internal_binding/binding_trace_events.cc
   src/internal_binding/binding_tty_wrap.cc
@@ -312,9 +315,11 @@ add_library(ubi_runtime STATIC
   src/ubi_encoding.cc
   src/ubi_string_decoder.cc
   src/ubi_http_parser.cc
+  src/ubi_js_stream.cc
   src/ubi_stream_wrap.cc
   src/ubi_process_wrap.cc
   src/ubi_tcp_wrap.cc
+  src/ubi_tls_wrap.cc
   src/ubi_tty_wrap.cc
   src/ubi_pipe_wrap.cc
   src/ubi_signal_wrap.cc

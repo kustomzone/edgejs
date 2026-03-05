@@ -6,6 +6,7 @@
 #include "ubi_encoding.h"
 #include "ubi_fs.h"
 #include "ubi_http_parser.h"
+#include "ubi_js_stream.h"
 #include "ubi_os.h"
 #include "ubi_pipe_wrap.h"
 #include "ubi_process.h"
@@ -15,6 +16,7 @@
 #include "ubi_stream_wrap.h"
 #include "ubi_string_decoder.h"
 #include "ubi_tcp_wrap.h"
+#include "ubi_tls_wrap.h"
 #include "ubi_timers_host.h"
 #include "ubi_tty_wrap.h"
 #include "ubi_udp_wrap.h"
@@ -29,12 +31,14 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
+#include "simdjson/simdjson.h"
 #include "uv.h"
 #include "unofficial_napi.h"
 
@@ -275,6 +279,290 @@ bool ParsePackageMain(const fs::path& package_json_path, std::string* main_out) 
   }
   *main_out = source.substr(first_quote + 1, second_quote - first_quote - 1);
   return true;
+}
+
+struct SerializedPackageConfigData {
+  std::optional<std::string> name;
+  std::optional<std::string> main;
+  std::optional<std::string> imports;
+  std::optional<std::string> exports_field;
+  std::string type = "none";
+  std::string file_path;
+};
+
+enum class ParsePackageStatus {
+  kMissing,
+  kParsed,
+  kInvalid,
+};
+
+int HexDigitValue(char ch) {
+  if (ch >= '0' && ch <= '9') return ch - '0';
+  if (ch >= 'a' && ch <= 'f') return 10 + (ch - 'a');
+  if (ch >= 'A' && ch <= 'F') return 10 + (ch - 'A');
+  return -1;
+}
+
+std::string PercentDecode(std::string_view input) {
+  std::string out;
+  out.reserve(input.size());
+  for (size_t i = 0; i < input.size(); ++i) {
+    const char ch = input[i];
+    if (ch == '%' && i + 2 < input.size()) {
+      const int hi = HexDigitValue(input[i + 1]);
+      const int lo = HexDigitValue(input[i + 2]);
+      if (hi >= 0 && lo >= 0) {
+        out.push_back(static_cast<char>((hi << 4) | lo));
+        i += 2;
+        continue;
+      }
+    }
+    out.push_back(ch);
+  }
+  return out;
+}
+
+std::optional<std::string> FileUrlToPathString(std::string_view specifier) {
+  constexpr std::string_view kFileScheme = "file://";
+  if (!(specifier.size() >= kFileScheme.size() &&
+        specifier.substr(0, kFileScheme.size()) == kFileScheme)) {
+    return std::nullopt;
+  }
+
+  std::string rest(specifier.substr(kFileScheme.size()));
+  if (rest.rfind("localhost/", 0) == 0) {
+    rest.erase(0, std::string("localhost").size());
+  } else if (!rest.empty() && rest[0] != '/') {
+    // Drop non-empty host section.
+    const size_t slash = rest.find('/');
+    if (slash == std::string::npos) return std::nullopt;
+    rest.erase(0, slash);
+  }
+
+  std::string decoded = PercentDecode(rest);
+#if defined(_WIN32)
+  if (decoded.size() >= 3 && decoded[0] == '/' && std::isalpha(decoded[1]) &&
+      decoded[2] == ':') {
+    decoded.erase(decoded.begin());
+  }
+  std::replace(decoded.begin(), decoded.end(), '/', '\\');
+#endif
+  return decoded;
+}
+
+bool ThrowInvalidPackageConfig(napi_env env, const std::string& path) {
+  const std::string message = "Invalid package config " + path + ".";
+  napi_throw_error(env, "ERR_INVALID_PACKAGE_CONFIG", message.c_str());
+  return false;
+}
+
+ParsePackageStatus ParseSerializedPackageConfig(const fs::path& package_json_path,
+                                                SerializedPackageConfigData* out) {
+  if (out == nullptr) return ParsePackageStatus::kInvalid;
+
+  std::error_code ec;
+  if (!fs::is_regular_file(package_json_path, ec) || ec) {
+    return ParsePackageStatus::kMissing;
+  }
+
+  std::ifstream in(package_json_path, std::ios::binary);
+  if (!in.is_open()) return ParsePackageStatus::kMissing;
+  std::ostringstream ss;
+  ss << in.rdbuf();
+  std::string source = ss.str();
+
+  simdjson::ondemand::parser parser;
+  simdjson::padded_string padded(source);
+  simdjson::ondemand::document document;
+  simdjson::ondemand::object main_object;
+  if (parser.iterate(padded).get(document) != simdjson::SUCCESS ||
+      document.get_object().get(main_object) != simdjson::SUCCESS) {
+    return ParsePackageStatus::kInvalid;
+  }
+
+  SerializedPackageConfigData parsed;
+  parsed.file_path = package_json_path.lexically_normal().string();
+
+  for (auto field : main_object) {
+    simdjson::ondemand::raw_json_string key;
+    simdjson::ondemand::value value;
+    if (field.key().get(key) != simdjson::SUCCESS ||
+        field.value().get(value) != simdjson::SUCCESS) {
+      return ParsePackageStatus::kInvalid;
+    }
+    if (key.raw() == nullptr) continue;
+
+    if (key == "name") {
+      std::string_view out_name;
+      if (value.get_string().get(out_name) != simdjson::SUCCESS) {
+        return ParsePackageStatus::kInvalid;
+      }
+      parsed.name = std::string(out_name);
+      continue;
+    }
+
+    if (key == "main") {
+      std::string_view out_main;
+      if (value.get_string().get(out_main) == simdjson::SUCCESS) {
+        parsed.main = std::string(out_main);
+      }
+      continue;
+    }
+
+    if (key == "type") {
+      std::string_view out_type;
+      if (value.get_string().get(out_type) != simdjson::SUCCESS) {
+        return ParsePackageStatus::kInvalid;
+      }
+      if (out_type == "commonjs" || out_type == "module") {
+        parsed.type = std::string(out_type);
+      }
+      continue;
+    }
+
+    if (key == "imports" || key == "exports") {
+      simdjson::ondemand::json_type field_type;
+      if (value.type().get(field_type) != simdjson::SUCCESS) {
+        return ParsePackageStatus::kInvalid;
+      }
+
+      std::optional<std::string>* target = (key == "imports") ? &parsed.imports : &parsed.exports_field;
+      switch (field_type) {
+        case simdjson::ondemand::json_type::object:
+        case simdjson::ondemand::json_type::array: {
+          std::string_view raw_value;
+          if (value.raw_json().get(raw_value) != simdjson::SUCCESS) {
+            return ParsePackageStatus::kInvalid;
+          }
+          *target = std::string(raw_value);
+          break;
+        }
+        case simdjson::ondemand::json_type::string: {
+          std::string_view str_value;
+          if (value.get_string().get(str_value) != simdjson::SUCCESS) {
+            return ParsePackageStatus::kInvalid;
+          }
+          *target = std::string(str_value);
+          break;
+        }
+        default:
+          break;
+      }
+      continue;
+    }
+  }
+
+  *out = std::move(parsed);
+  return ParsePackageStatus::kParsed;
+}
+
+napi_value SerializePackageConfigToArray(napi_env env, const SerializedPackageConfigData& data) {
+  napi_value out = nullptr;
+  if (napi_create_array_with_length(env, 6, &out) != napi_ok || out == nullptr) {
+    return nullptr;
+  }
+
+  auto set_optional_string = [&](uint32_t index, const std::optional<std::string>& value) {
+    if (!value.has_value()) return;
+    napi_value str = nullptr;
+    if (napi_create_string_utf8(env, value->c_str(), value->size(), &str) == napi_ok && str != nullptr) {
+      napi_set_element(env, out, index, str);
+    }
+  };
+
+  set_optional_string(0, data.name);
+  set_optional_string(1, data.main);
+  set_optional_string(3, data.imports);
+  set_optional_string(4, data.exports_field);
+
+  napi_value type_value = nullptr;
+  if (napi_create_string_utf8(env, data.type.c_str(), data.type.size(), &type_value) == napi_ok &&
+      type_value != nullptr) {
+    napi_set_element(env, out, 2, type_value);
+  }
+
+  napi_value file_path_value = nullptr;
+  if (napi_create_string_utf8(env, data.file_path.c_str(), data.file_path.size(), &file_path_value) == napi_ok &&
+      file_path_value != nullptr) {
+    napi_set_element(env, out, 5, file_path_value);
+  }
+  return out;
+}
+
+std::optional<fs::path> ParsePathOrFileUrl(const std::string& input) {
+  if (input.empty()) return std::nullopt;
+  if (std::optional<std::string> file_path = FileUrlToPathString(input)) {
+    return fs::path(*file_path);
+  }
+  return fs::path(input);
+}
+
+bool TraverseNearestParentPackageConfig(const fs::path& check_path,
+                                        SerializedPackageConfigData* out,
+                                        bool* invalid_out = nullptr) {
+  if (invalid_out != nullptr) *invalid_out = false;
+  fs::path current_path = check_path;
+  while (true) {
+    current_path = current_path.parent_path();
+    if (current_path.empty() || current_path.parent_path() == current_path) {
+      return false;
+    }
+    if (current_path.filename() == "node_modules") {
+      return false;
+    }
+
+    const fs::path package_json = current_path / "package.json";
+    ParsePackageStatus status = ParseSerializedPackageConfig(package_json, out);
+    if (status == ParsePackageStatus::kParsed) {
+      return true;
+    }
+    if (status == ParsePackageStatus::kInvalid) {
+      if (invalid_out != nullptr) *invalid_out = true;
+      return false;
+    }
+  }
+}
+
+bool ResolvePackageScopeFromPath(const fs::path& resolved_path,
+                                 SerializedPackageConfigData* out,
+                                 fs::path* unresolved_package_json_out,
+                                 bool* invalid_out = nullptr) {
+  if (invalid_out != nullptr) *invalid_out = false;
+
+  fs::path start_dir = resolved_path;
+  std::error_code ec;
+  if (fs::is_regular_file(start_dir, ec)) {
+    start_dir = start_dir.parent_path();
+  } else if (start_dir.has_filename() && !start_dir.extension().empty()) {
+    start_dir = start_dir.parent_path();
+  }
+
+  fs::path package_json = start_dir / "package.json";
+  while (true) {
+    if (package_json.parent_path().filename() == "node_modules") {
+      break;
+    }
+
+    ParsePackageStatus status = ParseSerializedPackageConfig(package_json, out);
+    if (status == ParsePackageStatus::kParsed) {
+      return true;
+    }
+    if (status == ParsePackageStatus::kInvalid) {
+      if (invalid_out != nullptr) *invalid_out = true;
+      return false;
+    }
+
+    fs::path parent = package_json.parent_path().parent_path();
+    if (parent.empty() || parent == package_json.parent_path()) {
+      break;
+    }
+    package_json = parent / "package.json";
+  }
+
+  if (unresolved_package_json_out != nullptr) {
+    *unresolved_package_json_out = start_dir / "package.json";
+  }
+  return false;
 }
 
 bool ResolveAsDirectory(const fs::path& candidate, fs::path* out) {
@@ -1020,7 +1308,7 @@ static napi_value OptionsGetCLIOptionsValuesCallback(napi_env env, napi_callback
       {"--test-isolation", "process"},
       {"--test-rerun-failures", ""},
       {"--test-shard", ""},
-      {"--tls-cipher-list", ""},
+      {"--tls-cipher-list", "HIGH:!aNULL:!eNULL"},
       {"--tls-keylog", ""},
       {"--unhandled-rejections", "throw"},
       {"--watch-kill-signal", "SIGTERM"},
@@ -1369,46 +1657,154 @@ static napi_value OptionsGetNamespaceOptionsInputTypeCallback(napi_env env, napi
   return map;
 }
 
-static napi_value ModulesReadPackageJSONCallback(napi_env env, napi_callback_info /*info*/) {
-  napi_value undefined = nullptr;
-  napi_get_undefined(env, &undefined);
-  return undefined;
+static napi_value ModulesReadPackageJSONCallback(napi_env env, napi_callback_info info) {
+  size_t argc = 4;
+  napi_value argv[4] = {nullptr, nullptr, nullptr, nullptr};
+  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok || argc < 1 || argv[0] == nullptr) {
+    return UndefinedValue(env);
+  }
+
+  const std::string path_input = ValueToUtf8(env, argv[0]);
+  if (path_input.empty()) return UndefinedValue(env);
+  std::optional<fs::path> maybe_path = ParsePathOrFileUrl(path_input);
+  if (!maybe_path.has_value()) return UndefinedValue(env);
+
+  SerializedPackageConfigData package_config;
+  const ParsePackageStatus status = ParseSerializedPackageConfig(*maybe_path, &package_config);
+  if (status == ParsePackageStatus::kMissing) {
+    return UndefinedValue(env);
+  }
+  if (status == ParsePackageStatus::kInvalid) {
+    ThrowInvalidPackageConfig(env, maybe_path->lexically_normal().string());
+    return nullptr;
+  }
+  napi_value out = SerializePackageConfigToArray(env, package_config);
+  return out != nullptr ? out : UndefinedValue(env);
 }
 
-static napi_value ModulesGetNearestParentPackageJSONTypeCallback(napi_env env, napi_callback_info /*info*/) {
+static napi_value ModulesGetNearestParentPackageJSONTypeCallback(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1] = {nullptr};
+  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok || argc < 1 || argv[0] == nullptr) {
+    return UndefinedValue(env);
+  }
+
+  const std::string check_path_input = ValueToUtf8(env, argv[0]);
+  std::optional<fs::path> check_path = ParsePathOrFileUrl(check_path_input);
+  if (!check_path.has_value()) return UndefinedValue(env);
+
+  SerializedPackageConfigData package_config;
+  bool invalid = false;
+  if (!TraverseNearestParentPackageConfig(*check_path, &package_config, &invalid)) {
+    if (invalid) {
+      ThrowInvalidPackageConfig(env, (check_path->parent_path() / "package.json").lexically_normal().string());
+      return nullptr;
+    }
+    return UndefinedValue(env);
+  }
+
   napi_value out = nullptr;
-  if (napi_create_string_utf8(env, "none", NAPI_AUTO_LENGTH, &out) != napi_ok || out == nullptr) {
-    napi_get_undefined(env, &out);
+  if (napi_create_string_utf8(env, package_config.type.c_str(), package_config.type.size(), &out) != napi_ok ||
+      out == nullptr) {
+    return UndefinedValue(env);
   }
   return out;
 }
 
-static napi_value ModulesGetNearestParentPackageJSONCallback(napi_env env, napi_callback_info /*info*/) {
-  napi_value undefined = nullptr;
-  napi_get_undefined(env, &undefined);
-  return undefined;
+static napi_value ModulesGetNearestParentPackageJSONCallback(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1] = {nullptr};
+  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok || argc < 1 || argv[0] == nullptr) {
+    return UndefinedValue(env);
+  }
+
+  const std::string check_path_input = ValueToUtf8(env, argv[0]);
+  std::optional<fs::path> check_path = ParsePathOrFileUrl(check_path_input);
+  if (!check_path.has_value()) return UndefinedValue(env);
+
+  SerializedPackageConfigData package_config;
+  bool invalid = false;
+  if (!TraverseNearestParentPackageConfig(*check_path, &package_config, &invalid)) {
+    if (invalid) {
+      ThrowInvalidPackageConfig(env, (check_path->parent_path() / "package.json").lexically_normal().string());
+      return nullptr;
+    }
+    return UndefinedValue(env);
+  }
+
+  napi_value out = SerializePackageConfigToArray(env, package_config);
+  return out != nullptr ? out : UndefinedValue(env);
 }
 
 static napi_value ModulesGetPackageScopeConfigCallback(napi_env env, napi_callback_info info) {
   size_t argc = 1;
   napi_value argv[1] = {nullptr};
-  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok) {
-    napi_value undefined = nullptr;
-    napi_get_undefined(env, &undefined);
-    return undefined;
+  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok || argc < 1 || argv[0] == nullptr) {
+    return UndefinedValue(env);
   }
-  if (argc >= 1 && argv[0] != nullptr) return argv[0];
+
+  const std::string resolved_input = ValueToUtf8(env, argv[0]);
+  std::optional<fs::path> resolved_path = ParsePathOrFileUrl(resolved_input);
+  if (!resolved_path.has_value()) return UndefinedValue(env);
+
+  SerializedPackageConfigData package_config;
+  fs::path unresolved_package_json;
+  bool invalid = false;
+  const bool found = ResolvePackageScopeFromPath(*resolved_path, &package_config, &unresolved_package_json, &invalid);
+  if (invalid) {
+    ThrowInvalidPackageConfig(
+        env,
+        unresolved_package_json.empty()
+            ? (*resolved_path / "package.json").lexically_normal().string()
+            : unresolved_package_json.lexically_normal().string());
+    return nullptr;
+  }
+
+  if (found) {
+    napi_value out = SerializePackageConfigToArray(env, package_config);
+    return out != nullptr ? out : UndefinedValue(env);
+  }
+
+  if (unresolved_package_json.empty()) {
+    unresolved_package_json = resolved_path->parent_path() / "package.json";
+  }
+  const std::string unresolved = unresolved_package_json.lexically_normal().string();
   napi_value out = nullptr;
-  if (napi_create_string_utf8(env, "", NAPI_AUTO_LENGTH, &out) != napi_ok || out == nullptr) {
-    napi_get_undefined(env, &out);
+  if (napi_create_string_utf8(env, unresolved.c_str(), unresolved.size(), &out) != napi_ok || out == nullptr) {
+    return UndefinedValue(env);
   }
   return out;
 }
 
-static napi_value ModulesGetPackageTypeCallback(napi_env env, napi_callback_info /*info*/) {
+static napi_value ModulesGetPackageTypeCallback(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1] = {nullptr};
+  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok || argc < 1 || argv[0] == nullptr) {
+    return UndefinedValue(env);
+  }
+
+  const std::string resolved_input = ValueToUtf8(env, argv[0]);
+  std::optional<fs::path> resolved_path = ParsePathOrFileUrl(resolved_input);
+  if (!resolved_path.has_value()) return UndefinedValue(env);
+
+  SerializedPackageConfigData package_config;
+  fs::path unresolved_package_json;
+  bool invalid = false;
+  const bool found = ResolvePackageScopeFromPath(*resolved_path, &package_config, &unresolved_package_json, &invalid);
+  if (invalid) {
+    ThrowInvalidPackageConfig(
+        env,
+        unresolved_package_json.empty()
+            ? (*resolved_path / "package.json").lexically_normal().string()
+            : unresolved_package_json.lexically_normal().string());
+    return nullptr;
+  }
+  if (!found) return UndefinedValue(env);
+
   napi_value out = nullptr;
-  if (napi_create_string_utf8(env, "none", NAPI_AUTO_LENGTH, &out) != napi_ok || out == nullptr) {
-    napi_get_undefined(env, &out);
+  if (napi_create_string_utf8(env, package_config.type.c_str(), package_config.type.size(), &out) != napi_ok ||
+      out == nullptr) {
+    return UndefinedValue(env);
   }
   return out;
 }
@@ -1474,9 +1870,80 @@ static napi_value ModulesSetLazyPathHelpersCallback(napi_env env, napi_callback_
   return undefined;
 }
 
+static napi_value GetGlobalInternalBindingFunction(napi_env env, napi_value global) {
+  if (env == nullptr || global == nullptr) return nullptr;
+
+  auto lookup = [&](const char* key) -> napi_value {
+    napi_value fn = nullptr;
+    napi_valuetype type = napi_undefined;
+    if (napi_get_named_property(env, global, key, &fn) != napi_ok ||
+        fn == nullptr ||
+        napi_typeof(env, fn, &type) != napi_ok ||
+        type != napi_function) {
+      return nullptr;
+    }
+    return fn;
+  };
+
+  if (napi_value fn = lookup("internalBinding"); fn != nullptr) return fn;
+  return lookup("getInternalBinding");
+}
+
+static napi_value GetUtilPrivateSymbolByName(napi_env env, const char* key_name) {
+  if (env == nullptr || key_name == nullptr) return nullptr;
+  napi_value global = nullptr;
+  if (napi_get_global(env, &global) != napi_ok || global == nullptr) return nullptr;
+
+  napi_value internal_binding = GetGlobalInternalBindingFunction(env, global);
+  if (internal_binding == nullptr) return nullptr;
+
+  napi_value util_name = nullptr;
+  if (napi_create_string_utf8(env, "util", NAPI_AUTO_LENGTH, &util_name) != napi_ok || util_name == nullptr) {
+    return nullptr;
+  }
+  napi_value util_binding = nullptr;
+  if (napi_call_function(env, global, internal_binding, 1, &util_name, &util_binding) != napi_ok ||
+      util_binding == nullptr ||
+      IsUndefinedValue(env, util_binding)) {
+    return nullptr;
+  }
+
+  napi_value private_symbols = nullptr;
+  if (napi_get_named_property(env, util_binding, "privateSymbols", &private_symbols) != napi_ok ||
+      private_symbols == nullptr ||
+      IsUndefinedValue(env, private_symbols)) {
+    return nullptr;
+  }
+
+  napi_value symbol = nullptr;
+  if (napi_get_named_property(env, private_symbols, key_name, &symbol) != napi_ok || symbol == nullptr ||
+      IsUndefinedValue(env, symbol)) {
+    return nullptr;
+  }
+  return symbol;
+}
+
+static void SetHostDefinedOptionSymbol(napi_env env, napi_value target, napi_value id_value) {
+  if (env == nullptr || target == nullptr) return;
+  napi_value symbol = GetUtilPrivateSymbolByName(env, "host_defined_option_symbol");
+  if (symbol == nullptr || IsUndefinedValue(env, symbol)) return;
+  napi_value value = id_value;
+  if (value == nullptr) napi_get_undefined(env, &value);
+  napi_set_property(env, target, symbol, value);
+}
+
+static napi_value GetNamedPropertyOrUndefined(napi_env env, napi_value object, const char* key) {
+  napi_value value = nullptr;
+  if (object != nullptr && napi_get_named_property(env, object, key, &value) == napi_ok && value != nullptr) {
+    return value;
+  }
+  napi_get_undefined(env, &value);
+  return value;
+}
+
 static napi_value ContextifyScriptConstructorCallback(napi_env env, napi_callback_info info) {
-  size_t argc = 2;
-  napi_value argv[2] = {nullptr};
+  size_t argc = 8;
+  napi_value argv[8] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
   napi_value this_arg = nullptr;
   if (napi_get_cb_info(env, info, &argc, argv, &this_arg, nullptr) != napi_ok || this_arg == nullptr) {
     return nullptr;
@@ -1500,44 +1967,236 @@ static napi_value ContextifyScriptConstructorCallback(napi_env env, napi_callbac
 
   napi_set_named_property(env, this_arg, "contextifyCode", code);
   napi_set_named_property(env, this_arg, "contextifyFilename", filename);
+  int32_t line_offset = 0;
+  int32_t column_offset = 0;
+  if (argc >= 3 && argv[2] != nullptr) {
+    napi_set_named_property(env, this_arg, "contextifyLineOffset", argv[2]);
+    napi_get_value_int32(env, argv[2], &line_offset);
+  }
+  if (argc >= 4 && argv[3] != nullptr) {
+    napi_set_named_property(env, this_arg, "contextifyColumnOffset", argv[3]);
+    napi_get_value_int32(env, argv[3], &column_offset);
+  }
   napi_set_named_property(env, this_arg, "sourceURL", filename);
+  napi_value host_defined_option_id = nullptr;
+  if (argc >= 8) host_defined_option_id = argv[7];
+  if (host_defined_option_id != nullptr) {
+    napi_set_named_property(env, this_arg, "contextifyHostDefinedOptionId", host_defined_option_id);
+  }
+  SetHostDefinedOptionSymbol(env, this_arg, host_defined_option_id);
+
+  // Match Node's constructor-time syntax validation behavior.
+  napi_value precompiled_cache = nullptr;
+  if (unofficial_napi_contextify_create_cached_data(env,
+                                                    code,
+                                                    filename,
+                                                    line_offset,
+                                                    column_offset,
+                                                    host_defined_option_id,
+                                                    &precompiled_cache) != napi_ok) {
+    return nullptr;
+  }
+
+  const bool has_cached_data_arg =
+      argc >= 5 && argv[4] != nullptr && !IsUndefinedValue(env, argv[4]);
+  if (has_cached_data_arg) {
+    napi_value rejected = nullptr;
+    napi_get_boolean(env, false, &rejected);
+    if (rejected != nullptr) {
+      napi_set_named_property(env, this_arg, "cachedDataRejected", rejected);
+    }
+  }
+
+  bool produce_cached_data = false;
+  if (argc >= 6 && argv[5] != nullptr) {
+    napi_get_value_bool(env, argv[5], &produce_cached_data);
+  }
+  if (produce_cached_data) {
+    napi_value produced = nullptr;
+    napi_get_boolean(env, true, &produced);
+    if (produced != nullptr) {
+      napi_set_named_property(env, this_arg, "cachedDataProduced", produced);
+    }
+    if (precompiled_cache != nullptr) {
+      napi_set_named_property(env, this_arg, "cachedData", precompiled_cache);
+    }
+  }
   return this_arg;
 }
 
 static napi_value ContextifyScriptRunInContextCallback(napi_env env, napi_callback_info info) {
+  size_t argc = 5;
+  napi_value argv[5] = {nullptr, nullptr, nullptr, nullptr, nullptr};
+  napi_value this_arg = nullptr;
+  if (napi_get_cb_info(env, info, &argc, argv, &this_arg, nullptr) != napi_ok || this_arg == nullptr) {
+    return nullptr;
+  }
+
+  napi_value sandbox = nullptr;
+  if (argc >= 1 && argv[0] != nullptr) {
+    sandbox = argv[0];
+  } else {
+    napi_get_null(env, &sandbox);
+  }
+
+  int64_t timeout = -1;
+  if (argc >= 2 && argv[1] != nullptr) {
+    napi_get_value_int64(env, argv[1], &timeout);
+  }
+
+  bool display_errors = true;
+  if (argc >= 3 && argv[2] != nullptr) {
+    napi_get_value_bool(env, argv[2], &display_errors);
+  }
+
+  bool break_on_sigint = false;
+  if (argc >= 4 && argv[3] != nullptr) {
+    napi_get_value_bool(env, argv[3], &break_on_sigint);
+  }
+
+  bool break_on_first_line = false;
+  if (argc >= 5 && argv[4] != nullptr) {
+    napi_get_value_bool(env, argv[4], &break_on_first_line);
+  }
+
+  napi_value code_value = GetNamedPropertyOrUndefined(env, this_arg, "contextifyCode");
+  napi_value filename_value = GetNamedPropertyOrUndefined(env, this_arg, "contextifyFilename");
+  napi_value line_offset_value = GetNamedPropertyOrUndefined(env, this_arg, "contextifyLineOffset");
+  napi_value column_offset_value = GetNamedPropertyOrUndefined(env, this_arg, "contextifyColumnOffset");
+  napi_value host_defined_option_id = GetNamedPropertyOrUndefined(env, this_arg, "contextifyHostDefinedOptionId");
+
+  int32_t line_offset = 0;
+  int32_t column_offset = 0;
+  if (line_offset_value != nullptr && !IsUndefinedValue(env, line_offset_value)) {
+    napi_get_value_int32(env, line_offset_value, &line_offset);
+  }
+  if (column_offset_value != nullptr && !IsUndefinedValue(env, column_offset_value)) {
+    napi_get_value_int32(env, column_offset_value, &column_offset);
+  }
+
+  napi_value result = nullptr;
+  const napi_status st = unofficial_napi_contextify_run_script(env,
+                                                               sandbox,
+                                                               code_value,
+                                                               filename_value,
+                                                               line_offset,
+                                                               column_offset,
+                                                               timeout,
+                                                               display_errors,
+                                                               break_on_sigint,
+                                                               break_on_first_line,
+                                                               host_defined_option_id,
+                                                               &result);
+  if (st != napi_ok || result == nullptr) {
+    return nullptr;
+  }
+  return result;
+}
+
+static napi_value ContextifyScriptCreateCachedDataCallback(napi_env env, napi_callback_info info) {
   napi_value this_arg = nullptr;
   size_t argc = 0;
   if (napi_get_cb_info(env, info, &argc, nullptr, &this_arg, nullptr) != napi_ok || this_arg == nullptr) {
     return nullptr;
   }
 
-  napi_value code_value = nullptr;
-  if (napi_get_named_property(env, this_arg, "contextifyCode", &code_value) != napi_ok || code_value == nullptr) {
-    napi_get_undefined(env, &code_value);
+  napi_value code_value = GetNamedPropertyOrUndefined(env, this_arg, "contextifyCode");
+  napi_value filename_value = GetNamedPropertyOrUndefined(env, this_arg, "contextifyFilename");
+  napi_value line_offset_value = GetNamedPropertyOrUndefined(env, this_arg, "contextifyLineOffset");
+  napi_value column_offset_value = GetNamedPropertyOrUndefined(env, this_arg, "contextifyColumnOffset");
+  napi_value host_defined_option_id = GetNamedPropertyOrUndefined(env, this_arg, "contextifyHostDefinedOptionId");
+
+  int32_t line_offset = 0;
+  int32_t column_offset = 0;
+  if (line_offset_value != nullptr && !IsUndefinedValue(env, line_offset_value)) {
+    napi_get_value_int32(env, line_offset_value, &line_offset);
   }
-  napi_value filename_value = nullptr;
-  if (napi_get_named_property(env, this_arg, "contextifyFilename", &filename_value) != napi_ok ||
-      filename_value == nullptr) {
-    napi_get_undefined(env, &filename_value);
+  if (column_offset_value != nullptr && !IsUndefinedValue(env, column_offset_value)) {
+    napi_get_value_int32(env, column_offset_value, &column_offset);
   }
 
-  const std::string code = ValueToUtf8(env, code_value);
-  const std::string filename = ValueToUtf8(env, filename_value);
-  std::string source = code;
-  if (!filename.empty()) {
-    source.append("\n//# sourceURL=");
-    source.append(filename);
+  napi_value out = nullptr;
+  if (unofficial_napi_contextify_create_cached_data(env,
+                                                    code_value,
+                                                    filename_value,
+                                                    line_offset,
+                                                    column_offset,
+                                                    host_defined_option_id,
+                                                    &out) != napi_ok ||
+      out == nullptr) {
+    return nullptr;
+  }
+  return out;
+}
+
+static napi_value ContextifyMakeContextCallback(napi_env env, napi_callback_info info) {
+  size_t argc = 7;
+  napi_value argv[7] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
+  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok) {
+    return nullptr;
   }
 
-  napi_value script = nullptr;
-  if (napi_create_string_utf8(env, source.c_str(), source.size(), &script) != napi_ok || script == nullptr) {
+  napi_value sandbox_or_symbol = nullptr;
+  if (argc >= 1 && argv[0] != nullptr) {
+    sandbox_or_symbol = argv[0];
+  } else {
+    napi_create_object(env, &sandbox_or_symbol);
+  }
+
+  napi_valuetype type = napi_undefined;
+  if (napi_typeof(env, sandbox_or_symbol, &type) != napi_ok ||
+      (type != napi_object && type != napi_function && type != napi_symbol)) {
+    napi_create_object(env, &sandbox_or_symbol);
+  }
+
+  napi_value name = nullptr;
+  if (argc >= 2 && argv[1] != nullptr) {
+    name = argv[1];
+  } else {
+    napi_create_string_utf8(env, "VM Context", NAPI_AUTO_LENGTH, &name);
+  }
+
+  napi_value origin = nullptr;
+  if (argc >= 3 && argv[2] != nullptr) {
+    origin = argv[2];
+  } else {
+    napi_get_undefined(env, &origin);
+  }
+
+  bool allow_strings = true;
+  if (argc >= 4 && argv[3] != nullptr) {
+    napi_get_value_bool(env, argv[3], &allow_strings);
+  }
+  bool allow_wasm = true;
+  if (argc >= 5 && argv[4] != nullptr) {
+    napi_get_value_bool(env, argv[4], &allow_wasm);
+  }
+  bool own_microtask_queue = false;
+  if (argc >= 6 && argv[5] != nullptr) {
+    napi_get_value_bool(env, argv[5], &own_microtask_queue);
+  }
+
+  napi_value host_defined_option_id = nullptr;
+  if (argc >= 7 && argv[6] != nullptr) {
+    host_defined_option_id = argv[6];
+  } else {
+    napi_get_undefined(env, &host_defined_option_id);
+  }
+
+  napi_value out = nullptr;
+  if (unofficial_napi_contextify_make_context(env,
+                                              sandbox_or_symbol,
+                                              name,
+                                              origin,
+                                              allow_strings,
+                                              allow_wasm,
+                                              own_microtask_queue,
+                                              host_defined_option_id,
+                                              &out) != napi_ok ||
+      out == nullptr) {
     return nullptr;
   }
-  napi_value result = nullptr;
-  if (napi_run_script(env, script, &result) != napi_ok) {
-    return nullptr;
-  }
-  return result;
+  return out;
 }
 
 static napi_value ContextifyCompileFunctionCallback(napi_env env, napi_callback_info info) {
@@ -1547,51 +2206,80 @@ static napi_value ContextifyCompileFunctionCallback(napi_env env, napi_callback_
     return nullptr;
   }
 
-  napi_value code = nullptr;
-  if (argc >= 1 && argv[0] != nullptr) {
-    napi_coerce_to_string(env, argv[0], &code);
-  }
+  napi_value code = argc >= 1 && argv[0] != nullptr ? argv[0] : nullptr;
   if (code == nullptr) {
     napi_create_string_utf8(env, "", NAPI_AUTO_LENGTH, &code);
+  }
+  napi_value filename = argc >= 2 && argv[1] != nullptr ? argv[1] : nullptr;
+  if (filename == nullptr) {
+    napi_create_string_utf8(env, "", NAPI_AUTO_LENGTH, &filename);
+  }
+
+  int32_t line_offset = 0;
+  int32_t column_offset = 0;
+  if (argc >= 3 && argv[2] != nullptr) {
+    napi_get_value_int32(env, argv[2], &line_offset);
+  }
+  if (argc >= 4 && argv[3] != nullptr) {
+    napi_get_value_int32(env, argv[3], &column_offset);
+  }
+
+  napi_value cached_data = nullptr;
+  if (argc >= 5 && argv[4] != nullptr) {
+    cached_data = argv[4];
+  } else {
+    napi_get_undefined(env, &cached_data);
+  }
+
+  bool produce_cached_data = false;
+  if (argc >= 6 && argv[5] != nullptr) {
+    napi_get_value_bool(env, argv[5], &produce_cached_data);
+  }
+
+  napi_value parsing_context = nullptr;
+  if (argc >= 7 && argv[6] != nullptr) {
+    parsing_context = argv[6];
+  } else {
+    napi_get_undefined(env, &parsing_context);
+  }
+
+  napi_value context_extensions = nullptr;
+  if (argc >= 8 && argv[7] != nullptr) {
+    context_extensions = argv[7];
+  } else {
+    napi_get_undefined(env, &context_extensions);
   }
 
   napi_value params = nullptr;
   if (argc >= 9 && argv[8] != nullptr) {
     params = argv[8];
   } else {
-    napi_create_array_with_length(env, 0, &params);
+    napi_get_undefined(env, &params);
   }
 
-  static constexpr const char* kFactorySource =
-      "(function(__code,__params){"
-      "  const p = Array.isArray(__params) ? __params : [];"
-      "  return Function(...p, __code);"
-      "})";
-  napi_value factory_script = nullptr;
-  if (napi_create_string_utf8(env, kFactorySource, NAPI_AUTO_LENGTH, &factory_script) != napi_ok ||
-      factory_script == nullptr) {
-    return nullptr;
-  }
-  napi_value factory = nullptr;
-  if (napi_run_script(env, factory_script, &factory) != napi_ok || factory == nullptr) {
-    return nullptr;
-  }
-  napi_value global = nullptr;
-  if (napi_get_global(env, &global) != napi_ok || global == nullptr) {
-    return nullptr;
-  }
-  napi_value fn = nullptr;
-  napi_value call_argv[2] = {code, params};
-  if (napi_call_function(env, global, factory, 2, call_argv, &fn) != napi_ok || fn == nullptr) {
-    return nullptr;
+  napi_value host_defined_option_id = nullptr;
+  if (argc >= 10 && argv[9] != nullptr) {
+    host_defined_option_id = argv[9];
+  } else {
+    napi_get_undefined(env, &host_defined_option_id);
   }
 
   napi_value out = nullptr;
-  if (napi_create_object(env, &out) != napi_ok || out == nullptr) return nullptr;
-  napi_set_named_property(env, out, "function", fn);
-  napi_value cached_data_produced = nullptr;
-  napi_get_boolean(env, false, &cached_data_produced);
-  napi_set_named_property(env, out, "cachedDataProduced", cached_data_produced);
+  if (unofficial_napi_contextify_compile_function(env,
+                                                  code,
+                                                  filename,
+                                                  line_offset,
+                                                  column_offset,
+                                                  cached_data,
+                                                  produce_cached_data,
+                                                  parsing_context,
+                                                  context_extensions,
+                                                  params,
+                                                  host_defined_option_id,
+                                                  &out) != napi_ok ||
+      out == nullptr) {
+    return nullptr;
+  }
   return out;
 }
 
@@ -1601,31 +2289,66 @@ static napi_value ContextifyCompileFunctionForCJSLoaderCallback(napi_env env, na
   if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok) {
     return nullptr;
   }
-  napi_value content_value = nullptr;
-  if (argc >= 1 && argv[0] != nullptr) {
-    napi_coerce_to_string(env, argv[0], &content_value);
+
+  napi_value code = argc >= 1 && argv[0] != nullptr ? argv[0] : nullptr;
+  if (code == nullptr) {
+    napi_create_string_utf8(env, "", NAPI_AUTO_LENGTH, &code);
   }
-  if (content_value == nullptr) {
-    napi_create_string_utf8(env, "", NAPI_AUTO_LENGTH, &content_value);
+  napi_value filename = argc >= 2 && argv[1] != nullptr ? argv[1] : nullptr;
+  if (filename == nullptr) {
+    napi_create_string_utf8(env, "[eval]", NAPI_AUTO_LENGTH, &filename);
   }
-  const std::string content = ValueToUtf8(env, content_value);
-  const std::string wrapped =
-      "(function (exports, require, module, __filename, __dirname) { " + content + "\n});";
-  napi_value wrapped_script = nullptr;
-  if (napi_create_string_utf8(env, wrapped.c_str(), wrapped.size(), &wrapped_script) != napi_ok ||
-      wrapped_script == nullptr) {
+  bool is_sea_main = false;
+  if (argc >= 3 && argv[2] != nullptr) {
+    napi_get_value_bool(env, argv[2], &is_sea_main);
+  }
+  bool should_detect_module = false;
+  if (argc >= 4 && argv[3] != nullptr) {
+    napi_get_value_bool(env, argv[3], &should_detect_module);
+  }
+
+  napi_value out = nullptr;
+  if (unofficial_napi_contextify_compile_function_for_cjs_loader(
+          env, code, filename, is_sea_main, should_detect_module, &out) != napi_ok ||
+      out == nullptr) {
     return nullptr;
   }
-  napi_value compiled_wrapper = nullptr;
-  if (napi_run_script(env, wrapped_script, &compiled_wrapper) != napi_ok || compiled_wrapper == nullptr) {
+  return out;
+}
+
+static napi_value ContextifyContainsModuleSyntaxCallback(napi_env env, napi_callback_info info) {
+  size_t argc = 4;
+  napi_value argv[4] = {nullptr, nullptr, nullptr, nullptr};
+  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok) {
+    return nullptr;
+  }
+
+  napi_value code = argc >= 1 && argv[0] != nullptr ? argv[0] : nullptr;
+  if (code == nullptr) {
+    napi_create_string_utf8(env, "", NAPI_AUTO_LENGTH, &code);
+  }
+  napi_value filename = argc >= 2 && argv[1] != nullptr ? argv[1] : nullptr;
+  if (filename == nullptr) {
+    napi_create_string_utf8(env, "[eval]", NAPI_AUTO_LENGTH, &filename);
+  }
+  napi_value resource_name = nullptr;
+  if (argc >= 3 && argv[2] != nullptr) {
+    resource_name = argv[2];
+  } else {
+    napi_get_undefined(env, &resource_name);
+  }
+  bool cjs_var_in_scope = true;
+  if (argc >= 4 && argv[3] != nullptr) {
+    napi_get_value_bool(env, argv[3], &cjs_var_in_scope);
+  }
+
+  bool result = false;
+  if (unofficial_napi_contextify_contains_module_syntax(
+          env, code, filename, resource_name, cjs_var_in_scope, &result) != napi_ok) {
     return nullptr;
   }
   napi_value out = nullptr;
-  if (napi_create_object(env, &out) != napi_ok || out == nullptr) return nullptr;
-  napi_set_named_property(env, out, "function", compiled_wrapper);
-  napi_value can_parse_as_esm = nullptr;
-  napi_get_boolean(env, false, &can_parse_as_esm);
-  napi_set_named_property(env, out, "canParseAsESM", can_parse_as_esm);
+  napi_get_boolean(env, result, &out);
   return out;
 }
 
@@ -2254,11 +2977,22 @@ static napi_value ResolveContextifyBinding(napi_env env) {
   if (napi_create_function(env,
                            "containsModuleSyntax",
                            NAPI_AUTO_LENGTH,
-                           ReturnFalseCallback,
+                           ContextifyContainsModuleSyntaxCallback,
                            nullptr,
                            &contains_module_syntax) == napi_ok &&
       contains_module_syntax != nullptr) {
     napi_set_named_property(env, out, "containsModuleSyntax", contains_module_syntax);
+  }
+
+  napi_value make_context = nullptr;
+  if (napi_create_function(env,
+                           "makeContext",
+                           NAPI_AUTO_LENGTH,
+                           ContextifyMakeContextCallback,
+                           nullptr,
+                           &make_context) == napi_ok &&
+      make_context != nullptr) {
+    napi_set_named_property(env, out, "makeContext", make_context);
   }
 
   napi_value contextify_script_ctor = nullptr;
@@ -2280,6 +3014,17 @@ static napi_value ResolveContextifyBinding(napi_env env) {
                                &run_in_context) == napi_ok &&
           run_in_context != nullptr) {
         napi_set_named_property(env, proto, "runInContext", run_in_context);
+      }
+
+      napi_value create_cached_data = nullptr;
+      if (napi_create_function(env,
+                               "createCachedData",
+                               NAPI_AUTO_LENGTH,
+                               ContextifyScriptCreateCachedDataCallback,
+                               nullptr,
+                               &create_cached_data) == napi_ok &&
+          create_cached_data != nullptr) {
+        napi_set_named_property(env, proto, "createCachedData", create_cached_data);
       }
     }
     napi_set_named_property(env, out, "ContextifyScript", contextify_script_ctor);
@@ -2449,6 +3194,9 @@ static napi_value DispatchResolveBinding(napi_env env, void* raw_state, const ch
   if (std::strcmp(name, "http_parser") == 0) {
     return GetOrCreateBinding(state, env, "http_parser", UbiInstallHttpParserBinding);
   }
+  if (std::strcmp(name, "js_stream") == 0) {
+    return GetOrCreateBinding(state, env, "js_stream", UbiInstallJsStreamBinding);
+  }
   if (std::strcmp(name, "os") == 0) {
     return GetOrCreateBinding(state, env, "os", UbiInstallOsBinding);
   }
@@ -2481,6 +3229,9 @@ static napi_value DispatchResolveBinding(napi_env env, void* raw_state, const ch
   }
   if (std::strcmp(name, "tcp_wrap") == 0) {
     return GetOrCreateBinding(state, env, "tcp_wrap", UbiInstallTcpWrapBinding);
+  }
+  if (std::strcmp(name, "tls_wrap") == 0) {
+    return GetOrCreateBinding(state, env, "tls_wrap", UbiInstallTlsWrapBinding);
   }
   if (std::strcmp(name, "timers") == 0) {
     return GetOrCreateBinding(state, env, "timers", UbiInstallTimersHostBinding);
@@ -2752,7 +3503,12 @@ bool EvaluateJsModule(napi_env env,
                       napi_value require_fn) {
   const std::string source = ReadTextFile(resolved_path);
   if (source.empty()) {
-    return ThrowLoaderError(env, ("Failed to read module source: " + resolved_path.string()).c_str());
+    std::ifstream probe(resolved_path);
+    if (probe.is_open()) {
+      // Empty source is valid JavaScript and should load as a no-op module.
+    } else {
+      return ThrowLoaderError(env, ("Failed to read module source: " + resolved_path.string()).c_str());
+    }
   }
   const std::string source_url = ModuleSourceUrlForResolvedPath(resolved_path);
 
@@ -2785,7 +3541,7 @@ bool EvaluateJsModule(napi_env env,
     napi_get_reference_value(env, state->internal_binding_ref, &internal_binding_val);
   }
   if (internal_binding_val == nullptr) {
-    napi_get_named_property(env, global, "internalBinding", &internal_binding_val);
+    internal_binding_val = GetGlobalInternalBindingFunction(env, global);
   }
   if (state != nullptr && state->primordials_ref != nullptr) {
     napi_get_reference_value(env, state->primordials_ref, &primordials_val);
@@ -2825,7 +3581,10 @@ bool EvaluateJsModule(napi_env env,
 bool ParseJsonModule(napi_env env, const fs::path& resolved_path, napi_value module_obj) {
   const std::string source = ReadTextFile(resolved_path);
   if (source.empty()) {
-    return ThrowLoaderError(env, "Failed to read JSON module");
+    std::ifstream probe(resolved_path);
+    if (!probe.is_open()) {
+      return ThrowLoaderError(env, "Failed to read JSON module");
+    }
   }
 
   const std::string parse_source = "(function(__text){ return JSON.parse(__text); })";
@@ -3149,6 +3908,18 @@ void UbiSetInternalBinding(napi_env env, napi_value internal_binding) {
   if (napi_create_reference(env, internal_binding, 1, &state.internal_binding_ref) != napi_ok) {
     state.internal_binding_ref = nullptr;
   }
+}
+
+napi_value UbiGetInternalBinding(napi_env env) {
+  if (env == nullptr) return nullptr;
+  auto it = g_loader_states.find(env);
+  if (it == g_loader_states.end()) return nullptr;
+  if (it->second.internal_binding_ref == nullptr) return nullptr;
+  napi_value out = nullptr;
+  if (napi_get_reference_value(env, it->second.internal_binding_ref, &out) != napi_ok || out == nullptr) {
+    return nullptr;
+  }
+  return out;
 }
 
 bool UbiRequireBuiltin(napi_env env, const char* id, napi_value* out) {

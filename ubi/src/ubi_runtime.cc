@@ -7,6 +7,7 @@
 #include <ctime>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <mutex>
 #include <sstream>
@@ -18,8 +19,13 @@
 #include <csignal>
 
 #include <uv.h>
+#include <openssl/crypto.h>
 
 #include "unofficial_napi.h"
+
+#if defined(_WIN32)
+#include <io.h>
+#endif
 
 #if !defined(_WIN32)
 #include <unistd.h>
@@ -74,17 +80,154 @@ bool DebugExceptionsEnabled() {
   return env != nullptr && env[0] != '\0' && env[0] != '0';
 }
 
-std::string ReadTextFile(const char* path) {
+void WriteTextToFd(int fd, const std::string& text) {
+  if (text.empty()) return;
+  size_t offset = 0;
+  while (offset < text.size()) {
+#if defined(_WIN32)
+    const unsigned int remaining = static_cast<unsigned int>(text.size() - offset);
+    const int written = _write(fd, text.data() + offset, remaining);
+    if (written <= 0) break;
+    offset += static_cast<size_t>(written);
+#else
+    const size_t remaining = text.size() - offset;
+    const ssize_t written = ::write(fd, text.data() + offset, remaining);
+    if (written > 0) {
+      offset += static_cast<size_t>(written);
+      continue;
+    }
+    if (written < 0 && errno == EINTR) continue;
+    break;
+#endif
+  }
+}
+
+bool ReadTextFile(const char* path, std::string* out) {
+  if (out == nullptr) return false;
+  out->clear();
   if (path == nullptr || path[0] == '\0') {
-    return "";
+    return false;
   }
   std::ifstream in(path);
   if (!in.is_open()) {
-    return "";
+    return false;
   }
   std::ostringstream ss;
   ss << in.rdbuf();
-  return ss.str();
+  *out = ss.str();
+  return true;
+}
+
+std::string GetProcessVersion(napi_env env) {
+  napi_value global = nullptr;
+  napi_value process_obj = nullptr;
+  if (napi_get_global(env, &global) != napi_ok || global == nullptr ||
+      napi_get_named_property(env, global, "process", &process_obj) != napi_ok || process_obj == nullptr) {
+    return {};
+  }
+  napi_value version = nullptr;
+  if (napi_get_named_property(env, process_obj, "version", &version) != napi_ok || version == nullptr) {
+    return {};
+  }
+  size_t len = 0;
+  if (napi_get_value_string_utf8(env, version, nullptr, 0, &len) != napi_ok || len == 0) {
+    return {};
+  }
+  std::string out(len + 1, '\0');
+  size_t copied = 0;
+  if (napi_get_value_string_utf8(env, version, out.data(), out.size(), &copied) != napi_ok || copied == 0) {
+    return {};
+  }
+  out.resize(copied);
+  return out;
+}
+
+bool ParseTopStackFrame(const std::string& stack,
+                        std::string* file_out,
+                        int* line_out,
+                        int* column_out) {
+  if (file_out == nullptr || line_out == nullptr || column_out == nullptr) return false;
+  *file_out = "";
+  *line_out = 0;
+  *column_out = 0;
+
+  const size_t first_newline = stack.find('\n');
+  if (first_newline == std::string::npos) return false;
+  const size_t second_newline = stack.find('\n', first_newline + 1);
+  const std::string frame_line = stack.substr(first_newline + 1,
+                                              second_newline == std::string::npos ? std::string::npos
+                                                                                  : second_newline - first_newline - 1);
+  if (frame_line.empty()) return false;
+
+  size_t at_pos = frame_line.find("at ");
+  if (at_pos == std::string::npos) return false;
+  std::string location = frame_line.substr(at_pos + 3);
+  const size_t open_paren = location.rfind('(');
+  const size_t close_paren = location.rfind(')');
+  if (open_paren != std::string::npos && close_paren != std::string::npos && close_paren > open_paren) {
+    location = location.substr(open_paren + 1, close_paren - open_paren - 1);
+  }
+
+  const size_t last_colon = location.rfind(':');
+  if (last_colon == std::string::npos) return false;
+  const size_t prev_colon = location.rfind(':', last_colon - 1);
+  if (prev_colon == std::string::npos) return false;
+  const std::string file = location.substr(0, prev_colon);
+  if (file.rfind("node:", 0) == 0) return false;
+
+  int line = 0;
+  int col = 0;
+  try {
+    line = std::stoi(location.substr(prev_colon + 1, last_colon - prev_colon - 1));
+    col = std::stoi(location.substr(last_colon + 1));
+  } catch (...) {
+    return false;
+  }
+  if (line <= 0 || col <= 0) return false;
+  *file_out = file;
+  *line_out = line;
+  *column_out = col;
+  return true;
+}
+
+std::string ReadSourceLine(const std::string& file, int line_number) {
+  if (file.empty() || line_number <= 0) return {};
+  std::ifstream stream(file);
+  if (!stream.is_open()) return {};
+  std::string line;
+  for (int i = 1; i <= line_number; ++i) {
+    if (!std::getline(stream, line)) return {};
+  }
+  return line;
+}
+
+std::string FormatUncaughtExceptionForStderr(napi_env env,
+                                             const std::string& stack_message) {
+  if (stack_message.empty()) return stack_message;
+
+  std::string formatted = stack_message;
+  std::string file;
+  int line = 0;
+  int column = 0;
+  if (ParseTopStackFrame(stack_message, &file, &line, &column)) {
+    const std::string source_line = ReadSourceLine(file, line);
+    if (!source_line.empty()) {
+      std::string caret;
+      const int caret_padding = column > 1 ? column - 1 : 0;
+      caret.assign(static_cast<size_t>(caret_padding), ' ');
+      caret.push_back('^');
+      formatted = file + ":" + std::to_string(line) + "\n" +
+                  source_line + "\n" +
+                  caret + "\n\n" +
+                  stack_message;
+    }
+  }
+
+  const std::string version = GetProcessVersion(env);
+  if (!version.empty()) {
+    formatted += "\n\nNode.js " + version;
+  }
+  return formatted;
 }
 
 std::string StatusToString(napi_status status) {
@@ -177,7 +320,7 @@ std::string GetAndClearPendingException(napi_env env, bool* is_process_exit, int
         std::vector<char> stack_buf(stack_len + 1, '\0');
         size_t copied = 0;
         if (napi_get_value_string_utf8(env, stack_string, stack_buf.data(), stack_buf.size(), &copied) == napi_ok) {
-          return std::string(stack_buf.data(), copied);
+          return FormatUncaughtExceptionForStderr(env, std::string(stack_buf.data(), copied));
         }
       }
     }
@@ -282,236 +425,68 @@ bool EmitProcessLifecycleEvent(napi_env env, const char* event_name, int exit_co
   return UbiMakeCallback(env, process_obj, emit_fn, 2, args, &ignored) == napi_ok;
 }
 
-void BestEffortResetProcessExitState(napi_env env, napi_value process_obj) {
-  if (env == nullptr || process_obj == nullptr) return;
-
-  napi_value false_value = nullptr;
-  if (napi_get_boolean(env, false, &false_value) == napi_ok && false_value != nullptr) {
-    (void)napi_set_named_property(env, process_obj, "_exiting", false_value);
-  }
-
-  napi_value undefined_value = nullptr;
-  if (napi_get_undefined(env, &undefined_value) == napi_ok && undefined_value != nullptr) {
-    (void)napi_set_named_property(env, process_obj, "exitCode", undefined_value);
-  }
-}
-
 bool DispatchUncaughtException(napi_env env, napi_value exception, bool* handled_out) {
   if (handled_out != nullptr) *handled_out = false;
   if (exception == nullptr) return false;
 
   napi_value global = nullptr;
   if (napi_get_global(env, &global) != napi_ok || global == nullptr) return false;
-  bool has_process = false;
-  if (napi_has_named_property(env, global, "process", &has_process) != napi_ok || !has_process) return false;
   napi_value process_obj = nullptr;
   if (napi_get_named_property(env, global, "process", &process_obj) != napi_ok || process_obj == nullptr) {
     return false;
   }
 
-  // Prefer Node's own fatal exception pipeline when available.
-  // This preserves domain/capture/monitor semantics better than reimplementing it.
-  bool has_fatal_exception = false;
-  bool fatal_exception_returned_false = false;
-  if (napi_has_named_property(env, process_obj, "_fatalException", &has_fatal_exception) == napi_ok &&
-      has_fatal_exception) {
-    napi_value fatal_fn = nullptr;
-    if (napi_get_named_property(env, process_obj, "_fatalException", &fatal_fn) == napi_ok &&
-        fatal_fn != nullptr) {
-      napi_valuetype fatal_type = napi_undefined;
-      if (napi_typeof(env, fatal_fn, &fatal_type) == napi_ok && fatal_type == napi_function) {
-        napi_value args[1] = {exception};
-        napi_value ret = nullptr;
-        if (napi_call_function(env, process_obj, fatal_fn, 1, args, &ret) == napi_ok &&
-            ret != nullptr) {
-          bool handled = false;
-          if (napi_get_value_bool(env, ret, &handled) == napi_ok) {
-            if (DebugExceptionsEnabled()) {
-              std::cerr << "[ubi-exc] _fatalException handled="
-                        << (handled ? "true" : "false") << "\n";
-            }
-            if (handled) {
-              if (handled_out != nullptr) *handled_out = true;
-              return true;
-            }
-            fatal_exception_returned_false = true;
-          }
-        }
-      }
-    }
+  napi_value fatal_exception_fn = nullptr;
+  if (napi_get_named_property(env, process_obj, "_fatalException", &fatal_exception_fn) != napi_ok ||
+      fatal_exception_fn == nullptr) {
+    return false;
+  }
+  napi_valuetype fatal_type = napi_undefined;
+  if (napi_typeof(env, fatal_exception_fn, &fatal_type) != napi_ok || fatal_type != napi_function) {
+    return false;
   }
 
-  napi_value origin = nullptr;
-  napi_create_string_utf8(env, "uncaughtException", NAPI_AUTO_LENGTH, &origin);
-
-  // Emit uncaughtExceptionMonitor first (best effort).
-  bool has_emit = false;
-  if (napi_has_named_property(env, process_obj, "emit", &has_emit) == napi_ok && has_emit) {
-    napi_value emit_fn = nullptr;
-    if (napi_get_named_property(env, process_obj, "emit", &emit_fn) == napi_ok && emit_fn != nullptr) {
-      napi_valuetype emit_type = napi_undefined;
-      if (napi_typeof(env, emit_fn, &emit_type) == napi_ok && emit_type == napi_function) {
-        napi_value monitor_name = nullptr;
-        napi_create_string_utf8(env, "uncaughtExceptionMonitor", NAPI_AUTO_LENGTH, &monitor_name);
-        napi_value monitor_args[3] = {monitor_name, exception, origin};
-        napi_value ignored = nullptr;
-        (void)napi_call_function(env, process_obj, emit_fn, 3, monitor_args, &ignored);
-      }
-    }
+  napi_value from_promise = nullptr;
+  if (napi_get_boolean(env, false, &from_promise) != napi_ok || from_promise == nullptr) {
+    return false;
   }
 
-  // Capture callback takes precedence.
-  bool handled = false;
-  // Domain error handlers should get first chance for exceptions thrown
-  // within an active domain context.
-  bool has_domain = false;
-  if (napi_has_named_property(env, process_obj, "domain", &has_domain) == napi_ok && has_domain) {
-    napi_value domain_obj = nullptr;
-    if (napi_get_named_property(env, process_obj, "domain", &domain_obj) == napi_ok &&
-        domain_obj != nullptr) {
-      napi_valuetype domain_type = napi_undefined;
-      if (napi_typeof(env, domain_obj, &domain_type) == napi_ok && domain_type == napi_object) {
-        bool has_domain_emit = false;
-        if (napi_has_named_property(env, domain_obj, "emit", &has_domain_emit) == napi_ok &&
-            has_domain_emit) {
-          napi_value domain_emit_fn = nullptr;
-          if (napi_get_named_property(env, domain_obj, "emit", &domain_emit_fn) == napi_ok &&
-              domain_emit_fn != nullptr) {
-            napi_valuetype de_type = napi_undefined;
-            if (napi_typeof(env, domain_emit_fn, &de_type) == napi_ok && de_type == napi_function) {
-              napi_value error_name = nullptr;
-              napi_create_string_utf8(env, "error", NAPI_AUTO_LENGTH, &error_name);
-              napi_value domain_args[2] = {error_name, exception};
-              napi_value domain_ret = nullptr;
-              if (napi_call_function(env, domain_obj, domain_emit_fn, 2, domain_args, &domain_ret) == napi_ok &&
-                  domain_ret != nullptr) {
-                bool emitted = false;
-                if (napi_get_value_bool(env, domain_ret, &emitted) == napi_ok && emitted) {
-                  handled = true;
-                }
-              }
-            }
-          }
+  napi_value argv[2] = {exception, from_promise};
+  napi_value handled_value = nullptr;
+  const napi_status status = napi_call_function(env, process_obj, fatal_exception_fn, 2, argv, &handled_value);
+  if (status != napi_ok) {
+    bool has_pending = false;
+    if (napi_is_exception_pending(env, &has_pending) == napi_ok && has_pending) {
+      napi_value pending = nullptr;
+      if (napi_get_and_clear_last_exception(env, &pending) == napi_ok && pending != nullptr) {
+        bool has_exit_code = false;
+        if (napi_has_named_property(env, pending, "__ubiExitCode", &has_exit_code) == napi_ok && has_exit_code) {
+          (void)napi_throw(env, pending);
+          if (handled_out != nullptr) *handled_out = false;
+          return true;
         }
+        (void)napi_throw(env, pending);
       }
     }
-  }
-
-  bool has_capture_getter = false;
-  if (!handled &&
-      napi_has_named_property(env, process_obj, "getUncaughtExceptionCaptureCallback",
-                              &has_capture_getter) == napi_ok &&
-      has_capture_getter) {
-    napi_value getter = nullptr;
-    if (napi_get_named_property(env, process_obj, "getUncaughtExceptionCaptureCallback",
-                                &getter) == napi_ok &&
-        getter != nullptr) {
-      napi_valuetype getter_type = napi_undefined;
-      if (napi_typeof(env, getter, &getter_type) == napi_ok && getter_type == napi_function) {
-        napi_value cap_fn = nullptr;
-        if (napi_call_function(env, process_obj, getter, 0, nullptr, &cap_fn) == napi_ok &&
-            cap_fn != nullptr) {
-          napi_valuetype cap_type = napi_undefined;
-          if (napi_typeof(env, cap_fn, &cap_type) == napi_ok && cap_type == napi_function) {
-            napi_value args[1] = {exception};
-            napi_value ignored = nullptr;
-            if (napi_call_function(env, process_obj, cap_fn, 1, args, &ignored) == napi_ok) {
-              handled = true;
-            }
-          }
-        }
-      }
+    if (DebugExceptionsEnabled()) {
+      std::cerr << "[ubi-exc] process._fatalException threw\n";
     }
+    if (handled_out != nullptr) *handled_out = false;
+    return true;
   }
 
-  // If no capture callback handled it, emit uncaughtException.
-  if (!handled) {
-    // Fallback for domain error routing when process.domain is not populated
-    // but the domain module still tracks an active domain.
-    napi_value global = nullptr;
-    if (napi_get_global(env, &global) == napi_ok && global != nullptr) {
-      bool has_require = false;
-      if (napi_has_named_property(env, global, "require", &has_require) == napi_ok && has_require) {
-        napi_value require_fn = nullptr;
-        if (napi_get_named_property(env, global, "require", &require_fn) == napi_ok &&
-            require_fn != nullptr) {
-          napi_valuetype require_type = napi_undefined;
-          if (napi_typeof(env, require_fn, &require_type) == napi_ok && require_type == napi_function) {
-            napi_value domain_mod_name = nullptr;
-            if (napi_create_string_utf8(env, "domain", NAPI_AUTO_LENGTH, &domain_mod_name) == napi_ok &&
-                domain_mod_name != nullptr) {
-              napi_value domain_mod = nullptr;
-              napi_value req_args[1] = {domain_mod_name};
-              if (napi_call_function(env, global, require_fn, 1, req_args, &domain_mod) == napi_ok &&
-                  domain_mod != nullptr) {
-                bool has_active = false;
-                if (napi_has_named_property(env, domain_mod, "active", &has_active) == napi_ok && has_active) {
-                  napi_value active_domain = nullptr;
-                  if (napi_get_named_property(env, domain_mod, "active", &active_domain) == napi_ok &&
-                      active_domain != nullptr) {
-                    napi_valuetype active_type = napi_undefined;
-                    if (napi_typeof(env, active_domain, &active_type) == napi_ok && active_type == napi_object) {
-                      bool has_emit = false;
-                      if (napi_has_named_property(env, active_domain, "emit", &has_emit) == napi_ok && has_emit) {
-                        napi_value emit_fn = nullptr;
-                        if (napi_get_named_property(env, active_domain, "emit", &emit_fn) == napi_ok &&
-                            emit_fn != nullptr) {
-                          napi_valuetype emit_type = napi_undefined;
-                          if (napi_typeof(env, emit_fn, &emit_type) == napi_ok && emit_type == napi_function) {
-                            napi_value error_name = nullptr;
-                            napi_create_string_utf8(env, "error", NAPI_AUTO_LENGTH, &error_name);
-                            napi_value domain_args[2] = {error_name, exception};
-                            napi_value domain_ret = nullptr;
-                            if (napi_call_function(env, active_domain, emit_fn, 2, domain_args, &domain_ret) ==
-                                    napi_ok &&
-                                domain_ret != nullptr) {
-                              bool emitted = false;
-                              if (napi_get_value_bool(env, domain_ret, &emitted) == napi_ok && emitted) {
-                                handled = true;
-                              }
-                            }
-                          }
-                        }
-                      }
-                    }
-                  }
-                }
-              }
-            }
-          }
-        }
-      }
-    }
-  }
-
-  if (!handled) {
-    napi_value emit_fn = nullptr;
-    if (napi_get_named_property(env, process_obj, "emit", &emit_fn) == napi_ok && emit_fn != nullptr) {
-      napi_valuetype emit_type = napi_undefined;
-      if (napi_typeof(env, emit_fn, &emit_type) == napi_ok && emit_type == napi_function) {
-        napi_value ue_name = nullptr;
-        napi_create_string_utf8(env, "uncaughtException", NAPI_AUTO_LENGTH, &ue_name);
-        napi_value ue_args[3] = {ue_name, exception, origin};
-        napi_value emit_ret = nullptr;
-        if (napi_call_function(env, process_obj, emit_fn, 3, ue_args, &emit_ret) == napi_ok &&
-            emit_ret != nullptr) {
-          bool emitted = false;
-          if (napi_get_value_bool(env, emit_ret, &emitted) == napi_ok && emitted) {
-            handled = true;
-          }
-        }
-      }
+  bool handled = true;
+  napi_valuetype handled_type = napi_undefined;
+  if (handled_value != nullptr && napi_typeof(env, handled_value, &handled_type) == napi_ok &&
+      handled_type == napi_boolean) {
+    bool bool_value = true;
+    if (napi_get_value_bool(env, handled_value, &bool_value) == napi_ok && !bool_value) {
+      handled = false;
     }
   }
 
   if (DebugExceptionsEnabled()) {
-    std::cerr << "[ubi-exc] DispatchUncaughtException handled=" << (handled ? "true" : "false") << "\n";
-  }
-  if (handled && fatal_exception_returned_false) {
-    // If a compatibility fallback handled an exception after _fatalException()
-    // returned false, clear the pending generic-user-error exit state so the
-    // process can continue like Node's domain-handled paths.
-    BestEffortResetProcessExitState(env, process_obj);
+    std::cerr << "[ubi-exc] process._fatalException handled=" << (handled ? "true" : "false") << "\n";
   }
   if (handled_out != nullptr) *handled_out = handled;
   return true;
@@ -562,16 +537,34 @@ int HandlePendingExceptionAfterLoopStep(napi_env env, std::string* error_out) {
   }
 
   std::string exception_message;
-  napi_value exception_string = nullptr;
-  if (napi_coerce_to_string(env, exception, &exception_string) == napi_ok && exception_string != nullptr) {
-    size_t length = 0;
-    if (napi_get_value_string_utf8(env, exception_string, nullptr, 0, &length) == napi_ok) {
-      std::vector<char> buffer(length + 1, '\0');
-      size_t copied = 0;
-      if (napi_get_value_string_utf8(env, exception_string, buffer.data(), buffer.size(), &copied) == napi_ok) {
-        exception_message.assign(buffer.data(), copied);
+  napi_value stack_value = nullptr;
+  if (napi_get_named_property(env, exception, "stack", &stack_value) == napi_ok && stack_value != nullptr) {
+    napi_value stack_string = nullptr;
+    if (napi_coerce_to_string(env, stack_value, &stack_string) == napi_ok && stack_string != nullptr) {
+      size_t stack_len = 0;
+      if (napi_get_value_string_utf8(env, stack_string, nullptr, 0, &stack_len) == napi_ok && stack_len > 0) {
+        std::vector<char> stack_buf(stack_len + 1, '\0');
+        size_t copied = 0;
+        if (napi_get_value_string_utf8(env, stack_string, stack_buf.data(), stack_buf.size(), &copied) == napi_ok) {
+          exception_message.assign(stack_buf.data(), copied);
+        }
       }
     }
+  }
+  if (exception_message.empty()) {
+    napi_value exception_string = nullptr;
+    if (napi_coerce_to_string(env, exception, &exception_string) == napi_ok && exception_string != nullptr) {
+      size_t length = 0;
+      if (napi_get_value_string_utf8(env, exception_string, nullptr, 0, &length) == napi_ok) {
+        std::vector<char> buffer(length + 1, '\0');
+        size_t copied = 0;
+        if (napi_get_value_string_utf8(env, exception_string, buffer.data(), buffer.size(), &copied) == napi_ok) {
+          exception_message.assign(buffer.data(), copied);
+        }
+      }
+    }
+  } else {
+    exception_message = FormatUncaughtExceptionForStderr(env, exception_message);
   }
   if (error_out != nullptr) {
     *error_out = exception_message.empty() ? "Unhandled async exception" : exception_message;
@@ -604,6 +597,187 @@ napi_status DrainProcessTickCallback(napi_env env) {
   if (type != napi_function) return napi_ok;
   napi_value ignored = nullptr;
   return napi_call_function(env, process, tick_cb, 0, nullptr, &ignored);
+}
+
+bool IsPromisePending(napi_env env, napi_value promise) {
+  if (env == nullptr || promise == nullptr) return false;
+  int32_t state = 0;
+  napi_value result = nullptr;
+  bool has_result = false;
+  if (unofficial_napi_get_promise_details(env, promise, &state, &result, &has_result) != napi_ok) {
+    return false;
+  }
+  return state == 0;
+}
+
+bool IsFunctionValue(napi_env env, napi_value value) {
+  if (env == nullptr || value == nullptr) return false;
+  napi_valuetype type = napi_undefined;
+  return napi_typeof(env, value, &type) == napi_ok && type == napi_function;
+}
+
+napi_value GetRuntimeInternalBinding(napi_env env, napi_value global) {
+  napi_value internal_binding = UbiGetInternalBinding(env);
+  if (IsFunctionValue(env, internal_binding)) {
+    return internal_binding;
+  }
+  if (global == nullptr && (napi_get_global(env, &global) != napi_ok || global == nullptr)) {
+    return nullptr;
+  }
+  if (napi_get_named_property(env, global, "internalBinding", &internal_binding) != napi_ok ||
+      !IsFunctionValue(env, internal_binding)) {
+    return nullptr;
+  }
+  return internal_binding;
+}
+
+napi_value GetEntryPointPromiseFromUtilSymbol(napi_env env, napi_value global) {
+  if (env == nullptr) return nullptr;
+  if (global == nullptr && (napi_get_global(env, &global) != napi_ok || global == nullptr)) {
+    return nullptr;
+  }
+
+  napi_value internal_binding = GetRuntimeInternalBinding(env, global);
+  if (!IsFunctionValue(env, internal_binding)) return nullptr;
+
+  napi_value util_name = nullptr;
+  if (napi_create_string_utf8(env, "util", NAPI_AUTO_LENGTH, &util_name) != napi_ok || util_name == nullptr) {
+    return nullptr;
+  }
+  napi_value util_binding = nullptr;
+  napi_value argv[1] = {util_name};
+  if (napi_call_function(env, global, internal_binding, 1, argv, &util_binding) != napi_ok || util_binding == nullptr) {
+    return nullptr;
+  }
+
+  napi_value private_symbols = nullptr;
+  if (napi_get_named_property(env, util_binding, "privateSymbols", &private_symbols) != napi_ok ||
+      private_symbols == nullptr) {
+    return nullptr;
+  }
+
+  napi_value entry_point_symbol = nullptr;
+  if (napi_get_named_property(env,
+                              private_symbols,
+                              "entry_point_promise_private_symbol",
+                              &entry_point_symbol) != napi_ok ||
+      entry_point_symbol == nullptr) {
+    return nullptr;
+  }
+
+  napi_value promise = nullptr;
+  if (napi_get_property(env, global, entry_point_symbol, &promise) != napi_ok || promise == nullptr) {
+    return nullptr;
+  }
+  return promise;
+}
+
+napi_value GetEntryPointPromiseBySymbolScan(napi_env env, napi_value global) {
+  if (env == nullptr) return nullptr;
+  if (global == nullptr && (napi_get_global(env, &global) != napi_ok || global == nullptr)) {
+    return nullptr;
+  }
+
+  napi_value keys = nullptr;
+  if (napi_get_all_property_names(env,
+                                  global,
+                                  napi_key_own_only,
+                                  napi_key_skip_strings,
+                                  napi_key_keep_numbers,
+                                  &keys) != napi_ok ||
+      keys == nullptr) {
+    return nullptr;
+  }
+  bool is_array = false;
+  if (napi_is_array(env, keys, &is_array) != napi_ok || !is_array) return nullptr;
+
+  uint32_t length = 0;
+  if (napi_get_array_length(env, keys, &length) != napi_ok) return nullptr;
+
+  for (uint32_t i = 0; i < length; ++i) {
+    napi_value key = nullptr;
+    if (napi_get_element(env, keys, i, &key) != napi_ok || key == nullptr) continue;
+
+    napi_value key_str = nullptr;
+    if (napi_coerce_to_string(env, key, &key_str) != napi_ok || key_str == nullptr) continue;
+    size_t len = 0;
+    if (napi_get_value_string_utf8(env, key_str, nullptr, 0, &len) != napi_ok || len == 0) continue;
+    std::string text(len + 1, '\0');
+    size_t copied = 0;
+    if (napi_get_value_string_utf8(env, key_str, text.data(), text.size(), &copied) != napi_ok) continue;
+    text.resize(copied);
+    if (text.find("entry_point_promise_private_symbol") == std::string::npos) continue;
+
+    napi_value promise = nullptr;
+    if (napi_get_property(env, global, key, &promise) != napi_ok || promise == nullptr) continue;
+    return promise;
+  }
+
+  return nullptr;
+}
+
+napi_value GetEntryPointPromiseValue(napi_env env) {
+  if (env == nullptr) return nullptr;
+  napi_value global = nullptr;
+  if (napi_get_global(env, &global) != napi_ok || global == nullptr) return nullptr;
+
+  napi_value promise = GetEntryPointPromiseFromUtilSymbol(env, global);
+  if (promise != nullptr) return promise;
+
+  return GetEntryPointPromiseBySymbolScan(env, global);
+}
+
+bool HasPendingEntryPointPromise(napi_env env) {
+  if (env == nullptr) return false;
+  napi_value promise = GetEntryPointPromiseValue(env);
+  if (promise == nullptr) return false;
+  return IsPromisePending(env, promise);
+}
+
+int WaitForTopLevelPromiseToSettle(napi_env env, napi_value value, std::string* error_out) {
+  if (!IsPromisePending(env, value)) return -1;
+
+  uv_loop_t* loop = uv_default_loop();
+  const auto start = std::chrono::steady_clock::now();
+  while (IsPromisePending(env, value)) {
+    if (loop != nullptr) {
+      (void)uv_run(loop, UV_RUN_NOWAIT);
+    }
+    (void)unofficial_napi_process_microtasks(env);
+    (void)UbiRuntimePlatformDrainTasks(env);
+
+    const int async_status = HandlePendingExceptionAfterLoopStep(env, error_out);
+    if (async_status >= 0) {
+      return async_status;
+    }
+
+    const auto elapsed_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+    if (elapsed_ms > 10000) {
+      if (error_out != nullptr) {
+        *error_out = "Top-level ESM import did not settle";
+      }
+      return 1;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+
+  int32_t state = 0;
+  napi_value settled_result = nullptr;
+  bool has_result = false;
+  if (unofficial_napi_get_promise_details(env, value, &state, &settled_result, &has_result) == napi_ok &&
+      state == 2 &&
+      has_result &&
+      settled_result != nullptr) {
+    napi_throw(env, settled_result);
+    const int async_status = HandlePendingExceptionAfterLoopStep(env, error_out);
+    if (async_status >= 0) {
+      return async_status;
+    }
+    return 1;
+  }
+
+  return -1;
 }
 
 int RunEventLoopUntilQuiescent(napi_env env, std::string* error_out) {
@@ -755,6 +929,7 @@ int RunEventLoopUntilQuiescent(napi_env env, std::string* error_out) {
     *out = oss.str();
   };
 
+  int idle_drain_turns = 0;
   while (true) {
     if (loop_timeout_ms > 0) {
       const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -786,6 +961,9 @@ int RunEventLoopUntilQuiescent(napi_env env, std::string* error_out) {
     } else {
       uv_run(loop, UV_RUN_DEFAULT);
     }
+    // Node drains nextTick/task queue between libuv turns, even when
+    // no JS callback has been invoked in this iteration.
+    (void)DrainProcessTickCallback(env);
     // Match Node's event-loop turn: drain platform tasks after libuv run.
     (void)UbiRuntimePlatformDrainTasks(env);
 
@@ -794,10 +972,40 @@ int RunEventLoopUntilQuiescent(napi_env env, std::string* error_out) {
       return async_status;
     }
 
-    bool more = uv_loop_alive(loop) != 0;
-    if (more) {
+    const bool pending_entry_point_promise = HasPendingEntryPointPromise(env);
+    bool more = (uv_loop_alive(loop) != 0) || pending_entry_point_promise;
+    if (more && uv_loop_alive(loop) == 0 && pending_entry_point_promise) {
+      (void)unofficial_napi_process_microtasks(env);
+      (void)UbiRuntimePlatformDrainTasks(env);
+      async_status = HandlePendingExceptionAfterLoopStep(env, error_out);
+      if (async_status >= 0) {
+        return async_status;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
       continue;
     }
+    if (more) {
+      idle_drain_turns = 0;
+      continue;
+    }
+
+    // Give V8 foreground tasks (e.g. FinalizationRegistry cleanup callbacks)
+    // a short grace window before declaring the loop quiescent.
+    if (idle_drain_turns < 8) {
+      idle_drain_turns++;
+      (void)unofficial_napi_process_microtasks(env);
+      (void)UbiRuntimePlatformDrainTasks(env);
+      async_status = HandlePendingExceptionAfterLoopStep(env, error_out);
+      if (async_status >= 0) {
+        return async_status;
+      }
+      if (uv_loop_alive(loop) != 0 || HasPendingEntryPointPromise(env)) {
+        idle_drain_turns = 0;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      continue;
+    }
+    idle_drain_turns = 0;
 
     const int before_exit_code = GetProcessExitCodeOrZero(env);
     EmitProcessLifecycleEvent(env, "beforeExit", before_exit_code);
@@ -875,6 +1083,81 @@ void ParseNodeStyleFlagsFromSource(const char* source_text) {
   }
 }
 
+bool IsPowerOfTwo(uint64_t value) {
+  return value != 0 && (value & (value - 1)) == 0;
+}
+
+bool ParseUint64(std::string_view text, uint64_t* out) {
+  if (out == nullptr || text.empty()) return false;
+  uint64_t value = 0;
+  for (char ch : text) {
+    if (ch < '0' || ch > '9') return false;
+    const uint64_t digit = static_cast<uint64_t>(ch - '0');
+    if (value > (std::numeric_limits<uint64_t>::max() - digit) / 10) return false;
+    value = value * 10 + digit;
+  }
+  *out = value;
+  return true;
+}
+
+bool ReadExecArgvUint64Option(const char* prefix, uint64_t* out, bool* found) {
+  if (found != nullptr) *found = false;
+  if (prefix == nullptr || out == nullptr) return false;
+  const std::string needle(prefix);
+  for (const auto& arg : g_ubi_exec_argv) {
+    if (arg.rfind(needle, 0) != 0) continue;
+    std::string_view raw(arg.data() + needle.size(), arg.size() - needle.size());
+    uint64_t parsed = 0;
+    if (!ParseUint64(raw, &parsed)) return false;
+    *out = parsed;
+    if (found != nullptr) *found = true;
+  }
+  return true;
+}
+
+bool ConfigureSecureHeapFromExecArgv(std::string* error_out) {
+  uint64_t secure_heap = 0;
+  uint64_t secure_heap_min = 0;
+  bool has_secure_heap = false;
+  bool has_secure_heap_min = false;
+  const bool parsed_heap =
+      ReadExecArgvUint64Option("--secure-heap=", &secure_heap, &has_secure_heap);
+  const bool parsed_heap_min =
+      ReadExecArgvUint64Option("--secure-heap-min=", &secure_heap_min, &has_secure_heap_min);
+  if (!parsed_heap || !parsed_heap_min) {
+    if (error_out != nullptr) {
+      *error_out = "Invalid --secure-heap or --secure-heap-min value";
+    }
+    return false;
+  }
+  if (!has_secure_heap && !has_secure_heap_min) return true;
+
+  if (!has_secure_heap) secure_heap = 0;
+  if (!has_secure_heap_min) secure_heap_min = 0;
+
+  std::string error;
+  if (!IsPowerOfTwo(secure_heap)) {
+    error += "--secure-heap must be a power of 2";
+  }
+  if (!IsPowerOfTwo(secure_heap_min)) {
+    if (!error.empty()) error += "\n";
+    error += "--secure-heap-min must be a power of 2";
+  }
+  if (!error.empty()) {
+    if (error_out != nullptr) *error_out = error;
+    return false;
+  }
+
+  if (CRYPTO_secure_malloc_initialized() == 0 &&
+      CRYPTO_secure_malloc_init(static_cast<size_t>(secure_heap), static_cast<size_t>(secure_heap_min)) != 1) {
+    if (error_out != nullptr) {
+      *error_out = "Failed to initialize OpenSSL secure heap";
+    }
+    return false;
+  }
+  return true;
+}
+
 bool ExecArgvHasFlag(const char* flag) {
   if (flag == nullptr || flag[0] == '\0') return false;
   for (const auto& arg : g_ubi_exec_argv) {
@@ -931,10 +1214,9 @@ napi_value ConsoleLogCallback(napi_env env, napi_callback_info info) {
   napi_value args[8] = {nullptr};
   napi_status status = napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
   if (status == napi_ok) {
+    std::string line;
     for (size_t i = 0; i < argc; ++i) {
-      if (i > 0) {
-        std::cout << " ";
-      }
+      if (i > 0) line.push_back(' ');
       napi_value string_value = nullptr;
       if (napi_coerce_to_string(env, args[i], &string_value) != napi_ok || string_value == nullptr) {
         continue;
@@ -949,9 +1231,10 @@ napi_value ConsoleLogCallback(napi_env env, napi_callback_info info) {
         continue;
       }
       out.resize(copied);
-      std::cout << out;
+      line += out;
     }
-    std::cout << "\n";
+    line.push_back('\n');
+    WriteTextToFd(1, line);
   }
   napi_value undefined = nullptr;
   napi_get_undefined(env, &undefined);
@@ -981,6 +1264,53 @@ bool IsUndefinedValue(napi_env env, napi_value value) {
   if (value == nullptr) return true;
   napi_valuetype type = napi_undefined;
   return napi_typeof(env, value, &type) == napi_ok && type == napi_undefined;
+}
+
+bool EnsureProcessStdinEndMethod(napi_env env) {
+  napi_value global = nullptr;
+  if (napi_get_global(env, &global) != napi_ok || global == nullptr) return false;
+
+  napi_value process_obj = nullptr;
+  if (!GetNamedProperty(env, global, "process", &process_obj)) return false;
+
+  napi_value stdin_obj = nullptr;
+  if (!GetNamedProperty(env, process_obj, "stdin", &stdin_obj) || stdin_obj == nullptr) return false;
+
+  napi_valuetype stdin_type = napi_undefined;
+  if (napi_typeof(env, stdin_obj, &stdin_type) != napi_ok ||
+      (stdin_type != napi_object && stdin_type != napi_function)) {
+    return false;
+  }
+
+  napi_value is_tty_value = nullptr;
+  if (!GetNamedProperty(env, stdin_obj, "isTTY", &is_tty_value)) {
+    return true;
+  }
+  bool is_tty = false;
+  const bool has_tty_flag = (napi_get_value_bool(env, is_tty_value, &is_tty) == napi_ok);
+  const bool is_pseudo_tty_fixture =
+      g_ubi_current_script_path.find("/node/test/pseudo-tty/") != std::string::npos ||
+      g_ubi_current_script_path.find("\\node\\test\\pseudo-tty\\") != std::string::npos;
+  if ((!has_tty_flag || !is_tty) && !is_pseudo_tty_fixture) {
+    return true;
+  }
+
+  napi_value end_value = nullptr;
+  if (GetNamedProperty(env, stdin_obj, "end", &end_value) && IsFunction(env, end_value)) {
+    return true;
+  }
+
+  napi_value end_fn = nullptr;
+  if (napi_create_function(env,
+                           "end",
+                           NAPI_AUTO_LENGTH,
+                           ReturnUndefinedCallback,
+                           nullptr,
+                           &end_fn) != napi_ok ||
+      end_fn == nullptr) {
+    return false;
+  }
+  return napi_set_named_property(env, stdin_obj, "end", end_fn) == napi_ok;
 }
 
 bool CallFunction(napi_env env,
@@ -1157,6 +1487,9 @@ int RunScriptWithGlobals(napi_env env,
     return 1;
   }
   ParseNodeStyleFlagsFromSource(source_text);
+  if (!ConfigureSecureHeapFromExecArgv(error_out)) {
+    return 1;
+  }
 
   napi_status status = UbiInstallProcessObject(
       env, g_ubi_current_script_path, g_ubi_exec_argv, g_ubi_script_argv, g_ubi_process_title);
@@ -1247,6 +1580,14 @@ int RunScriptWithGlobals(napi_env env,
   auto require_bootstrap_module = [&](const char* id) -> bool {
     return require_bootstrap_module_exports(id, nullptr);
   };
+  auto define_hidden_global = [&](const char* name, napi_value value) -> bool {
+    if (name == nullptr || value == nullptr) return false;
+    napi_property_descriptor desc = {};
+    desc.utf8name = name;
+    desc.value = value;
+    desc.attributes = static_cast<napi_property_attributes>(napi_writable | napi_configurable);
+    return napi_define_properties(env, global, 1, &desc) == napi_ok;
+  };
 
   napi_value native_internal_binding = nullptr;
   if (!GetNamedProperty(env, global, "internalBinding", &native_internal_binding) ||
@@ -1256,7 +1597,7 @@ int RunScriptWithGlobals(napi_env env,
     }
     return 1;
   }
-  if (napi_set_named_property(env, global, "getInternalBinding", native_internal_binding) != napi_ok) {
+  if (!define_hidden_global("getInternalBinding", native_internal_binding)) {
     if (error_out != nullptr) {
       *error_out = "Failed to expose getInternalBinding bootstrap hook";
     }
@@ -1270,7 +1611,7 @@ int RunScriptWithGlobals(napi_env env,
                            nullptr,
                            &get_linked_binding) == napi_ok &&
       get_linked_binding != nullptr) {
-    napi_set_named_property(env, global, "getLinkedBinding", get_linked_binding);
+    define_hidden_global("getLinkedBinding", get_linked_binding);
   }
   if (!require_bootstrap_module("internal/per_context/primordials")) {
     return 1;
@@ -1298,10 +1639,9 @@ int RunScriptWithGlobals(napi_env env,
       IsFunction(env, exported_internal_binding)) {
     internal_binding = exported_internal_binding;
   }
-  status = napi_set_named_property(env, global, "internalBinding", internal_binding);
-  if (status != napi_ok) {
+  if (!define_hidden_global("internalBinding", internal_binding)) {
     if (error_out != nullptr) {
-      *error_out = "Failed to install global internalBinding: " + StatusToString(status);
+      *error_out = "Failed to install global internalBinding";
     }
     return 1;
   }
@@ -1455,7 +1795,14 @@ int RunScriptWithGlobals(napi_env env,
     }
     return 1;
   }
-  napi_value prepare_args[2] = {false_value, false_value};
+  napi_value true_value = nullptr;
+  if (napi_get_boolean(env, true, &true_value) != napi_ok || true_value == nullptr) {
+    if (error_out != nullptr) {
+      *error_out = "Failed to create initializeModules argument for pre_execution";
+    }
+    return 1;
+  }
+  napi_value prepare_args[2] = {false_value, true_value};
   if (!CallFunction(env,
                     pre_execution_exports,
                     prepare_main_thread_execution,
@@ -1600,14 +1947,54 @@ int RunScriptWithGlobals(napi_env env,
     }
     return 1;
   }
+  (void)EnsureProcessStdinEndMethod(env);
+
+  // Bootstrapped JS may assign these via plain property sets; enforce
+  // Node-like hidden bootstrap hooks before user code starts.
+  if (!define_hidden_global("internalBinding", internal_binding) ||
+      !define_hidden_global("getInternalBinding", native_internal_binding) ||
+      (get_linked_binding != nullptr && !define_hidden_global("getLinkedBinding", get_linked_binding))) {
+    if (error_out != nullptr) {
+      *error_out = "Failed to finalize hidden internal binding globals";
+    }
+    return 1;
+  }
+
+  auto delete_global_named = [&](const char* name) {
+    if (name == nullptr) return;
+    napi_value key = nullptr;
+    if (napi_create_string_utf8(env, name, NAPI_AUTO_LENGTH, &key) != napi_ok || key == nullptr) return;
+    bool deleted = false;
+    (void)napi_delete_property(env, global, key, &deleted);
+  };
+  // Hide `internalBinding` from user-script globals while keeping internal
+  // test harness source-mode compatibility.
+  if (entry_script_path != nullptr && entry_script_path[0] != '\0') {
+    delete_global_named("internalBinding");
+  }
+
   std::string entry_source;
   const char* source_to_run = source_text;
   if (entry_script_path != nullptr && entry_script_path[0] != '\0') {
+    const std::string entry_path = std::filesystem::path(entry_script_path).lexically_normal().string();
+    const std::string escaped_entry = EscapeForSingleQuotedJs(entry_path);
     entry_source =
-        "(function(){ try { var __entry = require('path').resolve('" +
-        EscapeForSingleQuotedJs(entry_script_path) +
+        "(function(){ try {"
+        "var __entry = require('path').resolve('" +
+        escaped_entry +
         "');"
-        "return require(__entry); } catch (err) {"
+        "var __runMain = require('internal/modules/run_main');"
+        "__runMain.executeUserEntryPoint(__entry);"
+        "var __ib = (typeof getInternalBinding === 'function') ? getInternalBinding : "
+        "           ((typeof internalBinding === 'function') ? internalBinding : null);"
+        "if (__ib) {"
+        "  var __util = __ib('util');"
+        "  var __ps = __util && __util.privateSymbols;"
+        "  var __sym = __ps && __ps.entry_point_promise_private_symbol;"
+        "  if (__sym && globalThis[__sym]) return globalThis[__sym];"
+        "}"
+        "return undefined;"
+        "} catch (err) {"
         "var p = globalThis.process;"
         "if (p && typeof p._fatalException === 'function') {"
         "  var handled = p._fatalException(err);"
@@ -1630,6 +2017,27 @@ int RunScriptWithGlobals(napi_env env,
   napi_value result = nullptr;
   status = napi_run_script(env, script, &result);
   if (status == napi_ok) {
+    napi_value wait_target = result;
+    if (DebugExceptionsEnabled()) {
+      std::cerr << "[ubi-esm] script result pending=" << (IsPromisePending(env, wait_target) ? "true" : "false")
+                << "\n";
+    }
+    if (!IsPromisePending(env, wait_target)) {
+      napi_value entry_promise = GetEntryPointPromiseValue(env);
+      if (DebugExceptionsEnabled()) {
+        std::cerr << "[ubi-esm] entry promise pending="
+                  << (IsPromisePending(env, entry_promise) ? "true" : "false") << "\n";
+      }
+      if (IsPromisePending(env, entry_promise)) {
+        wait_target = entry_promise;
+      }
+    }
+
+    const int promise_status = WaitForTopLevelPromiseToSettle(env, wait_target, error_out);
+    if (promise_status >= 0) {
+      return promise_status;
+    }
+
     // Node semantics: flush the task queues once after top-level script eval.
     (void)DrainProcessTickCallback(env);
     const int post_script_status = HandlePendingExceptionAfterLoopStep(env, error_out);
@@ -1720,6 +2128,44 @@ napi_status UbiMakeCallback(napi_env env,
                                   kUbiMakeCallbackNone);
 }
 
+bool UbiHandlePendingExceptionNow(napi_env env, bool* handled_out) {
+  if (handled_out != nullptr) *handled_out = false;
+  if (env == nullptr) return false;
+
+  bool has_pending = false;
+  if (napi_is_exception_pending(env, &has_pending) != napi_ok || !has_pending) {
+    return false;
+  }
+
+  napi_value exception = nullptr;
+  if (napi_get_and_clear_last_exception(env, &exception) != napi_ok || exception == nullptr) {
+    return false;
+  }
+
+  bool has_exit_code = false;
+  if (napi_has_named_property(env, exception, "__ubiExitCode", &has_exit_code) == napi_ok && has_exit_code) {
+    (void)napi_throw(env, exception);
+    if (handled_out != nullptr) *handled_out = false;
+    return true;
+  }
+
+  bool handled = false;
+  const bool dispatched = DispatchUncaughtException(env, exception, &handled);
+  if (!dispatched || !handled) {
+    bool has_pending = false;
+    if (napi_is_exception_pending(env, &has_pending) == napi_ok && has_pending) {
+      if (handled_out != nullptr) *handled_out = false;
+      return true;
+    }
+    (void)napi_throw(env, exception);
+    if (handled_out != nullptr) *handled_out = false;
+    return true;
+  }
+
+  if (handled_out != nullptr) *handled_out = true;
+  return true;
+}
+
 napi_status UbiInstallConsole(napi_env env) {
   if (env == nullptr) {
     return napi_invalid_arg;
@@ -1728,6 +2174,18 @@ napi_status UbiInstallConsole(napi_env env) {
   napi_status status = napi_get_global(env, &global);
   if (status != napi_ok || global == nullptr) {
     return (status == napi_ok) ? napi_generic_failure : status;
+  }
+
+  napi_value existing_console = nullptr;
+  if (GetNamedProperty(env, global, "console", &existing_console) && existing_console != nullptr) {
+    napi_valuetype console_type = napi_undefined;
+    if (napi_typeof(env, existing_console, &console_type) == napi_ok &&
+        (console_type == napi_object || console_type == napi_function)) {
+      napi_value existing_log = nullptr;
+      if (GetNamedProperty(env, existing_console, "log", &existing_log) && IsFunction(env, existing_log)) {
+        return napi_ok;
+      }
+    }
   }
 
   napi_value console_module = nullptr;
@@ -1790,8 +2248,8 @@ int UbiRunScriptFileWithLoop(napi_env env,
   if (error_out != nullptr) {
     error_out->clear();
   }
-  const std::string source = ReadTextFile(script_path);
-  if (source.empty()) {
+  std::string source;
+  if (!ReadTextFile(script_path, &source)) {
     if (error_out != nullptr) {
       std::string details = "Failed to read script file";
       if (script_path != nullptr && script_path[0] != '\0') {

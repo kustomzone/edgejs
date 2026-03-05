@@ -76,6 +76,11 @@ bool ValueToUtf8(napi_env env, napi_value value, std::string* out) {
   return true;
 }
 
+bool IsBufferEncoding(napi_env env, napi_value value) {
+  std::string encoding;
+  return ValueToUtf8(env, value, &encoding) && encoding == "buffer";
+}
+
 bool CaptureRawMethod(napi_env env, FsBindingState* st, napi_value binding, const char* name) {
   if (st == nullptr || binding == nullptr || name == nullptr) return false;
   if (st->raw_methods.find(name) != st->raw_methods.end()) return true;
@@ -260,6 +265,26 @@ size_t ByteLengthOfValue(napi_env env, napi_value value) {
   return 0;
 }
 
+napi_value ConvertNameArrayToEncoding(napi_env env, napi_value names, bool as_buffer) {
+  if (!as_buffer || names == nullptr || IsUndefined(env, names)) return names;
+  uint32_t len = 0;
+  bool is_array = false;
+  if (napi_is_array(env, names, &is_array) != napi_ok || !is_array ||
+      napi_get_array_length(env, names, &len) != napi_ok) {
+    return names;
+  }
+  napi_value out = nullptr;
+  if (napi_create_array_with_length(env, len, &out) != napi_ok || out == nullptr) return names;
+  for (uint32_t i = 0; i < len; ++i) {
+    napi_value item = nullptr;
+    if (napi_get_element(env, names, i, &item) != napi_ok || item == nullptr) continue;
+    napi_value converted = BufferFromValue(env, item, "utf8");
+    if (converted == nullptr || IsUndefined(env, converted)) converted = item;
+    napi_set_element(env, out, i, converted);
+  }
+  return out;
+}
+
 napi_value MakeResolvedPromise(napi_env env, napi_value value) {
   napi_deferred deferred = nullptr;
   napi_value promise = nullptr;
@@ -281,6 +306,197 @@ enum class ReqKind {
   kPromise,
   kCallback,
 };
+
+struct DeferredReqCompletion {
+  napi_env env = nullptr;
+  napi_ref req_ref = nullptr;
+  napi_ref oncomplete_ref = nullptr;
+  napi_ref err_ref = nullptr;
+  napi_ref value_ref = nullptr;
+};
+
+napi_value GetNodeActiveRequestsSymbol(napi_env env) {
+  napi_value global = GetGlobal(env);
+  if (global == nullptr) return nullptr;
+  napi_value symbol_ctor = nullptr;
+  napi_value symbol_for = nullptr;
+  if (napi_get_named_property(env, global, "Symbol", &symbol_ctor) != napi_ok ||
+      symbol_ctor == nullptr ||
+      napi_get_named_property(env, symbol_ctor, "for", &symbol_for) != napi_ok ||
+      symbol_for == nullptr) {
+    return nullptr;
+  }
+  napi_valuetype fn_type = napi_undefined;
+  if (napi_typeof(env, symbol_for, &fn_type) != napi_ok || fn_type != napi_function) return nullptr;
+  napi_value key = nullptr;
+  if (napi_create_string_utf8(env, "node.activeRequests", NAPI_AUTO_LENGTH, &key) != napi_ok || key == nullptr) {
+    return nullptr;
+  }
+  napi_value symbol = nullptr;
+  napi_value argv[1] = {key};
+  if (napi_call_function(env, symbol_ctor, symbol_for, 1, argv, &symbol) != napi_ok || symbol == nullptr) {
+    return nullptr;
+  }
+  return symbol;
+}
+
+napi_value GetOrCreateNodeActiveRequestsArray(napi_env env) {
+  napi_value global = GetGlobal(env);
+  napi_value symbol = GetNodeActiveRequestsSymbol(env);
+  if (global == nullptr || symbol == nullptr) return nullptr;
+
+  napi_value requests = nullptr;
+  if (napi_get_property(env, global, symbol, &requests) == napi_ok && requests != nullptr) {
+    bool is_array = false;
+    if (napi_is_array(env, requests, &is_array) == napi_ok && is_array) return requests;
+  }
+
+  requests = nullptr;
+  if (napi_create_array(env, &requests) != napi_ok || requests == nullptr) return nullptr;
+  if (napi_set_property(env, global, symbol, requests) != napi_ok) return nullptr;
+  return requests;
+}
+
+void TrackActiveRequest(napi_env env, napi_value req) {
+  if (req == nullptr || IsUndefined(env, req)) return;
+  napi_value requests = GetOrCreateNodeActiveRequestsArray(env);
+  if (requests == nullptr) return;
+  uint32_t len = 0;
+  if (napi_get_array_length(env, requests, &len) != napi_ok) return;
+  napi_set_element(env, requests, len, req);
+}
+
+void UntrackActiveRequest(napi_env env, napi_value req) {
+  if (req == nullptr || IsUndefined(env, req)) return;
+  napi_value requests = GetOrCreateNodeActiveRequestsArray(env);
+  if (requests == nullptr) return;
+  uint32_t len = 0;
+  if (napi_get_array_length(env, requests, &len) != napi_ok || len == 0) return;
+  for (uint32_t i = 0; i < len; ++i) {
+    napi_value item = nullptr;
+    if (napi_get_element(env, requests, i, &item) != napi_ok || item == nullptr) continue;
+    bool same = false;
+    if (napi_strict_equals(env, item, req, &same) != napi_ok || !same) continue;
+    for (uint32_t j = i + 1; j < len; ++j) {
+      napi_value next = nullptr;
+      if (napi_get_element(env, requests, j, &next) != napi_ok || next == nullptr) continue;
+      napi_set_element(env, requests, j - 1, next);
+    }
+    bool deleted = false;
+    napi_delete_element(env, requests, len - 1, &deleted);
+    break;
+  }
+}
+
+void DestroyDeferredReqCompletion(DeferredReqCompletion* completion) {
+  if (completion == nullptr) return;
+  napi_env env = completion->env;
+  if (env != nullptr) {
+    ResetRef(env, &completion->req_ref);
+    ResetRef(env, &completion->oncomplete_ref);
+    ResetRef(env, &completion->err_ref);
+    ResetRef(env, &completion->value_ref);
+  }
+  delete completion;
+}
+
+void InvokeDeferredReqCompletion(napi_env env, DeferredReqCompletion* completion) {
+  if (completion == nullptr || env == nullptr) return;
+  napi_value req = GetRefValue(env, completion->req_ref);
+  napi_value oncomplete = GetRefValue(env, completion->oncomplete_ref);
+  napi_value err = GetRefValue(env, completion->err_ref);
+  napi_value value = GetRefValue(env, completion->value_ref);
+  if (req != nullptr) UntrackActiveRequest(env, req);
+
+  if (req == nullptr || oncomplete == nullptr) {
+    DestroyDeferredReqCompletion(completion);
+    return;
+  }
+
+  if (err != nullptr && !IsUndefined(env, err)) {
+    napi_value argv[1] = {err};
+    napi_value ignored = nullptr;
+    napi_call_function(env, req, oncomplete, 1, argv, &ignored);
+  } else if (value != nullptr && !IsUndefined(env, value)) {
+    napi_value argv[2] = {Undefined(env), value};
+    napi_value ignored = nullptr;
+    napi_call_function(env, req, oncomplete, 2, argv, &ignored);
+  } else {
+    napi_value argv[1] = {Undefined(env)};
+    napi_value ignored = nullptr;
+    napi_call_function(env, req, oncomplete, 1, argv, &ignored);
+  }
+  DestroyDeferredReqCompletion(completion);
+}
+
+napi_value DeferredReqCompletionCallback(napi_env env, napi_callback_info info) {
+  void* data = nullptr;
+  size_t argc = 0;
+  napi_get_cb_info(env, info, &argc, nullptr, nullptr, &data);
+  auto* completion = static_cast<DeferredReqCompletion*>(data);
+  InvokeDeferredReqCompletion(env, completion);
+  return Undefined(env);
+}
+
+bool ScheduleDeferredReqCompletion(napi_env env,
+                                   napi_value req,
+                                   napi_value oncomplete,
+                                   napi_value err,
+                                   napi_value value) {
+  if (env == nullptr || req == nullptr || oncomplete == nullptr) return false;
+  auto* completion = new DeferredReqCompletion();
+  completion->env = env;
+  if (napi_create_reference(env, req, 1, &completion->req_ref) != napi_ok ||
+      napi_create_reference(env, oncomplete, 1, &completion->oncomplete_ref) != napi_ok ||
+      (err != nullptr && !IsUndefined(env, err) &&
+       napi_create_reference(env, err, 1, &completion->err_ref) != napi_ok) ||
+      (value != nullptr && !IsUndefined(env, value) &&
+       napi_create_reference(env, value, 1, &completion->value_ref) != napi_ok)) {
+    DestroyDeferredReqCompletion(completion);
+    return false;
+  }
+
+  TrackActiveRequest(env, req);
+
+  napi_value callback = nullptr;
+  if (napi_create_function(env,
+                           "__ubiFsDeferredReqComplete",
+                           NAPI_AUTO_LENGTH,
+                           DeferredReqCompletionCallback,
+                           completion,
+                           &callback) != napi_ok ||
+      callback == nullptr) {
+    UntrackActiveRequest(env, req);
+    DestroyDeferredReqCompletion(completion);
+    return false;
+  }
+
+  napi_value global = GetGlobal(env);
+  napi_value process = nullptr;
+  napi_value next_tick = nullptr;
+  napi_valuetype next_tick_type = napi_undefined;
+  if (global == nullptr ||
+      napi_get_named_property(env, global, "process", &process) != napi_ok ||
+      process == nullptr ||
+      napi_get_named_property(env, process, "nextTick", &next_tick) != napi_ok ||
+      next_tick == nullptr ||
+      napi_typeof(env, next_tick, &next_tick_type) != napi_ok ||
+      next_tick_type != napi_function) {
+    UntrackActiveRequest(env, req);
+    DestroyDeferredReqCompletion(completion);
+    return false;
+  }
+
+  napi_value argv[1] = {callback};
+  napi_value ignored = nullptr;
+  if (napi_call_function(env, process, next_tick, 1, argv, &ignored) != napi_ok) {
+    UntrackActiveRequest(env, req);
+    DestroyDeferredReqCompletion(completion);
+    return false;
+  }
+
+  return true;
+}
 
 ReqKind ParseReq(napi_env env, napi_value candidate, napi_value* oncomplete) {
   if (oncomplete != nullptr) *oncomplete = nullptr;
@@ -309,19 +525,22 @@ ReqKind ParseReq(napi_env env, napi_value candidate, napi_value* oncomplete) {
 
 void CompleteReq(napi_env env, ReqKind kind, napi_value req, napi_value oncomplete, napi_value err, napi_value value) {
   if (kind != ReqKind::kCallback || req == nullptr || oncomplete == nullptr) return;
-  if (err != nullptr) {
+  if (ScheduleDeferredReqCompletion(env, req, oncomplete, err, value)) return;
+  if (err != nullptr && !IsUndefined(env, err)) {
     napi_value argv[1] = {err};
     napi_value ignored = nullptr;
     napi_call_function(env, req, oncomplete, 1, argv, &ignored);
-  } else if (value != nullptr && !IsUndefined(env, value)) {
+    return;
+  }
+  if (value != nullptr && !IsUndefined(env, value)) {
     napi_value argv[2] = {Undefined(env), value};
     napi_value ignored = nullptr;
     napi_call_function(env, req, oncomplete, 2, argv, &ignored);
-  } else {
-    napi_value argv[1] = {Undefined(env)};
-    napi_value ignored = nullptr;
-    napi_call_function(env, req, oncomplete, 1, argv, &ignored);
+    return;
   }
+  napi_value argv[1] = {Undefined(env)};
+  napi_value ignored = nullptr;
+  napi_call_function(env, req, oncomplete, 1, argv, &ignored);
 }
 
 struct FileHandleWrap {
@@ -589,15 +808,29 @@ napi_value FsAccess(napi_env env, napi_callback_info info) {
   napi_value ignored = nullptr;
   napi_value err = nullptr;
   if (!CallRaw(env, "accessSync", 2, call_argv, &ignored, &err)) {
-    if (!CallRaw(env, "access", 2, call_argv, &ignored, &err)) {
-      if (req_kind == ReqKind::kPromise) return MakeRejectedPromise(env, err);
-      CompleteReq(env, req_kind, req, oncomplete, err, Undefined(env));
-      if (err != nullptr) {
-        napi_throw(env, err);
-        return nullptr;
+    // Prefer raw async access when available, but do not erase sync failure
+    // semantics when only accessSync exists.
+    FsBindingState* st = GetState(env);
+    const bool has_async_access =
+        st != nullptr && st->raw_methods.find("access") != st->raw_methods.end();
+    if (has_async_access) {
+      napi_value async_err = nullptr;
+      if (CallRaw(env, "access", 2, call_argv, &ignored, &async_err)) {
+        if (req_kind == ReqKind::kPromise) return MakeResolvedPromise(env, Undefined(env));
+        CompleteReq(env, req_kind, req, oncomplete, nullptr, Undefined(env));
+        return Undefined(env);
       }
-      return Undefined(env);
+      if (async_err != nullptr) {
+        err = async_err;
+      }
     }
+    if (req_kind == ReqKind::kPromise) return MakeRejectedPromise(env, err);
+    CompleteReq(env, req_kind, req, oncomplete, err, Undefined(env));
+    if (err != nullptr) {
+      napi_throw(env, err);
+      return nullptr;
+    }
+    return Undefined(env);
   }
   if (req_kind == ReqKind::kPromise) return MakeResolvedPromise(env, Undefined(env));
   CompleteReq(env, req_kind, req, oncomplete, nullptr, Undefined(env));
@@ -687,6 +920,88 @@ napi_value FsStatfs(napi_env env, napi_callback_info info) {
   return typed;
 }
 
+napi_value FsReaddir(napi_env env, napi_callback_info info) {
+  size_t argc = 4;
+  napi_value argv[4] = {nullptr, nullptr, nullptr, nullptr};
+  napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+
+  const bool as_buffer = argc >= 2 && argv[1] != nullptr && IsBufferEncoding(env, argv[1]);
+  bool with_file_types = false;
+  if (argc >= 3 && argv[2] != nullptr) napi_get_value_bool(env, argv[2], &with_file_types);
+  napi_value req = argc >= 4 ? argv[3] : nullptr;
+  napi_value oncomplete = nullptr;
+  ReqKind req_kind = ParseReq(env, req, &oncomplete);
+
+  napi_value with_file_types_value = nullptr;
+  napi_get_boolean(env, with_file_types, &with_file_types_value);
+  napi_value call_argv[2] = {argc >= 1 ? argv[0] : Undefined(env),
+                             with_file_types_value != nullptr ? with_file_types_value : Undefined(env)};
+  napi_value raw_out = nullptr;
+  napi_value err = nullptr;
+  if (!CallRaw(env, "readdir", 2, call_argv, &raw_out, &err)) {
+    if (req_kind == ReqKind::kPromise) return MakeRejectedPromise(env, err);
+    CompleteReq(env, req_kind, req, oncomplete, err, Undefined(env));
+    if (req_kind == ReqKind::kNone && err != nullptr) {
+      napi_throw(env, err);
+      return nullptr;
+    }
+    return Undefined(env);
+  }
+
+  napi_value out = raw_out;
+  if (with_file_types) {
+    napi_value names = nullptr;
+    napi_value types = nullptr;
+    if (raw_out != nullptr &&
+        napi_get_element(env, raw_out, 0, &names) == napi_ok &&
+        napi_get_element(env, raw_out, 1, &types) == napi_ok) {
+      napi_value encoded_names = ConvertNameArrayToEncoding(env, names, as_buffer);
+      napi_value pair = nullptr;
+      if (napi_create_array_with_length(env, 2, &pair) == napi_ok && pair != nullptr) {
+        napi_set_element(env, pair, 0, encoded_names != nullptr ? encoded_names : names);
+        napi_set_element(env, pair, 1, types != nullptr ? types : Undefined(env));
+        out = pair;
+      }
+    }
+  } else {
+    out = ConvertNameArrayToEncoding(env, raw_out, as_buffer);
+  }
+
+  if (req_kind == ReqKind::kPromise) return MakeResolvedPromise(env, out);
+  CompleteReq(env, req_kind, req, oncomplete, nullptr, out);
+  return out;
+}
+
+napi_value FsMkdtemp(napi_env env, napi_callback_info info) {
+  size_t argc = 3;
+  napi_value argv[3] = {nullptr, nullptr, nullptr};
+  napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+
+  const bool as_buffer = argc >= 2 && argv[1] != nullptr && IsBufferEncoding(env, argv[1]);
+  napi_value req = argc >= 3 ? argv[2] : nullptr;
+  napi_value oncomplete = nullptr;
+  ReqKind req_kind = ParseReq(env, req, &oncomplete);
+
+  napi_value call_argv[1] = {argc >= 1 ? argv[0] : Undefined(env)};
+  napi_value raw_out = nullptr;
+  napi_value err = nullptr;
+  if (!CallRaw(env, "mkdtemp", 1, call_argv, &raw_out, &err)) {
+    if (req_kind == ReqKind::kPromise) return MakeRejectedPromise(env, err);
+    CompleteReq(env, req_kind, req, oncomplete, err, Undefined(env));
+    if (req_kind == ReqKind::kNone && err != nullptr) {
+      napi_throw(env, err);
+      return nullptr;
+    }
+    return Undefined(env);
+  }
+
+  napi_value out = as_buffer ? BufferFromValue(env, raw_out, "utf8") : raw_out;
+  if (out == nullptr || IsUndefined(env, out)) out = raw_out;
+  if (req_kind == ReqKind::kPromise) return MakeResolvedPromise(env, out);
+  CompleteReq(env, req_kind, req, oncomplete, nullptr, out);
+  return out;
+}
+
 napi_value FsRead(napi_env env, napi_callback_info info) {
   size_t argc = 6;
   napi_value argv[6] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
@@ -712,6 +1027,70 @@ napi_value FsRead(napi_env env, napi_callback_info info) {
   if (req_kind == ReqKind::kPromise) return MakeResolvedPromise(env, out);
   CompleteReq(env, req_kind, req, oncomplete, nullptr, out);
   return out;
+}
+
+napi_value FsOpen(napi_env env, napi_callback_info info) {
+  size_t argc = 4;
+  napi_value argv[4] = {nullptr, nullptr, nullptr, nullptr};
+  napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+
+  napi_value req = argc >= 4 ? argv[3] : nullptr;
+  napi_value oncomplete = nullptr;
+  ReqKind req_kind = ParseReq(env, req, &oncomplete);
+
+  napi_value call_argv[3] = {argc >= 1 ? argv[0] : Undefined(env),
+                             argc >= 2 ? argv[1] : Undefined(env),
+                             argc >= 3 ? argv[2] : Undefined(env)};
+  napi_value out = nullptr;
+  napi_value err = nullptr;
+  if (!CallRaw(env, "open", 3, call_argv, &out, &err)) {
+    if (req_kind == ReqKind::kPromise) return MakeRejectedPromise(env, err);
+    CompleteReq(env, req_kind, req, oncomplete, err, Undefined(env));
+    if (req_kind == ReqKind::kCallback) return Undefined(env);
+    if (err != nullptr) {
+      napi_throw(env, err);
+      return nullptr;
+    }
+    return Undefined(env);
+  }
+
+  if (req_kind == ReqKind::kPromise) return MakeResolvedPromise(env, out);
+  if (req_kind == ReqKind::kCallback) {
+    CompleteReq(env, req_kind, req, oncomplete, nullptr, out);
+    return Undefined(env);
+  }
+  return out;
+}
+
+napi_value FsClose(napi_env env, napi_callback_info info) {
+  size_t argc = 2;
+  napi_value argv[2] = {nullptr, nullptr};
+  napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+
+  napi_value req = argc >= 2 ? argv[1] : nullptr;
+  napi_value oncomplete = nullptr;
+  ReqKind req_kind = ParseReq(env, req, &oncomplete);
+
+  napi_value call_argv[1] = {argc >= 1 ? argv[0] : Undefined(env)};
+  napi_value out = nullptr;
+  napi_value err = nullptr;
+  if (!CallRaw(env, "close", 1, call_argv, &out, &err)) {
+    if (req_kind == ReqKind::kPromise) return MakeRejectedPromise(env, err);
+    CompleteReq(env, req_kind, req, oncomplete, err, Undefined(env));
+    if (req_kind == ReqKind::kCallback) return Undefined(env);
+    if (err != nullptr) {
+      napi_throw(env, err);
+      return nullptr;
+    }
+    return Undefined(env);
+  }
+
+  if (req_kind == ReqKind::kPromise) return MakeResolvedPromise(env, Undefined(env));
+  if (req_kind == ReqKind::kCallback) {
+    CompleteReq(env, req_kind, req, oncomplete, nullptr, Undefined(env));
+    return Undefined(env);
+  }
+  return out != nullptr ? out : Undefined(env);
 }
 
 napi_value FsReadBuffers(napi_env env, napi_callback_info info) {
@@ -1302,11 +1681,14 @@ napi_value ResolveFs(napi_env env, const ResolveOptions& options) {
                       &state.file_handle_ctor_ref);
 
   // Missing API surface.
+  SetNamedMethod(env, binding, "open", FsOpen);
+  SetNamedMethod(env, binding, "close", FsClose);
   SetNamedMethod(env, binding, "access", FsAccess);
   SetNamedMethod(env, binding, "stat", FsStat);
   SetNamedMethod(env, binding, "lstat", FsLstat);
   SetNamedMethod(env, binding, "fstat", FsFstat);
   SetNamedMethod(env, binding, "statfs", FsStatfs);
+  SetNamedMethod(env, binding, "readdir", FsReaddir);
   SetNamedMethod(env, binding, "read", FsRead);
   SetNamedMethod(env, binding, "readBuffers", FsReadBuffers);
   SetNamedMethod(env, binding, "writeBuffer", FsWriteBuffer);
@@ -1318,6 +1700,7 @@ napi_value ResolveFs(napi_env env, const ResolveOptions& options) {
   SetNamedMethod(env, binding, "cpSyncCheckPaths", FsCpSyncCheckPaths);
   SetNamedMethod(env, binding, "cpSyncOverrideFile", FsCpSyncOverrideFile);
   SetNamedMethod(env, binding, "cpSyncCopyDir", FsCpSyncCopyDir);
+  SetNamedMethod(env, binding, "mkdtemp", FsMkdtemp);
   SetNamedMethod(env, binding, "link", FsLink);
   SetNamedMethod(env, binding, "fdatasync", FsFdatasync);
   SetNamedMethod(env, binding, "chown", FsUnsupportedChown);

@@ -4,6 +4,7 @@
 #include <unordered_map>
 
 #include "internal_binding/helpers.h"
+#include "../ubi_module_loader.h"
 
 namespace internal_binding {
 
@@ -183,9 +184,10 @@ napi_value GetVmDynamicImportDefaultInternalSymbol(napi_env env) {
   napi_value global = GetGlobal(env);
   if (global == nullptr) return Undefined(env);
 
-  napi_value internal_binding = nullptr;
-  if (napi_get_named_property(env, global, "internalBinding", &internal_binding) != napi_ok ||
-      !IsFunctionValue(env, internal_binding)) {
+  napi_value internal_binding = UbiGetInternalBinding(env);
+  if (!IsFunctionValue(env, internal_binding) &&
+      (napi_get_named_property(env, global, "internalBinding", &internal_binding) != napi_ok ||
+       !IsFunctionValue(env, internal_binding))) {
     return Undefined(env);
   }
 

@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <unordered_map>
 
 #if !defined(_WIN32)
 #include <arpa/inet.h>
@@ -25,6 +26,51 @@
 namespace {
 bool g_has_simulated_priority = false;
 int g_simulated_priority = 0;
+
+struct OsBindingState {
+  napi_ref get_home_directory_override_ref = nullptr;
+  napi_ref get_home_directory_trampoline_ref = nullptr;
+};
+
+std::unordered_map<napi_env, OsBindingState> g_os_binding_states;
+std::unordered_map<napi_env, bool> g_os_binding_cleanup_hooks;
+
+void ResetRef(napi_env env, napi_ref* ref_ptr) {
+  if (ref_ptr == nullptr || *ref_ptr == nullptr) return;
+  napi_delete_reference(env, *ref_ptr);
+  *ref_ptr = nullptr;
+}
+
+napi_value GetRefValue(napi_env env, napi_ref ref) {
+  if (ref == nullptr) return nullptr;
+  napi_value out = nullptr;
+  if (napi_get_reference_value(env, ref, &out) != napi_ok || out == nullptr) return nullptr;
+  return out;
+}
+
+bool IsFunctionValue(napi_env env, napi_value value) {
+  if (value == nullptr) return false;
+  napi_valuetype type = napi_undefined;
+  return napi_typeof(env, value, &type) == napi_ok && type == napi_function;
+}
+
+void CleanupOsBindingState(void* arg) {
+  napi_env env = static_cast<napi_env>(arg);
+  auto it = g_os_binding_states.find(env);
+  if (it != g_os_binding_states.end()) {
+    ResetRef(env, &it->second.get_home_directory_override_ref);
+    ResetRef(env, &it->second.get_home_directory_trampoline_ref);
+    g_os_binding_states.erase(it);
+  }
+  g_os_binding_cleanup_hooks.erase(env);
+}
+
+void EnsureOsBindingCleanupHook(napi_env env) {
+  if (g_os_binding_cleanup_hooks.find(env) != g_os_binding_cleanup_hooks.end()) return;
+  if (napi_add_env_cleanup_hook(env, CleanupOsBindingState, env) == napi_ok) {
+    g_os_binding_cleanup_hooks[env] = true;
+  }
+}
 
 int NormalizePriorityPid(int32_t pid) {
   // In Node.js APIs, pid=0 means current process.
@@ -242,6 +288,68 @@ napi_value BindingGetHomeDirectory(napi_env env, napi_callback_info info) {
   napi_value out = nullptr;
   if (napi_create_string_utf8(env, home.data(), len, &out) != napi_ok) return nullptr;
   return out;
+}
+
+napi_value BindingGetHomeDirectoryTrampoline(napi_env env, napi_callback_info info) {
+  EnsureOsBindingCleanupHook(env);
+  auto& state = g_os_binding_states[env];
+
+  napi_value override_fn = GetRefValue(env, state.get_home_directory_override_ref);
+  if (IsFunctionValue(env, override_fn)) {
+    size_t argc = 1;
+    napi_value argv[1] = {nullptr};
+    napi_value this_arg = nullptr;
+    if (napi_get_cb_info(env, info, &argc, argv, &this_arg, nullptr) != napi_ok) {
+      return nullptr;
+    }
+    if (this_arg == nullptr) {
+      napi_get_global(env, &this_arg);
+    }
+    napi_value out = nullptr;
+    if (napi_call_function(env, this_arg, override_fn, argc, argv, &out) != napi_ok) {
+      return nullptr;
+    }
+    return out;
+  }
+
+  return BindingGetHomeDirectory(env, info);
+}
+
+napi_value BindingGetHomeDirectoryGetter(napi_env env, napi_callback_info info) {
+  EnsureOsBindingCleanupHook(env);
+  auto& state = g_os_binding_states[env];
+  napi_value fn = GetRefValue(env, state.get_home_directory_trampoline_ref);
+  if (fn != nullptr) return fn;
+
+  if (napi_create_function(
+          env, "getHomeDirectory", NAPI_AUTO_LENGTH, BindingGetHomeDirectoryTrampoline, nullptr, &fn) != napi_ok ||
+      fn == nullptr) {
+    return nullptr;
+  }
+  if (napi_create_reference(env, fn, 1, &state.get_home_directory_trampoline_ref) != napi_ok) {
+    return nullptr;
+  }
+  return fn;
+}
+
+napi_value BindingGetHomeDirectorySetter(napi_env env, napi_callback_info info) {
+  EnsureOsBindingCleanupHook(env);
+  auto& state = g_os_binding_states[env];
+
+  size_t argc = 1;
+  napi_value argv[1] = {nullptr};
+  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok) {
+    return nullptr;
+  }
+
+  ResetRef(env, &state.get_home_directory_override_ref);
+  if (argc >= 1 && IsFunctionValue(env, argv[0])) {
+    napi_create_reference(env, argv[0], 1, &state.get_home_directory_override_ref);
+  }
+
+  napi_value undefined = nullptr;
+  napi_get_undefined(env, &undefined);
+  return undefined;
 }
 
 napi_value BindingGetOSInformation(napi_env env, napi_callback_info info) {
@@ -823,10 +931,11 @@ napi_value UbiInstallOsBinding(napi_env env) {
     return nullptr;
   }
 
+  EnsureOsBindingCleanupHook(env);
+
   SetMethod(env, binding, "getAvailableParallelism", BindingGetAvailableParallelism);
   SetMethod(env, binding, "getCPUs", BindingGetCPUs);
   SetMethod(env, binding, "getFreeMem", BindingGetFreeMem);
-  SetMethod(env, binding, "getHomeDirectory", BindingGetHomeDirectory);
   SetMethod(env, binding, "getHostname", BindingGetHostname);
   SetMethod(env, binding, "getInterfaceAddresses", BindingGetInterfaceAddresses);
   SetMethod(env, binding, "getLoadAvg", BindingGetLoadAvg);
@@ -837,6 +946,19 @@ napi_value UbiInstallOsBinding(napi_env env) {
   SetMethod(env, binding, "getUserInfo", BindingGetUserInfo);
   SetMethod(env, binding, "setPriority", BindingSetPriority);
   SetNamedBool(env, binding, "isBigEndian", IsBigEndian());
+
+  napi_property_descriptor home_dir_prop = napi_property_descriptor{
+      "getHomeDirectory",
+      nullptr,
+      nullptr,
+      BindingGetHomeDirectoryGetter,
+      BindingGetHomeDirectorySetter,
+      nullptr,
+      napi_default,
+      nullptr};
+  if (napi_define_properties(env, binding, 1, &home_dir_prop) != napi_ok) {
+    return nullptr;
+  }
 
   return binding;
 }

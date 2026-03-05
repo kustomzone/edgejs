@@ -9,6 +9,7 @@ namespace internal_binding {
 
 napi_value ResolveAsyncWrap(napi_env env, const ResolveOptions& options);
 napi_value ResolveAsyncContextFrame(napi_env env, const ResolveOptions& options);
+napi_value ResolveBlockList(napi_env env, const ResolveOptions& options);
 napi_value ResolveBlob(napi_env env, const ResolveOptions& options);
 napi_value ResolveBuffer(napi_env env, const ResolveOptions& options);
 napi_value ResolveBuiltins(napi_env env, const ResolveOptions& options);
@@ -24,6 +25,7 @@ napi_value ResolveFsEventWrap(napi_env env, const ResolveOptions& options);
 napi_value ResolveFs(napi_env env, const ResolveOptions& options);
 napi_value ResolveHeapUtils(napi_env env, const ResolveOptions& options);
 napi_value ResolveHttpParser(napi_env env, const ResolveOptions& options);
+napi_value ResolveJsStream(napi_env env, const ResolveOptions& options);
 napi_value ResolveInternalOnlyV8(napi_env env, const ResolveOptions& options);
 napi_value ResolveModuleWrap(napi_env env, const ResolveOptions& options);
 napi_value ResolveModules(napi_env env, const ResolveOptions& options);
@@ -45,6 +47,7 @@ napi_value ResolveStringDecoder(napi_env env, const ResolveOptions& options);
 napi_value ResolveSymbols(napi_env env, const ResolveOptions& options);
 napi_value ResolveTaskQueue(napi_env env, const ResolveOptions& options);
 napi_value ResolveTcpWrap(napi_env env, const ResolveOptions& options);
+napi_value ResolveTlsWrap(napi_env env, const ResolveOptions& options);
 napi_value ResolveTimers(napi_env env, const ResolveOptions& options);
 napi_value ResolveTraceEvents(napi_env env, const ResolveOptions& options);
 napi_value ResolveTtyWrap(napi_env env, const ResolveOptions& options);
@@ -68,9 +71,10 @@ struct BindingResolverEntry {
   ResolverFn resolver;
 };
 
-constexpr std::array<BindingResolverEntry, 51> kResolvers = {{
+constexpr std::array<BindingResolverEntry, 54> kResolvers = {{
     {"async_wrap", ResolveAsyncWrap},
     {"async_context_frame", ResolveAsyncContextFrame},
+    {"block_list", ResolveBlockList},
     {"blob", ResolveBlob},
     {"buffer", ResolveBuffer},
     {"builtins", ResolveBuiltins},
@@ -86,6 +90,7 @@ constexpr std::array<BindingResolverEntry, 51> kResolvers = {{
     {"fs", ResolveFs},
     {"heap_utils", ResolveHeapUtils},
     {"http_parser", ResolveHttpParser},
+    {"js_stream", ResolveJsStream},
     {"internal_only_v8", ResolveInternalOnlyV8},
     {"module_wrap", ResolveModuleWrap},
     {"modules", ResolveModules},
@@ -107,6 +112,7 @@ constexpr std::array<BindingResolverEntry, 51> kResolvers = {{
     {"symbols", ResolveSymbols},
     {"task_queue", ResolveTaskQueue},
     {"tcp_wrap", ResolveTcpWrap},
+    {"tls_wrap", ResolveTlsWrap},
     {"timers", ResolveTimers},
     {"trace_events", ResolveTraceEvents},
     {"tty_wrap", ResolveTtyWrap},
