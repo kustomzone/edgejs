@@ -2,11 +2,14 @@
 
 #include <ctime>
 #include <cstdio>
+#include <cstdlib>
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <new>
 #include <optional>
 #include <unordered_map>
+#include <vector>
 
 #include <libplatform/libplatform.h>
 
@@ -147,6 +150,403 @@ void PromiseRejectCallback(v8::PromiseRejectMessage message) {
   }
 }
 
+v8::Local<v8::String> OneByteString(v8::Isolate* isolate, const char* value) {
+  return v8::String::NewFromUtf8(isolate, value, v8::NewStringType::kInternalized)
+      .ToLocalChecked();
+}
+
+bool ReadArrayBufferViewBytes(v8::Local<v8::Value> value,
+                              const uint8_t** data_out,
+                              size_t* size_out) {
+  if (data_out == nullptr || size_out == nullptr || value.IsEmpty() || !value->IsArrayBufferView()) {
+    return false;
+  }
+  v8::Local<v8::ArrayBufferView> view = value.As<v8::ArrayBufferView>();
+  std::shared_ptr<v8::BackingStore> store = view->Buffer()->GetBackingStore();
+  if (!store || store->Data() == nullptr) {
+    *data_out = nullptr;
+    *size_out = 0;
+    return true;
+  }
+  *data_out = static_cast<const uint8_t*>(store->Data()) + view->ByteOffset();
+  *size_out = view->ByteLength();
+  return true;
+}
+
+class SerializerContext {
+ public:
+  SerializerContext(napi_env env, v8::Local<v8::Object> wrap)
+      : env_(env), isolate_(env->isolate), serializer_(isolate_) {
+    wrap_.Reset(isolate_, wrap);
+    wrap_.SetWeak(this, WeakCallback, v8::WeakCallbackType::kParameter);
+  }
+
+  ~SerializerContext() { wrap_.Reset(); }
+
+  static void New(const v8::FunctionCallbackInfo<v8::Value>& args) {
+    v8::Isolate* isolate = args.GetIsolate();
+    if (!args.IsConstructCall()) {
+      isolate->ThrowException(v8::Exception::TypeError(
+          OneByteString(isolate, "Class constructor Serializer cannot be invoked without 'new'")));
+      return;
+    }
+    if (!args.Data()->IsExternal()) {
+      isolate->ThrowException(v8::Exception::Error(
+          OneByteString(isolate, "Internal serializer constructor state missing")));
+      return;
+    }
+
+    auto* env = static_cast<napi_env>(v8::Local<v8::External>::Cast(args.Data())->Value());
+    if (env == nullptr) {
+      isolate->ThrowException(v8::Exception::Error(
+          OneByteString(isolate, "Internal serializer environment missing")));
+      return;
+    }
+
+    auto* ctx = new SerializerContext(env, args.This());
+    args.This()->SetAlignedPointerInInternalField(0, ctx);
+  }
+
+  static void WriteHeader(const v8::FunctionCallbackInfo<v8::Value>& args) {
+    SerializerContext* ctx = Unwrap(args);
+    if (ctx == nullptr) return;
+    ctx->serializer_.WriteHeader();
+  }
+
+  static void WriteValue(const v8::FunctionCallbackInfo<v8::Value>& args) {
+    SerializerContext* ctx = Unwrap(args);
+    if (ctx == nullptr) return;
+    v8::Local<v8::Value> value = args.Length() >= 1 ? args[0] : v8::Undefined(ctx->isolate_);
+    bool ret = false;
+    if (ctx->serializer_.WriteValue(ctx->env_->context(), value).To(&ret)) {
+      args.GetReturnValue().Set(ret);
+    }
+  }
+
+  static void SetTreatArrayBufferViewsAsHostObjects(
+      const v8::FunctionCallbackInfo<v8::Value>& args) {
+    SerializerContext* ctx = Unwrap(args);
+    if (ctx == nullptr) return;
+    (void)args;
+    // Intentionally a no-op: keep V8 default ArrayBufferView serialization.
+  }
+
+  static void ReleaseBuffer(const v8::FunctionCallbackInfo<v8::Value>& args) {
+    SerializerContext* ctx = Unwrap(args);
+    if (ctx == nullptr) return;
+
+    std::pair<uint8_t*, size_t> serialized = ctx->serializer_.Release();
+    v8::Isolate* isolate = ctx->isolate_;
+    v8::HandleScope handle_scope(isolate);
+    v8::Local<v8::Context> context = ctx->env_->context();
+    v8::Context::Scope context_scope(context);
+
+    auto backing_store = v8::ArrayBuffer::NewBackingStore(
+        serialized.first,
+        serialized.second,
+        [](void* data, size_t, void*) { std::free(data); },
+        nullptr);
+    if (!backing_store) {
+      std::free(serialized.first);
+      return;
+    }
+    v8::Local<v8::ArrayBuffer> ab =
+        v8::ArrayBuffer::New(isolate, std::move(backing_store));
+    v8::Local<v8::Uint8Array> view =
+        v8::Uint8Array::New(ab, 0, serialized.second);
+
+    v8::Local<v8::Value> buffer_ctor;
+    if (context->Global()->Get(context, OneByteString(isolate, "Buffer")).ToLocal(&buffer_ctor) &&
+        buffer_ctor->IsFunction()) {
+      v8::Local<v8::Value> from_val;
+      if (buffer_ctor.As<v8::Object>()->Get(context, OneByteString(isolate, "from")).ToLocal(&from_val) &&
+          from_val->IsFunction()) {
+        v8::Local<v8::Value> argv[1] = {view};
+        v8::Local<v8::Value> out;
+        if (from_val.As<v8::Function>()->Call(context, buffer_ctor, 1, argv).ToLocal(&out)) {
+          args.GetReturnValue().Set(out);
+          return;
+        }
+      }
+    }
+
+    args.GetReturnValue().Set(view);
+  }
+
+  static void TransferArrayBuffer(const v8::FunctionCallbackInfo<v8::Value>& args) {
+    SerializerContext* ctx = Unwrap(args);
+    if (ctx == nullptr) return;
+    if (args.Length() < 2) return;
+
+    uint32_t id = 0;
+    if (!args[0]->Uint32Value(ctx->env_->context()).To(&id)) return;
+
+    if (!args[1]->IsArrayBuffer()) {
+      ctx->isolate_->ThrowException(v8::Exception::TypeError(
+          OneByteString(ctx->isolate_, "arrayBuffer must be an ArrayBuffer")));
+      return;
+    }
+    ctx->serializer_.TransferArrayBuffer(id, args[1].As<v8::ArrayBuffer>());
+  }
+
+  static void WriteUint32(const v8::FunctionCallbackInfo<v8::Value>& args) {
+    SerializerContext* ctx = Unwrap(args);
+    if (ctx == nullptr || args.Length() < 1) return;
+    uint32_t value = 0;
+    if (args[0]->Uint32Value(ctx->env_->context()).To(&value)) {
+      ctx->serializer_.WriteUint32(value);
+    }
+  }
+
+  static void WriteUint64(const v8::FunctionCallbackInfo<v8::Value>& args) {
+    SerializerContext* ctx = Unwrap(args);
+    if (ctx == nullptr || args.Length() < 2) return;
+    uint32_t hi = 0;
+    uint32_t lo = 0;
+    if (!args[0]->Uint32Value(ctx->env_->context()).To(&hi) ||
+        !args[1]->Uint32Value(ctx->env_->context()).To(&lo)) {
+      return;
+    }
+    ctx->serializer_.WriteUint64((static_cast<uint64_t>(hi) << 32) | static_cast<uint64_t>(lo));
+  }
+
+  static void WriteDouble(const v8::FunctionCallbackInfo<v8::Value>& args) {
+    SerializerContext* ctx = Unwrap(args);
+    if (ctx == nullptr || args.Length() < 1) return;
+    double value = 0;
+    if (args[0]->NumberValue(ctx->env_->context()).To(&value)) {
+      ctx->serializer_.WriteDouble(value);
+    }
+  }
+
+  static void WriteRawBytes(const v8::FunctionCallbackInfo<v8::Value>& args) {
+    SerializerContext* ctx = Unwrap(args);
+    if (ctx == nullptr || args.Length() < 1) return;
+    const uint8_t* data = nullptr;
+    size_t size = 0;
+    if (!ReadArrayBufferViewBytes(args[0], &data, &size)) {
+      ctx->isolate_->ThrowException(v8::Exception::TypeError(
+          OneByteString(ctx->isolate_, "source must be a TypedArray or a DataView")));
+      return;
+    }
+    ctx->serializer_.WriteRawBytes(data, size);
+  }
+
+ private:
+  static SerializerContext* Unwrap(const v8::FunctionCallbackInfo<v8::Value>& args) {
+    if (args.This().IsEmpty() || args.This()->InternalFieldCount() < 1) return nullptr;
+    return static_cast<SerializerContext*>(args.This()->GetAlignedPointerFromInternalField(0));
+  }
+
+  static void WeakCallback(const v8::WeakCallbackInfo<SerializerContext>& info) {
+    delete info.GetParameter();
+  }
+
+  napi_env env_;
+  v8::Isolate* isolate_;
+  v8::Global<v8::Object> wrap_;
+  v8::ValueSerializer serializer_;
+};
+
+class DeserializerContext {
+ public:
+  DeserializerContext(napi_env env,
+                      v8::Local<v8::Object> wrap,
+                      v8::Local<v8::Value> buffer)
+      : env_(env), isolate_(env->isolate) {
+    const uint8_t* data = nullptr;
+    size_t size = 0;
+    if (!ReadArrayBufferViewBytes(buffer, &data, &size)) return;
+    if (data != nullptr && size > 0) {
+      data_.assign(data, data + size);
+    }
+    deserializer_ = std::make_unique<v8::ValueDeserializer>(
+        isolate_, data_.empty() ? nullptr : data_.data(), data_.size());
+
+    wrap_.Reset(isolate_, wrap);
+    wrap_.SetWeak(this, WeakCallback, v8::WeakCallbackType::kParameter);
+
+    v8::Local<v8::Context> context = env_->context();
+    v8::Context::Scope context_scope(context);
+    (void)wrap->Set(context, OneByteString(isolate_, "buffer"), buffer);
+  }
+
+  ~DeserializerContext() {
+    wrap_.Reset();
+    deserializer_.reset();
+  }
+
+  static void New(const v8::FunctionCallbackInfo<v8::Value>& args) {
+    v8::Isolate* isolate = args.GetIsolate();
+    if (!args.IsConstructCall()) {
+      isolate->ThrowException(v8::Exception::TypeError(
+          OneByteString(isolate, "Class constructor Deserializer cannot be invoked without 'new'")));
+      return;
+    }
+    if (!args.Data()->IsExternal()) {
+      isolate->ThrowException(v8::Exception::Error(
+          OneByteString(isolate, "Internal deserializer constructor state missing")));
+      return;
+    }
+    if (args.Length() < 1 || !args[0]->IsArrayBufferView()) {
+      isolate->ThrowException(v8::Exception::TypeError(
+          OneByteString(isolate, "buffer must be a TypedArray or a DataView")));
+      return;
+    }
+
+    auto* env = static_cast<napi_env>(v8::Local<v8::External>::Cast(args.Data())->Value());
+    if (env == nullptr) {
+      isolate->ThrowException(v8::Exception::Error(
+          OneByteString(isolate, "Internal deserializer environment missing")));
+      return;
+    }
+    auto* ctx = new DeserializerContext(env, args.This(), args[0]);
+    args.This()->SetAlignedPointerInInternalField(0, ctx);
+  }
+
+  static void ReadHeader(const v8::FunctionCallbackInfo<v8::Value>& args) {
+    DeserializerContext* ctx = Unwrap(args);
+    if (ctx == nullptr || !ctx->deserializer_) return;
+    bool ok = false;
+    if (ctx->deserializer_->ReadHeader(ctx->env_->context()).To(&ok)) {
+      args.GetReturnValue().Set(ok);
+    }
+  }
+
+  static void ReadValue(const v8::FunctionCallbackInfo<v8::Value>& args) {
+    DeserializerContext* ctx = Unwrap(args);
+    if (ctx == nullptr || !ctx->deserializer_) return;
+    v8::Local<v8::Value> out;
+    if (ctx->deserializer_->ReadValue(ctx->env_->context()).ToLocal(&out)) {
+      args.GetReturnValue().Set(out);
+    }
+  }
+
+  static void TransferArrayBuffer(const v8::FunctionCallbackInfo<v8::Value>& args) {
+    DeserializerContext* ctx = Unwrap(args);
+    if (ctx == nullptr || !ctx->deserializer_ || args.Length() < 2) return;
+    uint32_t id = 0;
+    if (!args[0]->Uint32Value(ctx->env_->context()).To(&id)) return;
+    if (!args[1]->IsArrayBuffer()) {
+      ctx->isolate_->ThrowException(v8::Exception::TypeError(
+          OneByteString(ctx->isolate_, "arrayBuffer must be an ArrayBuffer")));
+      return;
+    }
+    ctx->deserializer_->TransferArrayBuffer(id, args[1].As<v8::ArrayBuffer>());
+  }
+
+  static void GetWireFormatVersion(const v8::FunctionCallbackInfo<v8::Value>& args) {
+    DeserializerContext* ctx = Unwrap(args);
+    if (ctx == nullptr || !ctx->deserializer_) return;
+    args.GetReturnValue().Set(v8::Integer::NewFromUnsigned(
+        ctx->isolate_, ctx->deserializer_->GetWireFormatVersion()));
+  }
+
+  static void ReadUint32(const v8::FunctionCallbackInfo<v8::Value>& args) {
+    DeserializerContext* ctx = Unwrap(args);
+    if (ctx == nullptr || !ctx->deserializer_) return;
+    uint32_t value = 0;
+    if (!ctx->deserializer_->ReadUint32(&value)) {
+      ctx->isolate_->ThrowException(v8::Exception::Error(
+          OneByteString(ctx->isolate_, "ReadUint32() failed")));
+      return;
+    }
+    args.GetReturnValue().Set(v8::Integer::NewFromUnsigned(ctx->isolate_, value));
+  }
+
+  static void ReadUint64(const v8::FunctionCallbackInfo<v8::Value>& args) {
+    DeserializerContext* ctx = Unwrap(args);
+    if (ctx == nullptr || !ctx->deserializer_) return;
+    uint64_t value = 0;
+    if (!ctx->deserializer_->ReadUint64(&value)) {
+      ctx->isolate_->ThrowException(v8::Exception::Error(
+          OneByteString(ctx->isolate_, "ReadUint64() failed")));
+      return;
+    }
+    const uint32_t hi = static_cast<uint32_t>(value >> 32);
+    const uint32_t lo = static_cast<uint32_t>(value);
+    v8::Local<v8::Value> vals[2] = {
+        v8::Integer::NewFromUnsigned(ctx->isolate_, hi),
+        v8::Integer::NewFromUnsigned(ctx->isolate_, lo),
+    };
+    args.GetReturnValue().Set(v8::Array::New(ctx->isolate_, vals, 2));
+  }
+
+  static void ReadDouble(const v8::FunctionCallbackInfo<v8::Value>& args) {
+    DeserializerContext* ctx = Unwrap(args);
+    if (ctx == nullptr || !ctx->deserializer_) return;
+    double value = 0;
+    if (!ctx->deserializer_->ReadDouble(&value)) {
+      ctx->isolate_->ThrowException(v8::Exception::Error(
+          OneByteString(ctx->isolate_, "ReadDouble() failed")));
+      return;
+    }
+    args.GetReturnValue().Set(value);
+  }
+
+  static void ReadRawBytes(const v8::FunctionCallbackInfo<v8::Value>& args) {
+    DeserializerContext* ctx = Unwrap(args);
+    if (ctx == nullptr || !ctx->deserializer_ || args.Length() < 1) return;
+
+    int64_t requested = 0;
+    if (!args[0]->IntegerValue(ctx->env_->context()).To(&requested) || requested < 0) {
+      return;
+    }
+    const size_t length = static_cast<size_t>(requested);
+
+    const void* read_ptr = nullptr;
+    if (!ctx->deserializer_->ReadRawBytes(length, &read_ptr)) {
+      ctx->isolate_->ThrowException(v8::Exception::Error(
+          OneByteString(ctx->isolate_, "ReadRawBytes() failed")));
+      return;
+    }
+    const uint8_t* pos = static_cast<const uint8_t*>(read_ptr);
+    const uint8_t* base = ctx->data_.empty() ? nullptr : ctx->data_.data();
+    if (base == nullptr || pos < base || pos + length > base + ctx->data_.size()) {
+      ctx->isolate_->ThrowException(v8::Exception::Error(
+          OneByteString(ctx->isolate_, "ReadRawBytes() returned out-of-range data")));
+      return;
+    }
+    const uint32_t offset = static_cast<uint32_t>(pos - base);
+    args.GetReturnValue().Set(v8::Integer::NewFromUnsigned(ctx->isolate_, offset));
+  }
+
+ private:
+  static DeserializerContext* Unwrap(const v8::FunctionCallbackInfo<v8::Value>& args) {
+    if (args.This().IsEmpty() || args.This()->InternalFieldCount() < 1) return nullptr;
+    return static_cast<DeserializerContext*>(args.This()->GetAlignedPointerFromInternalField(0));
+  }
+
+  static void WeakCallback(const v8::WeakCallbackInfo<DeserializerContext>& info) {
+    delete info.GetParameter();
+  }
+
+  napi_env env_;
+  v8::Isolate* isolate_;
+  v8::Global<v8::Object> wrap_;
+  std::vector<uint8_t> data_;
+  std::unique_ptr<v8::ValueDeserializer> deserializer_;
+};
+
+void SetProtoMethod(v8::Isolate* isolate,
+                    v8::Local<v8::FunctionTemplate> tmpl,
+                    const char* name,
+                    v8::FunctionCallback callback) {
+  tmpl->PrototypeTemplate()->Set(
+      isolate,
+      name,
+      v8::FunctionTemplate::New(isolate, callback));
+}
+
+bool SetConstructorFunction(v8::Local<v8::Context> context,
+                            v8::Local<v8::Object> target,
+                            const char* name,
+                            v8::Local<v8::FunctionTemplate> tmpl) {
+  v8::Local<v8::Function> ctor;
+  if (!tmpl->GetFunction(context).ToLocal(&ctor)) return false;
+  return target->Set(context, OneByteString(context->GetIsolate(), name), ctor).FromMaybe(false);
+}
+
 }  // namespace
 
 extern "C" {
@@ -240,8 +640,9 @@ napi_status NAPI_CDECL unofficial_napi_release_env(void* scope_ptr) {
 
 napi_status NAPI_CDECL unofficial_napi_request_gc_for_testing(napi_env env) {
   if (env == nullptr || env->isolate == nullptr) return napi_invalid_arg;
-  env->isolate->RequestGarbageCollectionForTesting(
-      v8::Isolate::GarbageCollectionType::kFullGarbageCollection);
+  // Avoid hard dependency on V8's --expose-gc runtime flag while still
+  // requesting aggressive reclamation behavior for tests.
+  env->isolate->LowMemoryNotification();
   env->isolate->PerformMicrotaskCheckpoint();
   return napi_ok;
 }
@@ -457,6 +858,58 @@ napi_status NAPI_CDECL unofficial_napi_notify_datetime_configuration_change(napi
   env->isolate->DateTimeConfigurationChangeNotification(
       v8::Isolate::TimeZoneDetection::kRedetect);
   return napi_ok;
+}
+
+napi_status NAPI_CDECL unofficial_napi_create_serdes_binding(napi_env env,
+                                                             napi_value* result_out) {
+  if (env == nullptr || env->isolate == nullptr || result_out == nullptr) return napi_invalid_arg;
+
+  v8::Isolate* isolate = env->isolate;
+  v8::HandleScope handle_scope(isolate);
+  v8::Local<v8::Context> context = env->context();
+  v8::Context::Scope context_scope(context);
+
+  v8::Local<v8::Object> target = v8::Object::New(isolate);
+  v8::Local<v8::External> env_data = v8::External::New(isolate, env);
+
+  v8::Local<v8::FunctionTemplate> serializer_tmpl =
+      v8::FunctionTemplate::New(isolate, SerializerContext::New, env_data);
+  serializer_tmpl->InstanceTemplate()->SetInternalFieldCount(1);
+  SetProtoMethod(isolate, serializer_tmpl, "writeHeader", SerializerContext::WriteHeader);
+  SetProtoMethod(isolate, serializer_tmpl, "writeValue", SerializerContext::WriteValue);
+  SetProtoMethod(isolate, serializer_tmpl, "releaseBuffer", SerializerContext::ReleaseBuffer);
+  SetProtoMethod(isolate, serializer_tmpl, "transferArrayBuffer", SerializerContext::TransferArrayBuffer);
+  SetProtoMethod(isolate, serializer_tmpl, "writeUint32", SerializerContext::WriteUint32);
+  SetProtoMethod(isolate, serializer_tmpl, "writeUint64", SerializerContext::WriteUint64);
+  SetProtoMethod(isolate, serializer_tmpl, "writeDouble", SerializerContext::WriteDouble);
+  SetProtoMethod(isolate, serializer_tmpl, "writeRawBytes", SerializerContext::WriteRawBytes);
+  SetProtoMethod(isolate,
+                 serializer_tmpl,
+                 "_setTreatArrayBufferViewsAsHostObjects",
+                 SerializerContext::SetTreatArrayBufferViewsAsHostObjects);
+  if (!SetConstructorFunction(context, target, "Serializer", serializer_tmpl)) {
+    return napi_generic_failure;
+  }
+
+  v8::Local<v8::FunctionTemplate> deserializer_tmpl =
+      v8::FunctionTemplate::New(isolate, DeserializerContext::New, env_data);
+  deserializer_tmpl->InstanceTemplate()->SetInternalFieldCount(1);
+  SetProtoMethod(isolate, deserializer_tmpl, "readHeader", DeserializerContext::ReadHeader);
+  SetProtoMethod(isolate, deserializer_tmpl, "readValue", DeserializerContext::ReadValue);
+  SetProtoMethod(
+      isolate, deserializer_tmpl, "getWireFormatVersion", DeserializerContext::GetWireFormatVersion);
+  SetProtoMethod(
+      isolate, deserializer_tmpl, "transferArrayBuffer", DeserializerContext::TransferArrayBuffer);
+  SetProtoMethod(isolate, deserializer_tmpl, "readUint32", DeserializerContext::ReadUint32);
+  SetProtoMethod(isolate, deserializer_tmpl, "readUint64", DeserializerContext::ReadUint64);
+  SetProtoMethod(isolate, deserializer_tmpl, "readDouble", DeserializerContext::ReadDouble);
+  SetProtoMethod(isolate, deserializer_tmpl, "_readRawBytes", DeserializerContext::ReadRawBytes);
+  if (!SetConstructorFunction(context, target, "Deserializer", deserializer_tmpl)) {
+    return napi_generic_failure;
+  }
+
+  *result_out = napi_v8_wrap_value(env, target);
+  return (*result_out == nullptr) ? napi_generic_failure : napi_ok;
 }
 
 }  // extern "C"

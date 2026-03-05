@@ -195,9 +195,7 @@ bool IsInternalScriptName(std::string_view script_name) {
   if (script_name.empty()) return false;
   if (script_name.rfind("node:", 0) == 0) return true;
   return script_name.find("/node-lib/") != std::string::npos ||
-         script_name.find("\\node-lib\\") != std::string::npos ||
-         script_name.find("/ubi/src/builtins/") != std::string::npos ||
-         script_name.find("\\ubi\\src\\builtins\\") != std::string::npos;
+         script_name.find("\\node-lib\\") != std::string::npos;
 }
 
 static uint32_t GetUVHandleTypeCode(uv_handle_type type) {

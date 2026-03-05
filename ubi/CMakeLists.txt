@@ -245,11 +245,13 @@ if(UBI_NAPI_PROVIDER STREQUAL "bundled-v8")
 endif()
 
 add_library(ubi_runtime STATIC
+  src/builtin_catalog.cc
   src/ubi_runtime.cc
   src/ubi_runtime_platform_v8.cc
   src/ubi_process.cc
   src/ubi_module_loader.cc
   src/internal_binding/dispatch.cc
+  src/internal_binding/binding_async_context_frame.cc
   src/internal_binding/binding_async_wrap.cc
   src/internal_binding/binding_blob.cc
   src/internal_binding/binding_buffer.cc
@@ -262,8 +264,11 @@ add_library(ubi_runtime STATIC
   src/internal_binding/binding_crypto.cc
   src/internal_binding/binding_encoding_binding.cc
   src/internal_binding/binding_errors.cc
+  src/internal_binding/binding_fs_event_wrap.cc
   src/internal_binding/binding_fs.cc
+  src/internal_binding/binding_heap_utils.cc
   src/internal_binding/binding_http_parser.cc
+  src/internal_binding/binding_internal_only_v8.cc
   src/internal_binding/binding_module_wrap.cc
   src/internal_binding/binding_modules.cc
   src/internal_binding/binding_messaging.cc
@@ -276,6 +281,7 @@ add_library(ubi_runtime STATIC
   src/internal_binding/binding_process_methods.cc
   src/internal_binding/binding_process_wrap.cc
   src/internal_binding/binding_report.cc
+  src/internal_binding/binding_serdes.cc
   src/internal_binding/binding_signal_wrap.cc
   src/internal_binding/binding_spawn_sync.cc
   src/internal_binding/binding_stream_wrap.cc
@@ -291,9 +297,11 @@ add_library(ubi_runtime STATIC
   src/internal_binding/binding_url.cc
   src/internal_binding/binding_url_pattern.cc
   src/internal_binding/binding_util.cc
+  src/internal_binding/binding_v8.cc
   src/internal_binding/binding_uv.cc
   src/internal_binding/binding_wasm_web_api.cc
   src/internal_binding/binding_worker.cc
+  src/internal_binding/binding_zlib.cc
   src/ubi_errors_binding.cc
   "${PROJECT_ROOT}/deps/llhttp/src/api.c"
   "${PROJECT_ROOT}/deps/llhttp/src/http.c"

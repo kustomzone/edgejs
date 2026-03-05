@@ -277,6 +277,34 @@ v8::Local<v8::Object> CreateBufferObject(napi_env env,
                                          size_t offset,
                                          size_t length) {
   v8::Local<v8::ArrayBuffer> ab = v8::ArrayBuffer::New(env->isolate, backing_store);
+  v8::Local<v8::Context> context = env->context();
+  v8::Local<v8::Object> global = context->Global();
+
+  // Node's napi_create_buffer* APIs produce Buffer instances, not plain
+  // Uint8Array views. Prefer global Buffer.from(arrayBuffer, offset, length)
+  // when available so native bindings observe Node-compatible semantics.
+  v8::Local<v8::String> buffer_name = v8::String::NewFromUtf8Literal(env->isolate, "Buffer");
+  v8::Local<v8::Value> buffer_ctor_value;
+  if (global->Get(context, buffer_name).ToLocal(&buffer_ctor_value) && buffer_ctor_value->IsObject()) {
+    v8::Local<v8::Object> buffer_ctor = buffer_ctor_value.As<v8::Object>();
+    v8::Local<v8::String> from_name = v8::String::NewFromUtf8Literal(env->isolate, "from");
+    v8::Local<v8::Value> from_value;
+    if (buffer_ctor->Get(context, from_name).ToLocal(&from_value) && from_value->IsFunction()) {
+      v8::Local<v8::Function> from_fn = from_value.As<v8::Function>();
+      v8::Local<v8::Value> argv[3] = {
+          ab,
+          v8::Number::New(env->isolate, static_cast<double>(offset)),
+          v8::Number::New(env->isolate, static_cast<double>(length)),
+      };
+      v8::Local<v8::Value> maybe_buffer;
+      if (from_fn->Call(context, buffer_ctor, 3, argv).ToLocal(&maybe_buffer) &&
+          maybe_buffer->IsObject()) {
+        return maybe_buffer.As<v8::Object>();
+      }
+    }
+  }
+
+  // Fallback used during very early bootstrap before Buffer is available.
   return v8::Uint8Array::New(ab, offset, length);
 }
 

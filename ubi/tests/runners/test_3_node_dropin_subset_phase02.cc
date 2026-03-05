@@ -11,6 +11,7 @@
 #if defined(__APPLE__)
 #include <crt_externs.h>
 #endif
+#include <signal.h>
 #include <fcntl.h>
 #include <sys/file.h>
 #include <sys/wait.h>
@@ -21,9 +22,17 @@
 
 #include "test_env.h"
 #include "ubi_module_loader.h"
+#include "ubi_process_wrap.h"
 #include "ubi_runtime.h"
 
-class Test3NodeDropinSubsetPhase02 : public FixtureTestBase {};
+namespace {
+void BestEffortKillLeakedFixtureChildren();
+}  // namespace
+
+class Test3NodeDropinSubsetPhase02 : public FixtureTestBase {
+ protected:
+  static void TearDownTestSuite() { BestEffortKillLeakedFixtureChildren(); }
+};
 
 namespace {
 
@@ -348,6 +357,39 @@ std::filesystem::path ResolveUbiCliPathForRawSubprocess() {
   return fs::path("ubi");
 }
 
+std::string ShellSingleQuoted(std::string_view input) {
+  std::string out;
+  out.reserve(input.size() + 2);
+  out.push_back('\'');
+  for (char c : input) {
+    if (c == '\'') {
+      out += "'\\''";
+    } else {
+      out.push_back(c);
+    }
+  }
+  out.push_back('\'');
+  return out;
+}
+
+void BestEffortKillLeakedFixtureChildren() {
+#if defined(_WIN32)
+  return;
+#else
+  // Raw drop-in tests sometimes spawn detached fixture children that outlive
+  // their parent process tree. Reap known child_process fixture commands.
+  constexpr const char* kFixturePatterns[] = {
+      "node/test/fixtures/child-process-",
+      "node/test/fixtures/parent-process-nonpersistent",
+  };
+  for (const char* pattern : kFixturePatterns) {
+    const std::string cmd =
+        "/usr/bin/pkill -f " + ShellSingleQuoted(pattern) + " >/dev/null 2>&1 || true";
+    (void)std::system(cmd.c_str());
+  }
+#endif
+}
+
 int RunRawNodeTestScriptInSubprocess(const char* node_test_relative_path, std::string* error_out) {
 #if defined(NAPI_V8_NODE_ROOT_PATH) || defined(PROJECT_ROOT_PATH)
 #if defined(_WIN32)
@@ -369,13 +411,21 @@ int RunRawNodeTestScriptInSubprocess(const char* node_test_relative_path, std::s
   }
 
   if (child_pid == 0) {
+    // Put each raw-test subprocess tree in its own process group so the parent
+    // can always reap/kill descendants after the child exits.
+    (void)setpgid(0, 0);
     void* scope = nullptr;
     napi_env env = nullptr;
     if (unofficial_napi_create_env(8, &env, &scope) != napi_ok || env == nullptr) {
       _exit(70);
     }
     std::string child_error;
-    const int child_exit = RunRawNodeTestScript(env, node_test_relative_path, &child_error, false);
+    // Raw Node tests rely on libuv/event-loop turns (process exit checks,
+    // IPC callbacks, mustCall verification). Run with loop support enabled in
+    // subprocess mode to avoid false positives and leaking orphan children.
+    const int child_exit = RunRawNodeTestScript(env, node_test_relative_path, &child_error, true);
+    // Force-clean any tracked child processes before tearing down this env.
+    UbiProcessWrapForceKillTrackedChildren();
     if (!child_error.empty()) {
       (void)write(STDERR_FILENO, child_error.c_str(), child_error.size());
       (void)write(STDERR_FILENO, "\n", 1);
@@ -394,6 +444,10 @@ int RunRawNodeTestScriptInSubprocess(const char* node_test_relative_path, std::s
     }
     return 1;
   }
+
+  // Best-effort kill any descendants left behind by the raw test subprocess.
+  // kill(-pgid, ...) targets the process group whose id == child_pid.
+  (void)kill(-child_pid, SIGKILL);
 
   int exit_code = 1;
   if (WIFEXITED(status)) {

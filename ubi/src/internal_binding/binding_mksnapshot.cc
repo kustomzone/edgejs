@@ -45,6 +45,17 @@ napi_value ResolveMksnapshot(napi_env env, const ResolveOptions& /*options*/) {
   define_noop("setDeserializeCallback");
   define_noop("setDeserializeMainFunction");
 
+  void* data = nullptr;
+  napi_value ab = nullptr;
+  napi_value is_building_snapshot_buffer = nullptr;
+  if (napi_create_arraybuffer(env, 1, &data, &ab) == napi_ok && data != nullptr && ab != nullptr) {
+    static_cast<uint8_t*>(data)[0] = 0;
+    if (napi_create_typedarray(env, napi_uint8_array, 1, ab, 0, &is_building_snapshot_buffer) == napi_ok &&
+        is_building_snapshot_buffer != nullptr) {
+      napi_set_named_property(env, out, "isBuildingSnapshotBuffer", is_building_snapshot_buffer);
+    }
+  }
+
   SetString(env, out, "anonymousMainPath", "<anonymous>");
 
   auto& ref = g_mksnapshot_refs[env];

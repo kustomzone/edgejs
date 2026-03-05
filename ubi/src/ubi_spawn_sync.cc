@@ -85,6 +85,14 @@ std::string ValueToUtf8(napi_env env, napi_value value) {
   return out;
 }
 
+bool CoerceValueToUtf8(napi_env env, napi_value value, std::string* out) {
+  if (out == nullptr || value == nullptr) return false;
+  napi_value as_string = nullptr;
+  if (napi_coerce_to_string(env, value, &as_string) != napi_ok || as_string == nullptr) return false;
+  *out = ValueToUtf8(env, as_string);
+  return true;
+}
+
 bool ParseSpawnOptions(napi_env env, napi_value value, SpawnOptions* out) {
   if (out == nullptr) return false;
   napi_valuetype t = napi_undefined;
@@ -92,7 +100,7 @@ bool ParseSpawnOptions(napi_env env, napi_value value, SpawnOptions* out) {
 
   napi_value file_val = nullptr;
   if (GetNamedProperty(env, value, "file", &file_val)) {
-    out->file = ValueToUtf8(env, file_val);
+    if (!CoerceValueToUtf8(env, file_val, &out->file)) return false;
   }
   if (out->file.empty()) return false;
 
@@ -106,7 +114,9 @@ bool ParseSpawnOptions(napi_env env, napi_value value, SpawnOptions* out) {
       for (uint32_t i = 0; i < len; ++i) {
         napi_value elem = nullptr;
         if (napi_get_element(env, args_val, i, &elem) != napi_ok || elem == nullptr) continue;
-        out->args.push_back(ValueToUtf8(env, elem));
+        std::string arg;
+        if (!CoerceValueToUtf8(env, elem, &arg)) return false;
+        out->args.push_back(arg);
       }
     }
   }
@@ -156,7 +166,9 @@ bool ParseSpawnOptions(napi_env env, napi_value value, SpawnOptions* out) {
       for (uint32_t i = 0; i < len; ++i) {
         napi_value elem = nullptr;
         if (napi_get_element(env, env_pairs_val, i, &elem) != napi_ok || elem == nullptr) continue;
-        out->env_pairs.push_back(ValueToUtf8(env, elem));
+        std::string pair;
+        if (!CoerceValueToUtf8(env, elem, &pair)) return false;
+        out->env_pairs.push_back(pair);
       }
     }
   }

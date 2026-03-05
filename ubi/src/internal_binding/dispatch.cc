@@ -8,6 +8,7 @@
 namespace internal_binding {
 
 napi_value ResolveAsyncWrap(napi_env env, const ResolveOptions& options);
+napi_value ResolveAsyncContextFrame(napi_env env, const ResolveOptions& options);
 napi_value ResolveBlob(napi_env env, const ResolveOptions& options);
 napi_value ResolveBuffer(napi_env env, const ResolveOptions& options);
 napi_value ResolveBuiltins(napi_env env, const ResolveOptions& options);
@@ -19,8 +20,11 @@ napi_value ResolveCredentials(napi_env env, const ResolveOptions& options);
 napi_value ResolveCrypto(napi_env env, const ResolveOptions& options);
 napi_value ResolveEncodingBinding(napi_env env, const ResolveOptions& options);
 napi_value ResolveErrors(napi_env env, const ResolveOptions& options);
+napi_value ResolveFsEventWrap(napi_env env, const ResolveOptions& options);
 napi_value ResolveFs(napi_env env, const ResolveOptions& options);
+napi_value ResolveHeapUtils(napi_env env, const ResolveOptions& options);
 napi_value ResolveHttpParser(napi_env env, const ResolveOptions& options);
+napi_value ResolveInternalOnlyV8(napi_env env, const ResolveOptions& options);
 napi_value ResolveModuleWrap(napi_env env, const ResolveOptions& options);
 napi_value ResolveModules(napi_env env, const ResolveOptions& options);
 napi_value ResolveMksnapshot(napi_env env, const ResolveOptions& options);
@@ -34,6 +38,7 @@ napi_value ResolveProcessMethods(napi_env env, const ResolveOptions& options);
 napi_value ResolveProcessWrap(napi_env env, const ResolveOptions& options);
 napi_value ResolveReport(napi_env env, const ResolveOptions& options);
 napi_value ResolveSignalWrap(napi_env env, const ResolveOptions& options);
+napi_value ResolveSerdes(napi_env env, const ResolveOptions& options);
 napi_value ResolveSpawnSync(napi_env env, const ResolveOptions& options);
 napi_value ResolveStreamWrap(napi_env env, const ResolveOptions& options);
 napi_value ResolveStringDecoder(napi_env env, const ResolveOptions& options);
@@ -48,9 +53,11 @@ napi_value ResolveUdpWrap(napi_env env, const ResolveOptions& options);
 napi_value ResolveUrl(napi_env env, const ResolveOptions& options);
 napi_value ResolveUrlPattern(napi_env env, const ResolveOptions& options);
 napi_value ResolveUtil(napi_env env, const ResolveOptions& options);
+napi_value ResolveV8(napi_env env, const ResolveOptions& options);
 napi_value ResolveUv(napi_env env, const ResolveOptions& options);
 napi_value ResolveWasmWebApi(napi_env env, const ResolveOptions& options);
 napi_value ResolveWorker(napi_env env, const ResolveOptions& options);
+napi_value ResolveZlib(napi_env env, const ResolveOptions& options);
 
 namespace {
 
@@ -61,8 +68,9 @@ struct BindingResolverEntry {
   ResolverFn resolver;
 };
 
-constexpr std::array<BindingResolverEntry, 44> kResolvers = {{
+constexpr std::array<BindingResolverEntry, 51> kResolvers = {{
     {"async_wrap", ResolveAsyncWrap},
+    {"async_context_frame", ResolveAsyncContextFrame},
     {"blob", ResolveBlob},
     {"buffer", ResolveBuffer},
     {"builtins", ResolveBuiltins},
@@ -74,8 +82,11 @@ constexpr std::array<BindingResolverEntry, 44> kResolvers = {{
     {"crypto", ResolveCrypto},
     {"encoding_binding", ResolveEncodingBinding},
     {"errors", ResolveErrors},
+    {"fs_event_wrap", ResolveFsEventWrap},
     {"fs", ResolveFs},
+    {"heap_utils", ResolveHeapUtils},
     {"http_parser", ResolveHttpParser},
+    {"internal_only_v8", ResolveInternalOnlyV8},
     {"module_wrap", ResolveModuleWrap},
     {"modules", ResolveModules},
     {"mksnapshot", ResolveMksnapshot},
@@ -88,6 +99,7 @@ constexpr std::array<BindingResolverEntry, 44> kResolvers = {{
     {"process_methods", ResolveProcessMethods},
     {"process_wrap", ResolveProcessWrap},
     {"report", ResolveReport},
+    {"serdes", ResolveSerdes},
     {"signal_wrap", ResolveSignalWrap},
     {"spawn_sync", ResolveSpawnSync},
     {"stream_wrap", ResolveStreamWrap},
@@ -103,9 +115,11 @@ constexpr std::array<BindingResolverEntry, 44> kResolvers = {{
     {"url", ResolveUrl},
     {"url_pattern", ResolveUrlPattern},
     {"util", ResolveUtil},
+    {"v8", ResolveV8},
     {"uv", ResolveUv},
     {"wasm_web_api", ResolveWasmWebApi},
     {"worker", ResolveWorker},
+    {"zlib", ResolveZlib},
 }};
 
 }  // namespace

@@ -2,8 +2,11 @@
 
 #include <cstdint>
 #include <csignal>
+#include <mutex>
 #include <string>
+#include <unordered_set>
 #include <vector>
+#include <iostream>
 
 #include <uv.h>
 
@@ -26,6 +29,20 @@ struct ProcessWrap {
 };
 
 int32_t g_next_pid = 40000;
+std::mutex g_live_child_pids_mutex;
+std::unordered_set<int32_t> g_live_child_pids;
+
+void TrackLiveChildPid(int32_t pid) {
+  if (pid <= 0) return;
+  std::lock_guard<std::mutex> lock(g_live_child_pids_mutex);
+  g_live_child_pids.insert(pid);
+}
+
+void UntrackLiveChildPid(int32_t pid) {
+  if (pid <= 0) return;
+  std::lock_guard<std::mutex> lock(g_live_child_pids_mutex);
+  g_live_child_pids.erase(pid);
+}
 
 void HoldWrapperRef(ProcessWrap* wrap) {
   if (wrap == nullptr || wrap->env == nullptr || wrap->wrapper_ref == nullptr || wrap->wrapper_ref_held) return;
@@ -81,6 +98,11 @@ bool GetNamedValue(napi_env env, napi_value obj, const char* key, napi_value* ou
   bool has = false;
   if (napi_has_named_property(env, obj, key, &has) != napi_ok || !has) return false;
   return napi_get_named_property(env, obj, key, out) == napi_ok && *out != nullptr;
+}
+
+bool DebugProcessWrapEnabled() {
+  const char* v = std::getenv("UBI_DEBUG_PROCESS_WRAP");
+  return v != nullptr && v[0] != '\0' && v[0] != '0';
 }
 
 int SignalFromName(const std::string& name) {
@@ -183,6 +205,7 @@ void OnProcessExit(uv_process_t* process, int64_t exit_status, int term_signal) 
   auto* wrap = static_cast<ProcessWrap*>(process->data);
   if (wrap == nullptr) return;
   wrap->alive = false;
+  UntrackLiveChildPid(wrap->pid);
   EmitOnExit(wrap, static_cast<int32_t>(exit_status), static_cast<int32_t>(term_signal), term_signal != 0);
   uv_handle_t* h = reinterpret_cast<uv_handle_t*>(process);
   if (!uv_is_closing(h)) {
@@ -274,11 +297,13 @@ napi_value ProcessSpawn(napi_env env, napi_callback_info info) {
       for (uint32_t i = 0; i < len; i++) {
         napi_value item = nullptr;
         if (napi_get_element(env, args_value, i, &item) != napi_ok || item == nullptr) continue;
+        napi_value as_string = nullptr;
+        if (napi_coerce_to_string(env, item, &as_string) != napi_ok || as_string == nullptr) continue;
         size_t slen = 0;
-        if (napi_get_value_string_utf8(env, item, nullptr, 0, &slen) != napi_ok) continue;
+        if (napi_get_value_string_utf8(env, as_string, nullptr, 0, &slen) != napi_ok) continue;
         std::string s(slen + 1, '\0');
         size_t copied = 0;
-        if (napi_get_value_string_utf8(env, item, s.data(), s.size(), &copied) != napi_ok) continue;
+        if (napi_get_value_string_utf8(env, as_string, s.data(), s.size(), &copied) != napi_ok) continue;
         s.resize(copied);
         args_storage.push_back(std::move(s));
       }
@@ -455,6 +480,9 @@ napi_value ProcessSpawn(napi_env env, napi_callback_info info) {
   if (rc != 0) {
     wrap->process_initialized = false;
     wrap->process_closed = false;
+    if (DebugProcessWrapEnabled()) {
+      std::cerr << "[ubi-process-wrap] spawn file=" << file << " rc=" << rc << "\n";
+    }
     return MakeInt32(env, rc);
   }
 
@@ -463,9 +491,13 @@ napi_value ProcessSpawn(napi_env env, napi_callback_info info) {
   wrap->real_async = true;
   wrap->pid = static_cast<int32_t>(wrap->process.pid);
   wrap->alive = true;
+  TrackLiveChildPid(wrap->pid);
   uv_ref(reinterpret_cast<uv_handle_t*>(&wrap->process));
   HoldWrapperRef(wrap);
   SetPidProperty(env, self, wrap->pid);
+  if (DebugProcessWrapEnabled()) {
+    std::cerr << "[ubi-process-wrap] spawn file=" << file << " pid=" << wrap->pid << "\n";
+  }
   return MakeInt32(env, 0);
 }
 
@@ -512,11 +544,19 @@ napi_value ProcessKill(napi_env env, napi_callback_info info) {
   if (wrap->real_async && wrap->process_initialized) {
     int kill_signal = has_signal ? signal : SIGTERM;
     int rc = uv_process_kill(&wrap->process, kill_signal);
-    if (rc == UV_ESRCH) wrap->alive = false;
+    if (DebugProcessWrapEnabled()) {
+      std::cerr << "[ubi-process-wrap] kill pid=" << wrap->pid << " signal=" << kill_signal << " rc=" << rc
+                << " alive=" << (wrap->alive ? 1 : 0) << "\n";
+    }
+    if (rc == UV_ESRCH) {
+      wrap->alive = false;
+      UntrackLiveChildPid(wrap->pid);
+    }
     return MakeInt32(env, rc);
   }
 
   wrap->alive = false;
+  UntrackLiveChildPid(wrap->pid);
   EmitOnExit(wrap, 0, signal, has_signal);
   ReleaseWrapperRef(wrap);
 
@@ -591,4 +631,25 @@ napi_value UbiInstallProcessWrapBinding(napi_env env) {
   napi_set_named_property(env, binding, "Process", process_ctor);
 
   return binding;
+}
+
+void UbiProcessWrapForceKillTrackedChildren() {
+  std::vector<int32_t> pids;
+  {
+    std::lock_guard<std::mutex> lock(g_live_child_pids_mutex);
+    pids.reserve(g_live_child_pids.size());
+    for (int32_t pid : g_live_child_pids) {
+      if (pid > 0) pids.push_back(pid);
+    }
+  }
+
+  for (int32_t pid : pids) {
+    const int rc = uv_kill(pid, SIGKILL);
+    if (DebugProcessWrapEnabled()) {
+      std::cerr << "[ubi-process-wrap] cleanup kill pid=" << pid << " rc=" << rc << "\n";
+    }
+    if (rc == 0 || rc == UV_ESRCH) {
+      UntrackLiveChildPid(pid);
+    }
+  }
 }

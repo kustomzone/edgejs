@@ -1,10 +1,14 @@
 #include "internal_binding/dispatch.h"
 
+#include <unordered_map>
+
 #include "internal_binding/helpers.h"
 
 namespace internal_binding {
 
 namespace {
+
+std::unordered_map<napi_env, napi_ref> g_constants_refs;
 
 bool IsObjectLike(napi_env env, napi_value value) {
   if (value == nullptr) return false;
@@ -234,12 +238,27 @@ void NormalizeConstantsShape(napi_env env, napi_value constants) {
   CopyOwnProperties(env, src_signals, normalized_signals);
   napi_object_freeze(env, normalized_signals);
   napi_set_named_property(env, os_obj, "signals", normalized_signals);
+
+  // Keep zlib constants minimally non-empty so zlib.js can compute
+  // parameter-array bounds during module initialization.
+  napi_value zlib_obj = EnsureObjectProperty(env, constants, "zlib");
+  EnsureInt32Default(env, zlib_obj, "BROTLI_PARAM_QUALITY", 1);
+  EnsureInt32Default(env, zlib_obj, "ZSTD_c_compressionLevel", 1);
+  EnsureInt32Default(env, zlib_obj, "ZSTD_d_windowLogMax", 1);
 }
 
 }  // namespace
 
 napi_value ResolveConstants(napi_env env, const ResolveOptions& options) {
   const napi_value undefined = Undefined(env);
+  auto cached_it = g_constants_refs.find(env);
+  if (cached_it != g_constants_refs.end() && cached_it->second != nullptr) {
+    napi_value cached = nullptr;
+    if (napi_get_reference_value(env, cached_it->second, &cached) == napi_ok && cached != nullptr) {
+      return cached;
+    }
+  }
+
   napi_value out = nullptr;
   if (napi_create_object(env, &out) != napi_ok || out == nullptr) return undefined;
 
@@ -283,6 +302,13 @@ napi_value ResolveConstants(napi_env env, const ResolveOptions& options) {
   SetNamedObjectIfValid(env, out, "internal", CreateInternalConstants(env));
   SetNamedObjectIfValid(env, out, "trace", CreateTraceConstants(env));
   NormalizeConstantsShape(env, out);
+
+  auto& ref = g_constants_refs[env];
+  if (ref != nullptr) {
+    napi_delete_reference(env, ref);
+    ref = nullptr;
+  }
+  napi_create_reference(env, out, 1, &ref);
 
   return out;
 }

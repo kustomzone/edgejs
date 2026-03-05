@@ -758,6 +758,19 @@ napi_value PipeBytesWrittenGetter(napi_env env, napi_callback_info info) {
   return out;
 }
 
+napi_value PipeWriteQueueSizeGetter(napi_env env, napi_callback_info info) {
+  napi_value self = nullptr;
+  size_t argc = 0;
+  napi_get_cb_info(env, info, &argc, nullptr, &self, nullptr);
+  PipeWrap* wrap = nullptr;
+  napi_unwrap(env, self, reinterpret_cast<void**>(&wrap));
+  const size_t qsize =
+      (wrap != nullptr) ? uv_stream_get_write_queue_size(reinterpret_cast<uv_stream_t*>(&wrap->handle)) : 0;
+  napi_value out = nullptr;
+  napi_create_double(env, static_cast<double>(qsize), &out);
+  return out;
+}
+
 napi_value PipeFdGetter(napi_env env, napi_callback_info info) {
   napi_value self = nullptr;
   size_t argc = 0;
@@ -828,6 +841,7 @@ napi_value UbiInstallPipeWrapBinding(napi_env env) {
       {"asyncReset", nullptr, PipeAsyncReset, nullptr, nullptr, nullptr, napi_default, nullptr},
       {"bytesRead", nullptr, nullptr, PipeBytesReadGetter, nullptr, nullptr, napi_default, nullptr},
       {"bytesWritten", nullptr, nullptr, PipeBytesWrittenGetter, nullptr, nullptr, napi_default, nullptr},
+      {"writeQueueSize", nullptr, nullptr, PipeWriteQueueSizeGetter, nullptr, nullptr, napi_default, nullptr},
       {"fd", nullptr, nullptr, PipeFdGetter, nullptr, nullptr, napi_default, nullptr},
   };
 

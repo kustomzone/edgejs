@@ -622,6 +622,37 @@ int RunEventLoopUntilQuiescent(napi_env env, std::string* error_out) {
   }
   const auto loop_start = std::chrono::steady_clock::now();
 
+  struct TimeoutCleanupState {
+    int killed_processes = 0;
+    int closed_handles = 0;
+  };
+  auto cleanup_handles_on_timeout = [&](TimeoutCleanupState* state) {
+    if (state == nullptr) return;
+    uv_walk(
+        loop,
+        [](uv_handle_t* h, void* arg) {
+          if (h == nullptr || arg == nullptr) return;
+          auto* st = static_cast<TimeoutCleanupState*>(arg);
+          if (uv_handle_get_type(h) == UV_PROCESS) {
+            auto* p = reinterpret_cast<uv_process_t*>(h);
+            if (p->pid > 0) {
+              (void)uv_process_kill(p, SIGKILL);
+            }
+            st->killed_processes += 1;
+          }
+          if (!uv_is_closing(h)) {
+            uv_close(h, [](uv_handle_t* /*handle*/) {});
+            st->closed_handles += 1;
+          }
+        },
+        state);
+    // Best effort drain to allow close callbacks/process exits to run.
+    for (int i = 0; i < 8; i++) {
+      if (uv_run(loop, UV_RUN_NOWAIT) == 0) break;
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+  };
+
   auto active_handles_summary = [&](std::string* out) {
     if (out == nullptr) return;
     const char* kScript =
@@ -732,9 +763,16 @@ int RunEventLoopUntilQuiescent(napi_env env, std::string* error_out) {
       if (elapsed_ms >= loop_timeout_ms) {
         std::string handles;
         active_handles_summary(&handles);
+        TimeoutCleanupState cleanup_state;
+        cleanup_handles_on_timeout(&cleanup_state);
         if (error_out != nullptr) {
           *error_out = "UBI loop timeout after " + std::to_string(elapsed_ms) + "ms";
           if (!handles.empty()) *error_out += "; active handles: " + handles;
+          if (cleanup_state.killed_processes > 0 || cleanup_state.closed_handles > 0) {
+            *error_out += "; timeout cleanup: killed_processes=" +
+                          std::to_string(cleanup_state.killed_processes) +
+                          ", closed_handles=" + std::to_string(cleanup_state.closed_handles);
+          }
         }
         uv_stop(loop);
         return 1;
@@ -1049,6 +1087,29 @@ bool PrepareProcessPrototypeForBootstrap(napi_env env, std::string* error_out) {
   if (napi_create_object(env, &fresh_process_proto) != napi_ok || fresh_process_proto == nullptr) {
     return false;
   }
+  // Node bootstrap expects process.__proto__.constructor.name === "process".
+  // Keep this constructor on the process prototype before inheriting EventEmitter.prototype.
+  napi_value process_ctor = nullptr;
+  if (napi_create_function(env,
+                           "process",
+                           NAPI_AUTO_LENGTH,
+                           ReturnUndefinedCallback,
+                           nullptr,
+                           &process_ctor) != napi_ok ||
+      process_ctor == nullptr) {
+    return false;
+  }
+  napi_property_descriptor constructor_desc = {};
+  constructor_desc.utf8name = "constructor";
+  constructor_desc.value = process_ctor;
+  constructor_desc.attributes =
+      static_cast<napi_property_attributes>(napi_writable | napi_configurable);
+  if (napi_define_properties(env, fresh_process_proto, 1, &constructor_desc) != napi_ok) {
+    return false;
+  }
+  if (napi_set_named_property(env, process_ctor, "prototype", fresh_process_proto) != napi_ok) {
+    return false;
+  }
 
   napi_value set_prototype_of = nullptr;
   if (!GetNamedProperty(env, object_ctor, "setPrototypeOf", &set_prototype_of) ||
@@ -1144,9 +1205,31 @@ int RunScriptWithGlobals(napi_env env,
     return 1;
   }
 
-  auto require_bootstrap_module = [&](const char* id) -> bool {
+  auto require_bootstrap_module_exports = [&](const char* id, napi_value* out_exports) -> bool {
     napi_value exports = nullptr;
-    if (RequireModule(env, id, &exports)) return true;
+    if (UbiRequireBuiltin(env, id, &exports)) {
+      if (out_exports != nullptr) *out_exports = exports;
+      return true;
+    }
+    bool has_exception = false;
+    if (napi_is_exception_pending(env, &has_exception) == napi_ok && has_exception) {
+      if (error_out != nullptr) {
+        std::string msg = std::string("Failed to require ") + id;
+        bool is_exit = false;
+        int exit_code = 0;
+        const std::string exc = GetAndClearPendingException(env, &is_exit, &exit_code);
+        if (!exc.empty()) {
+          msg += ": ";
+          msg += exc;
+        }
+        *error_out = msg;
+      }
+      return false;
+    }
+    if (RequireModule(env, id, &exports)) {
+      if (out_exports != nullptr) *out_exports = exports;
+      return true;
+    }
     if (error_out != nullptr) {
       std::string msg = std::string("Failed to require ") + id;
       bool is_exit = false;
@@ -1159,6 +1242,10 @@ int RunScriptWithGlobals(napi_env env,
       *error_out = msg;
     }
     return false;
+  };
+
+  auto require_bootstrap_module = [&](const char* id) -> bool {
+    return require_bootstrap_module_exports(id, nullptr);
   };
 
   napi_value native_internal_binding = nullptr;
@@ -1205,13 +1292,11 @@ int RunScriptWithGlobals(napi_env env,
     return 1;
   }
 
-  napi_value internal_binding = nullptr;
-  if (!GetNamedProperty(env, realm_exports, "internalBinding", &internal_binding) ||
-      !IsFunction(env, internal_binding)) {
-    if (error_out != nullptr) {
-      *error_out = "internal/bootstrap/realm did not export internalBinding";
-    }
-    return 1;
+  napi_value internal_binding = native_internal_binding;
+  napi_value exported_internal_binding = nullptr;
+  if (GetNamedProperty(env, realm_exports, "internalBinding", &exported_internal_binding) &&
+      IsFunction(env, exported_internal_binding)) {
+    internal_binding = exported_internal_binding;
   }
   status = napi_set_named_property(env, global, "internalBinding", internal_binding);
   if (status != napi_ok) {
@@ -1338,7 +1423,7 @@ int RunScriptWithGlobals(napi_env env,
   }
 
   napi_value pre_execution_exports = nullptr;
-  if (!RequireModule(env, "internal/process/pre_execution", &pre_execution_exports) ||
+  if (!require_bootstrap_module_exports("internal/process/pre_execution", &pre_execution_exports) ||
       pre_execution_exports == nullptr) {
     if (error_out != nullptr) {
       std::string msg = "Failed to load internal/process/pre_execution";
@@ -1396,7 +1481,7 @@ int RunScriptWithGlobals(napi_env env,
   // ESM callback bridge needed by dynamic import() in CJS.
   {
     napi_value esm_utils_exports = nullptr;
-    if (!RequireModule(env, "internal/modules/esm/utils", &esm_utils_exports) ||
+    if (!require_bootstrap_module_exports("internal/modules/esm/utils", &esm_utils_exports) ||
         esm_utils_exports == nullptr) {
       if (error_out != nullptr) {
         std::string msg = "Failed to load internal/modules/esm/utils";

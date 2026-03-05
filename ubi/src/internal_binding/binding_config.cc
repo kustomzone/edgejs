@@ -3,12 +3,15 @@
 #include <cctype>
 #include <cstdlib>
 #include <string>
+#include <unordered_map>
 
 #include "internal_binding/helpers.h"
 
 namespace internal_binding {
 
 namespace {
+
+std::unordered_map<napi_env, napi_ref> g_config_refs;
 
 napi_value GetNamed(napi_env env, napi_value obj, const char* key) {
   napi_value out = nullptr;
@@ -84,6 +87,14 @@ napi_value ConfigGetDefaultLocale(napi_env env, napi_callback_info /*info*/) {
 }  // namespace
 
 napi_value ResolveConfig(napi_env env, const ResolveOptions& /*options*/) {
+  auto cached_it = g_config_refs.find(env);
+  if (cached_it != g_config_refs.end() && cached_it->second != nullptr) {
+    napi_value cached = nullptr;
+    if (napi_get_reference_value(env, cached_it->second, &cached) == napi_ok && cached != nullptr) {
+      return cached;
+    }
+  }
+
   napi_value out = nullptr;
   if (napi_create_object(env, &out) != napi_ok || out == nullptr) return Undefined(env);
 
@@ -121,6 +132,13 @@ napi_value ResolveConfig(napi_env env, const ResolveOptions& /*options*/) {
       get_default_locale != nullptr) {
     napi_set_named_property(env, out, "getDefaultLocale", get_default_locale);
   }
+
+  auto& ref = g_config_refs[env];
+  if (ref != nullptr) {
+    napi_delete_reference(env, ref);
+    ref = nullptr;
+  }
+  napi_create_reference(env, out, 1, &ref);
 
   return out;
 }

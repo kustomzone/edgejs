@@ -10,6 +10,7 @@ napi_status UbiInstallModuleLoader(napi_env env, const char* entry_script_path);
 // Call after the bootstrap prelude so every user module receives the same reference.
 void UbiSetPrimordials(napi_env env, napi_value primordials);
 void UbiSetInternalBinding(napi_env env, napi_value internal_binding);
+bool UbiRequireBuiltin(napi_env env, const char* id, napi_value* out);
 
 // Run the internal task_queue tick callback registered via setTickCallback().
 // When no callback is registered, `called` is set to false and napi_ok is returned.

@@ -21,6 +21,7 @@
 #include "ubi_url.h"
 #include "ubi_util.h"
 #include "internal_binding/dispatch.h"
+#include "builtin_catalog.h"
 
 #include <algorithm>
 #include <cctype>
@@ -44,6 +45,7 @@ namespace fs = std::filesystem;
 struct ModuleLoaderState {
   std::unordered_map<std::string, napi_ref> module_cache;
   std::unordered_map<std::string, napi_ref> binding_cache;
+  std::unordered_map<std::string, napi_ref> internal_binding_cache;
   napi_ref cache_object_ref = nullptr;
   napi_ref primordials_ref = nullptr;
   napi_ref internal_binding_ref = nullptr;
@@ -388,104 +390,15 @@ static bool ResolveNodeModules(const std::string& specifier, const std::string& 
   return FindPathInNodeModules(specifier, paths, out);
 }
 
-// Resolve bare specifier (e.g. "assert", "path", "node:worker_threads") from ubi/src/builtins/<id>.js.
-// Strips "node:" prefix so node:worker_threads resolves to builtins/worker_threads.js.
+// Resolve bare specifier (e.g. "assert", "path", "node:worker_threads")
+// against node-lib and selected node/deps internal/deps entries.
 bool ResolveBuiltinPath(const std::string& specifier, const std::string& base_dir, fs::path* out) {
-  std::string id = specifier;
-  if (id.size() > 5 && id.compare(0, 5, "node:") == 0) {
-    id = id.substr(5);
-  }
-  if (id.empty() || id.rfind(".", 0) == 0) {
-    return false;
-  }
-  static const fs::path runtime_builtins_dir =
-      fs::absolute(fs::path(__FILE__).parent_path() / "builtins").lexically_normal();
-  static const fs::path upstream_node_lib_dir =
-      fs::absolute(fs::path(__FILE__).parent_path() / ".." / ".." / "node-lib").lexically_normal();
-  fs::path resolved;
-  if (id == "internal/test/binding") {
-    fs::path internal_test_binding = runtime_builtins_dir / "internal_test_binding.js";
-    if (ResolveAsFile(internal_test_binding, &resolved)) {
-      *out = resolved.lexically_normal();
-      return true;
-    }
-  }
-  // Resolve critical internal util modules directly to upstream node-lib paths.
-  // This avoids an extra shim layer that can expose partially initialized wrapper
-  // exports during circular loads (e.g. events <-> internal/util call paths).
-  if (id == "internal/util" || id == "internal/util/inspect") {
-    fs::path upstream_candidate = upstream_node_lib_dir / (id + ".js");
-    if (ResolveAsFile(upstream_candidate, &resolved)) {
-      *out = resolved.lexically_normal();
-      return true;
-    }
-  }
-  // Internal dep modules (e.g. internal/deps/acorn/*) live under node/deps/*
-  // in this workspace, not under ubi/src/builtins.
-  if (id.rfind("internal/deps/", 0) == 0) {
-    const std::string dep_rel = id.substr(std::string("internal/deps/").size());
-    static const fs::path source_root =
-        fs::absolute(fs::path(__FILE__).parent_path() / ".." / "..").lexically_normal();
-    const std::vector<fs::path> node_deps_roots = {
-        source_root / "node" / "deps",
-        fs::current_path() / "node" / "deps",
-        fs::current_path().parent_path() / "node" / "deps",
-    };
-    for (const fs::path& deps_root : node_deps_roots) {
-      fs::path candidate = deps_root / dep_rel;
-      if (ResolveAsFile(candidate, &resolved) || ResolveAsDirectory(candidate, &resolved)) {
-        *out = resolved.lexically_normal();
-        return true;
-      }
-    }
-  }
-  fs::path candidate = runtime_builtins_dir / (id + ".js");
-  if (ResolveAsFile(candidate, &resolved)) {
-    *out = resolved.lexically_normal();
-    return true;
-  }
-  // Preserve Node-style relative builtin lookup for modules loaded from node-lib
-  // (e.g. internal/v8/startup_snapshot from node-lib/buffer.js).
-  const fs::path base_relative_builtins = fs::absolute(fs::path(base_dir) / ".." / "builtins").lexically_normal();
-  candidate = base_relative_builtins / (id + ".js");
-  if (ResolveAsFile(candidate, &resolved)) {
-    *out = resolved.lexically_normal();
-    return true;
-  }
-
-  // Final fallback for internal builtins that are not mirrored under
-  // ubi/src/builtins yet: resolve directly from node-lib.
-  if (id.rfind("internal/", 0) == 0) {
-    candidate = upstream_node_lib_dir / (id + ".js");
-    if (ResolveAsFile(candidate, &resolved)) {
-      *out = resolved.lexically_normal();
-      return true;
-    }
-  }
-  return false;
+  (void)base_dir;
+  return builtin_catalog::ResolveBuiltinId(specifier, out);
 }
 
 bool TryGetBuiltinIdFromResolvedPath(const fs::path& resolved_path, std::string* out_id) {
-  if (out_id == nullptr) return false;
-  static const fs::path runtime_builtins_dir =
-      fs::absolute(fs::path(__FILE__).parent_path() / "builtins").lexically_normal();
-  static const fs::path upstream_node_lib_dir =
-      fs::absolute(fs::path(__FILE__).parent_path() / ".." / ".." / "node-lib").lexically_normal();
-
-  const fs::path normalized = fs::absolute(resolved_path).lexically_normal();
-  auto derive_id = [&](const fs::path& root) -> bool {
-    const fs::path rel = normalized.lexically_relative(root);
-    const std::string rel_text = rel.generic_string();
-    if (rel_text.empty() || rel_text == "." || rel_text.rfind("..", 0) == 0) return false;
-    if (rel.extension() != ".js") return false;
-    std::string id = rel_text;
-    id.resize(id.size() - 3);  // trim ".js"
-    if (id == "internal_test_binding") id = "internal/test/binding";
-    *out_id = std::move(id);
-    return true;
-  };
-
-  return derive_id(runtime_builtins_dir) || derive_id(upstream_node_lib_dir);
+  return builtin_catalog::TryGetBuiltinIdForPath(resolved_path, out_id);
 }
 
 std::string ModuleSourceUrlForResolvedPath(const fs::path& resolved_path) {
@@ -496,41 +409,13 @@ std::string ModuleSourceUrlForResolvedPath(const fs::path& resolved_path) {
   return resolved_path.string();
 }
 
-// Directory to use when loading bootstrap builtins in the prelude, so they are found regardless of entry_dir.
+// Directory used for builtins compileFunction lookup.
 static std::string GetBuiltinsDirForBootstrap() {
-  static const fs::path runtime_builtins_dir =
-      fs::absolute(fs::path(__FILE__).parent_path() / "builtins").lexically_normal();
-  return runtime_builtins_dir.string();
+  return builtin_catalog::NodeLibRoot().string();
 }
 
-static std::vector<std::string> CollectRuntimeBuiltinIds() {
-  static std::vector<std::string> ids;
-  if (!ids.empty()) return ids;
-
-  const fs::path root = fs::absolute(fs::path(__FILE__).parent_path() / "builtins").lexically_normal();
-  std::error_code ec;
-  if (!fs::exists(root, ec) || !fs::is_directory(root, ec)) {
-    return ids;
-  }
-
-  for (fs::recursive_directory_iterator it(root, ec), end; it != end && !ec; it.increment(ec)) {
-    if (!it->is_regular_file(ec)) continue;
-    const fs::path p = it->path();
-    if (p.extension() != ".js") continue;
-    fs::path rel = p.lexically_relative(root);
-    std::string id = rel.generic_string();
-    if (id.size() <= 3) continue;
-    id.resize(id.size() - 3);  // trim ".js"
-    if (id == "internal_test_binding") {
-      ids.push_back("internal/test/binding");
-      continue;
-    }
-    ids.push_back(id);
-  }
-
-  std::sort(ids.begin(), ids.end());
-  ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
-  return ids;
+static const std::vector<std::string>& CollectRuntimeBuiltinIds() {
+  return builtin_catalog::AllBuiltinIds();
 }
 
 static napi_value NoopCallback(napi_env env, napi_callback_info /*info*/) {
@@ -600,6 +485,58 @@ static napi_value BuiltinsCompileFunctionCallback(napi_env env, napi_callback_in
     return nullptr;
   }
   return compiled;
+}
+
+static napi_value BuiltinsNativesSourceGetter(napi_env env, napi_callback_info info) {
+  napi_value this_arg = nullptr;
+  void* data = nullptr;
+  size_t argc = 0;
+  if (napi_get_cb_info(env, info, &argc, nullptr, &this_arg, &data) != napi_ok || data == nullptr) {
+    return nullptr;
+  }
+
+  const std::string* id = static_cast<const std::string*>(data);
+  fs::path resolved;
+  if (!builtin_catalog::ResolveBuiltinId(*id, &resolved)) {
+    napi_value undefined = nullptr;
+    napi_get_undefined(env, &undefined);
+    return undefined;
+  }
+
+  const std::string source = ReadTextFile(resolved);
+  napi_value source_value = nullptr;
+  if (napi_create_string_utf8(env, source.c_str(), source.size(), &source_value) != napi_ok ||
+      source_value == nullptr) {
+    return nullptr;
+  }
+
+  // Cache string value on first access to avoid repeated file reads.
+  if (this_arg != nullptr) {
+    napi_set_named_property(env, this_arg, id->c_str(), source_value);
+  }
+  return source_value;
+}
+
+static napi_value CreateBuiltinsNativesObject(napi_env env, const std::vector<std::string>& builtin_ids) {
+  napi_value natives = nullptr;
+  if (napi_create_object(env, &natives) != napi_ok || natives == nullptr) return nullptr;
+
+  for (const std::string& id : builtin_ids) {
+    napi_property_descriptor descriptor{
+        id.c_str(),
+        nullptr,
+        nullptr,
+        BuiltinsNativesSourceGetter,
+        nullptr,
+        nullptr,
+        static_cast<napi_property_attributes>(napi_enumerable | napi_configurable),
+        const_cast<std::string*>(&id),
+    };
+    if (napi_define_properties(env, natives, 1, &descriptor) != napi_ok) {
+      return nullptr;
+    }
+  }
+  return natives;
 }
 
 static napi_value BuiltinsSetInternalLoadersCallback(napi_env env, napi_callback_info info) {
@@ -708,6 +645,28 @@ static napi_value CacheBinding(ModuleLoaderState* state, napi_env env, const cha
   napi_ref ref = nullptr;
   if (napi_create_reference(env, binding, 1, &ref) != napi_ok || ref == nullptr) return nullptr;
   state->binding_cache[name] = ref;
+  return binding;
+}
+
+static napi_value GetCachedInternalBinding(ModuleLoaderState* state, napi_env env, const char* name) {
+  if (state == nullptr || name == nullptr) return nullptr;
+  auto it = state->internal_binding_cache.find(name);
+  if (it == state->internal_binding_cache.end() || it->second == nullptr) return nullptr;
+  napi_value out = nullptr;
+  if (napi_get_reference_value(env, it->second, &out) != napi_ok || out == nullptr) return nullptr;
+  return out;
+}
+
+static napi_value CacheInternalBinding(ModuleLoaderState* state, napi_env env, const char* name, napi_value binding) {
+  if (state == nullptr || name == nullptr || binding == nullptr || IsUndefinedValue(env, binding)) return nullptr;
+  auto it = state->internal_binding_cache.find(name);
+  if (it != state->internal_binding_cache.end() && it->second != nullptr) {
+    napi_delete_reference(env, it->second);
+    it->second = nullptr;
+  }
+  napi_ref ref = nullptr;
+  if (napi_create_reference(env, binding, 1, &ref) != napi_ok || ref == nullptr) return nullptr;
+  state->internal_binding_cache[name] = ref;
   return binding;
 }
 
@@ -1701,6 +1660,11 @@ static napi_value GetOrCreateNativeBuiltinsBinding(napi_env env, ModuleLoaderSta
     return nullptr;
   }
 
+  napi_value natives = CreateBuiltinsNativesObject(env, builtin_ids);
+  if (natives == nullptr || napi_set_named_property(env, binding, "natives", natives) != napi_ok) {
+    return nullptr;
+  }
+
   napi_value config_json = nullptr;
   const std::string builtins_config_json = LoadBuiltinsConfigJson();
   if (napi_create_string_utf8(env, builtins_config_json.c_str(), NAPI_AUTO_LENGTH, &config_json) != napi_ok ||
@@ -2576,6 +2540,12 @@ static napi_value NativeGetInternalBindingCallback(napi_env env, napi_callback_i
   }
   auto* state = static_cast<ModuleLoaderState*>(data);
   const std::string name = ValueToUtf8(env, argv[0]);
+  if (!name.empty()) {
+    napi_value cached = GetCachedInternalBinding(state, env, name.c_str());
+    if (cached != nullptr) {
+      return cached;
+    }
+  }
 
   internal_binding::ResolveOptions options;
   options.state = state;
@@ -2590,7 +2560,15 @@ static napi_value NativeGetInternalBindingCallback(napi_env env, napi_callback_i
   options.callbacks.resolve_options = ResolveOptionsBinding;
 
   napi_value resolved = internal_binding::Resolve(env, name, options);
-  if (resolved != nullptr) return resolved;
+  if (resolved != nullptr) {
+    if (!name.empty() && !IsUndefinedValue(env, resolved)) {
+      napi_value cached = CacheInternalBinding(state, env, name.c_str(), resolved);
+      if (cached != nullptr) {
+        return cached;
+      }
+    }
+    return resolved;
+  }
 
   bool has_pending_exception = false;
   if (napi_is_exception_pending(env, &has_pending_exception) == napi_ok && has_pending_exception) {
@@ -2911,6 +2889,33 @@ bool ParseJsonModule(napi_env env, const fs::path& resolved_path, napi_value mod
 
 bool LoadResolvedModule(napi_env env, ModuleLoaderState* state, const fs::path& resolved_path, napi_value* out_exports);
 
+bool CallRequireBuiltinLoader(napi_env env, ModuleLoaderState* state, const std::string& id, napi_value* out_exports) {
+  if (out_exports != nullptr) *out_exports = nullptr;
+  if (env == nullptr || state == nullptr || id.empty() || state->require_builtin_loader_ref == nullptr) return false;
+
+  napi_value require_builtin = nullptr;
+  if (napi_get_reference_value(env, state->require_builtin_loader_ref, &require_builtin) != napi_ok ||
+      require_builtin == nullptr) {
+    return false;
+  }
+
+  napi_value id_value = nullptr;
+  if (napi_create_string_utf8(env, id.c_str(), NAPI_AUTO_LENGTH, &id_value) != napi_ok || id_value == nullptr) {
+    return false;
+  }
+
+  napi_value global = nullptr;
+  if (napi_get_global(env, &global) != napi_ok || global == nullptr) return false;
+
+  napi_value exports = nullptr;
+  if (napi_call_function(env, global, require_builtin, 1, &id_value, &exports) != napi_ok || exports == nullptr) {
+    return false;
+  }
+
+  if (out_exports != nullptr) *out_exports = exports;
+  return true;
+}
+
 napi_value RequireCallback(napi_env env, napi_callback_info info) {
   size_t argc = 1;
   napi_value argv[1] = {nullptr};
@@ -2941,6 +2946,15 @@ napi_value RequireCallback(napi_env env, napi_callback_info info) {
   std::string resolved_key;
   fs::path resolved_path;
   if (ResolveBuiltinPath(specifier, context->base_dir, &resolved_path)) {
+    std::string builtin_id;
+    if (TryGetBuiltinIdFromResolvedPath(resolved_path, &builtin_id) &&
+        context->state->require_builtin_loader_ref != nullptr) {
+      napi_value builtin_exports = nullptr;
+      if (CallRequireBuiltinLoader(env, context->state, builtin_id, &builtin_exports) && builtin_exports != nullptr) {
+        return builtin_exports;
+      }
+      return nullptr;  // Preserve exception from requireBuiltin().
+    }
     resolved_key = CanonicalPathKey(resolved_path);
     resolved_path = fs::path(resolved_key);
   } else {
@@ -3137,6 +3151,13 @@ void UbiSetInternalBinding(napi_env env, napi_value internal_binding) {
   }
 }
 
+bool UbiRequireBuiltin(napi_env env, const char* id, napi_value* out) {
+  if (env == nullptr || id == nullptr || id[0] == '\0') return false;
+  auto it = g_loader_states.find(env);
+  if (it == g_loader_states.end()) return false;
+  return CallRequireBuiltinLoader(env, &it->second, id, out);
+}
+
 napi_status UbiInstallModuleLoader(napi_env env, const char* entry_script_path) {
   if (env == nullptr) {
     return napi_invalid_arg;
@@ -3169,6 +3190,12 @@ napi_status UbiInstallModuleLoader(napi_env env, const char* entry_script_path) 
     }
   }
   state.binding_cache.clear();
+  for (auto& kv : state.internal_binding_cache) {
+    if (kv.second != nullptr) {
+      napi_delete_reference(env, kv.second);
+    }
+  }
+  state.internal_binding_cache.clear();
   if (state.cache_object_ref != nullptr) {
     napi_delete_reference(env, state.cache_object_ref);
     state.cache_object_ref = nullptr;

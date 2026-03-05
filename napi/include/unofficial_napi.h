@@ -60,6 +60,11 @@ NAPI_EXTERN napi_status unofficial_napi_get_constructor_name(napi_env env,
 // Unofficial helper. Refreshes V8 date/timezone configuration after TZ changes.
 NAPI_EXTERN napi_status unofficial_napi_notify_datetime_configuration_change(napi_env env);
 
+// Unofficial helper. Creates the native internalBinding('serdes') object
+// containing Serializer and Deserializer constructors.
+NAPI_EXTERN napi_status unofficial_napi_create_serdes_binding(napi_env env,
+                                                              napi_value* result_out);
+
 #ifdef __cplusplus
 }  // extern "C"
 #endif
