@@ -320,6 +320,7 @@ class REPLServerImpl extends EventEmitter {
         const decl = /^(var|let|const)\s+([A-Za-z_$][\w$]*)(?:\s*=\s*([\s\S]*?))?\s*;?$/.exec(noComments);
         const multilineVar = /^var\s+([A-Za-z_$][\w$]*)\s*=\s*([\s\S]*?);?$/.exec(noComments);
         const classDecl = /^class\s+([A-Za-z_$][\w$]*)\b[\s\S]*$/.exec(noComments);
+        const fnDecl = /^function\s+([A-Za-z_$][\w$]*)\s*\(/.exec(noComments);
         const assign = /^([A-Za-z_$][\w$]*)\s*=(?!=)\s*([\s\S]*?)\s*;?$/.exec(noComments);
         const memberAssign = /^([A-Za-z_$][\w$]*)\.([A-Za-z_$][\w$]*)\s*=(?!=)\s*([\s\S]*?)\s*;?$/.exec(noComments);
         const globalGet = /^globalThis\.([A-Za-z_$][\w$]*)\s*;?$/.exec(noComments);
@@ -346,6 +347,12 @@ class REPLServerImpl extends EventEmitter {
           result = undefined;
         } else if (classDecl) {
           const name = classDecl[1];
+          const value = this.useGlobal ? (0, eval)(`(${noComments})`) : this._evalWithContext(`(${noComments})`, _file);
+          if (this.useGlobal) globalThis[name] = value;
+          else this.context[name] = value;
+          result = undefined;
+        } else if (fnDecl) {
+          const name = fnDecl[1];
           const value = this.useGlobal ? (0, eval)(`(${noComments})`) : this._evalWithContext(`(${noComments})`, _file);
           if (this.useGlobal) globalThis[name] = value;
           else this.context[name] = value;

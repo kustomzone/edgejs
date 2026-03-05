@@ -191,6 +191,15 @@ bool ValueInstanceOfGlobalCtor(napi_env env, napi_value value, const char* ctor_
   return result;
 }
 
+bool IsInternalScriptName(std::string_view script_name) {
+  if (script_name.empty()) return false;
+  if (script_name.rfind("node:", 0) == 0) return true;
+  return script_name.find("/node-lib/") != std::string::npos ||
+         script_name.find("\\node-lib\\") != std::string::npos ||
+         script_name.find("/ubi/src/builtins/") != std::string::npos ||
+         script_name.find("\\ubi\\src\\builtins\\") != std::string::npos;
+}
+
 static uint32_t GetUVHandleTypeCode(uv_handle_type type) {
   switch (type) {
     case UV_TCP:
@@ -235,36 +244,46 @@ napi_value IsInsideNodeModulesCallback(napi_env env, napi_callback_info info) {
 
   int32_t frame_limit = 10;
   if (argc >= 1 && argv[0] != nullptr) {
-    napi_get_value_int32(env, argv[0], &frame_limit);
+    napi_valuetype type = napi_undefined;
+    if (napi_typeof(env, argv[0], &type) == napi_ok && type == napi_number) {
+      int32_t candidate = 0;
+      if (napi_get_value_int32(env, argv[0], &candidate) == napi_ok) {
+        frame_limit = candidate;
+      }
+    }
   }
+  if (frame_limit < 1) frame_limit = 1;
 
   bool result = false;
-  if (frame_limit > 1) {
-    uint32_t frames = static_cast<uint32_t>(frame_limit - 1);
-    if (frames > 200) frames = 200;
+  uint32_t frames = static_cast<uint32_t>(frame_limit);
+  if (frames > 200) frames = 200;
 
-    napi_value callsites = nullptr;
-    if (unofficial_napi_get_call_sites(env, frames, &callsites) == napi_ok && callsites != nullptr) {
-      bool is_array = false;
-      if (napi_is_array(env, callsites, &is_array) == napi_ok && is_array) {
-        uint32_t length = 0;
-        if (napi_get_array_length(env, callsites, &length) == napi_ok) {
-          for (uint32_t i = 0; i < length; ++i) {
-            napi_value callsite = nullptr;
-            if (napi_get_element(env, callsites, i, &callsite) != napi_ok || callsite == nullptr) continue;
+  napi_value callsites = nullptr;
+  if (unofficial_napi_get_call_sites(env, frames, &callsites) == napi_ok && callsites != nullptr) {
+    bool is_array = false;
+    if (napi_is_array(env, callsites, &is_array) == napi_ok && is_array) {
+      uint32_t length = 0;
+      if (napi_get_array_length(env, callsites, &length) == napi_ok) {
+        for (uint32_t i = 0; i < length; ++i) {
+          napi_value callsite = nullptr;
+          if (napi_get_element(env, callsites, i, &callsite) != napi_ok || callsite == nullptr) continue;
 
-            napi_value script_name = GetNamedProperty(env, callsite, "scriptName");
-            std::string script_name_str;
-            if (!ValueToUtf8IfString(env, script_name, &script_name_str)) continue;
-            if (script_name_str.empty()) continue;
-            if (script_name_str.rfind("node:", 0) == 0) continue;
-
-            result = script_name_str.find("/node_modules/") != std::string::npos ||
-                     script_name_str.find("\\node_modules\\") != std::string::npos ||
-                     script_name_str.find("/node_modules\\") != std::string::npos ||
-                     script_name_str.find("\\node_modules/") != std::string::npos;
-            break;
+          napi_value script_name = GetNamedProperty(env, callsite, "scriptName");
+          std::string script_name_str;
+          ValueToUtf8IfString(env, script_name, &script_name_str);
+          if (script_name_str.empty()) {
+            script_name = GetNamedProperty(env, callsite, "scriptNameOrSourceURL");
+            script_name_str.clear();
+            ValueToUtf8IfString(env, script_name, &script_name_str);
           }
+          if (script_name_str.empty()) continue;
+          if (IsInternalScriptName(script_name_str)) continue;
+
+          result = script_name_str.find("/node_modules/") != std::string::npos ||
+                   script_name_str.find("\\node_modules\\") != std::string::npos ||
+                   script_name_str.find("/node_modules\\") != std::string::npos ||
+                   script_name_str.find("\\node_modules/") != std::string::npos;
+          break;
         }
       }
     }
@@ -563,7 +582,7 @@ napi_value GetProxyDetailsCallback(napi_env env, napi_callback_info info) {
 
 napi_value GetCallerLocationCallback(napi_env env, napi_callback_info /*info*/) {
   napi_value callsites = nullptr;
-  if (unofficial_napi_get_call_sites(env, 2, &callsites) != napi_ok || callsites == nullptr) {
+  if (unofficial_napi_get_call_sites(env, 64, &callsites) != napi_ok || callsites == nullptr) {
     return Undefined(env);
   }
 
@@ -571,47 +590,74 @@ napi_value GetCallerLocationCallback(napi_env env, napi_callback_info /*info*/) 
   if (napi_is_array(env, callsites, &is_array) != napi_ok || !is_array) return Undefined(env);
 
   uint32_t length = 0;
-  if (napi_get_array_length(env, callsites, &length) != napi_ok || length < 1) return Undefined(env);
+  if (napi_get_array_length(env, callsites, &length) != napi_ok || length == 0) return Undefined(env);
 
-  napi_value callsite = nullptr;
-  if (napi_get_element(env, callsites, 0, &callsite) != napi_ok || callsite == nullptr) return Undefined(env);
+  auto location_from_frame = [&](uint32_t index, napi_value* out) -> bool {
+    if (index >= length || out == nullptr) return false;
+    *out = nullptr;
 
-  napi_value file = GetNamedProperty(env, callsite, "scriptNameOrSourceURL");
-  std::string file_str;
-  ValueToUtf8IfString(env, file, &file_str);
-  if (file_str.empty()) {
-    file = GetNamedProperty(env, callsite, "scriptName");
-    file_str.clear();
+    napi_value callsite = nullptr;
+    if (napi_get_element(env, callsites, index, &callsite) != napi_ok || callsite == nullptr) return false;
+
+    napi_value file = GetNamedProperty(env, callsite, "scriptNameOrSourceURL");
+    std::string file_str;
     ValueToUtf8IfString(env, file, &file_str);
+    if (file_str.empty()) {
+      file = GetNamedProperty(env, callsite, "scriptName");
+      file_str.clear();
+      ValueToUtf8IfString(env, file, &file_str);
+    }
+    if (file_str.empty()) {
+      if (napi_create_string_utf8(env, "", 0, &file) != napi_ok || file == nullptr) {
+        return false;
+      }
+    }
+
+    napi_value line_v = GetNamedProperty(env, callsite, "lineNumber");
+    napi_value column_v = GetNamedProperty(env, callsite, "columnNumber");
+    if (line_v == nullptr || column_v == nullptr) return false;
+
+    uint32_t line = 0;
+    uint32_t column = 0;
+    if (napi_get_value_uint32(env, line_v, &line) != napi_ok ||
+        napi_get_value_uint32(env, column_v, &column) != napi_ok) {
+      return false;
+    }
+
+    napi_value location = nullptr;
+    if (napi_create_array_with_length(env, 3, &location) != napi_ok || location == nullptr) return false;
+
+    napi_value line_out = nullptr;
+    napi_value column_out = nullptr;
+    if (napi_create_uint32(env, line, &line_out) != napi_ok || line_out == nullptr) return false;
+    if (napi_create_uint32(env, column, &column_out) != napi_ok || column_out == nullptr) return false;
+
+    if (napi_set_element(env, location, 0, line_out) != napi_ok ||
+        napi_set_element(env, location, 1, column_out) != napi_ok ||
+        napi_set_element(env, location, 2, file) != napi_ok) {
+      return false;
+    }
+
+    *out = location;
+    return true;
+  };
+
+  // Node uses frame 1 because frame 0 is native util internals. When call-site
+  // metadata includes wrapper frames without script names, fall back to frame 0.
+  napi_value out = nullptr;
+  if (length > 1 && location_from_frame(1, &out)) {
+    return out;
   }
-  if (file_str.empty()) {
-    if (napi_create_string_utf8(env, "[eval]", NAPI_AUTO_LENGTH, &file) != napi_ok || file == nullptr) {
-      return Undefined(env);
+  if (location_from_frame(0, &out)) {
+    return out;
+  }
+  for (uint32_t i = 0; i < length; ++i) {
+    if (i == 0 || i == 1) continue;
+    if (location_from_frame(i, &out)) {
+      return out;
     }
   }
-
-  napi_value line_v = GetNamedProperty(env, callsite, "lineNumber");
-  napi_value column_v = GetNamedProperty(env, callsite, "columnNumber");
-  if (line_v == nullptr || column_v == nullptr) return Undefined(env);
-
-  int32_t line = 0;
-  int32_t column = 0;
-  if (napi_get_value_int32(env, line_v, &line) != napi_ok || napi_get_value_int32(env, column_v, &column) != napi_ok) {
-    return Undefined(env);
-  }
-
-  napi_value out = nullptr;
-  if (napi_create_array_with_length(env, 3, &out) != napi_ok || out == nullptr) return Undefined(env);
-
-  napi_value line_out = nullptr;
-  napi_value column_out = nullptr;
-  if (napi_create_int32(env, line, &line_out) != napi_ok || line_out == nullptr) return Undefined(env);
-  if (napi_create_int32(env, column, &column_out) != napi_ok || column_out == nullptr) return Undefined(env);
-  if (napi_set_element(env, out, 0, line_out) != napi_ok || napi_set_element(env, out, 1, column_out) != napi_ok ||
-      napi_set_element(env, out, 2, file) != napi_ok) {
-    return Undefined(env);
-  }
-  return out;
+  return Undefined(env);
 }
 
 napi_value PreviewEntriesCallback(napi_env env, napi_callback_info info) {

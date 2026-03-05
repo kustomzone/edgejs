@@ -580,20 +580,122 @@ function writeSync(fd, buffer, offsetOrOptions, length, position) {
 
 const setImmediateOrSync = globalThis.setImmediate || function (fn) { fn(); };
 
-function createReadStream(filePath, options) {
-  const EventEmitter = require('events');
-  const stream = new EventEmitter();
+function ReadStream(filePath, options) {
+  if (!(this instanceof ReadStream)) return new ReadStream(filePath, options);
+  EventEmitter.call(this);
+  const opts = options && typeof options === 'object' ? options : {};
+  this.path = filePath;
+  this.fd = typeof opts.fd === 'number' ? opts.fd : null;
+  this.flags = opts.flags === undefined ? 'r' : opts.flags;
+  this.mode = opts.mode === undefined ? 0o666 : opts.mode;
+  this.autoClose = opts.autoClose !== false;
+  this.readable = true;
+  this._destroyed = false;
+
   setImmediateOrSync(() => {
+    if (this.fd !== null) {
+      this.emit('open', this.fd);
+      this.emit('ready');
+      return;
+    }
     try {
-      const data = readFileSync(filePath, options);
-      stream.emit('data', data);
-      stream.emit('close');
-      stream.emit('end');
+      const data = readFileSync(filePath, opts);
+      this.emit('data', data);
+      this.emit('end');
+      this.emit('close');
     } catch (err) {
-      stream.emit('error', err);
+      this.emit('error', err);
     }
   });
-  return stream;
+}
+
+ReadStream.prototype = Object.create(EventEmitter.prototype);
+ReadStream.prototype.constructor = ReadStream;
+
+ReadStream.prototype.pause = function pause() {
+  return this;
+};
+
+ReadStream.prototype.resume = function resume() {
+  return this;
+};
+
+ReadStream.prototype.end = function end() {
+  if (this._destroyed) return this;
+  this.emit('end');
+  this.emit('close');
+  return this;
+};
+
+ReadStream.prototype.destroy = function destroy(err) {
+  if (this._destroyed) return this;
+  this._destroyed = true;
+  if (err) this.emit('error', err);
+  this.emit('close');
+  return this;
+};
+
+function WriteStream(filePath, options) {
+  if (!(this instanceof WriteStream)) return new WriteStream(filePath, options);
+  EventEmitter.call(this);
+  const opts = options && typeof options === 'object' ? options : {};
+  this.path = filePath;
+  this.fd = typeof opts.fd === 'number' ? opts.fd : null;
+  this.flags = opts.flags === undefined ? 'w' : opts.flags;
+  this.mode = opts.mode === undefined ? 0o666 : opts.mode;
+  this.autoClose = opts.autoClose !== false;
+  this.writable = true;
+}
+
+WriteStream.prototype = Object.create(EventEmitter.prototype);
+WriteStream.prototype.constructor = WriteStream;
+
+WriteStream.prototype.write = function write(chunk, encoding, callback) {
+  let cb = callback;
+  let data = chunk;
+  if (typeof encoding === 'function') cb = encoding;
+  if (typeof data !== 'string' && !(data && typeof data.byteLength === 'number')) {
+    data = String(data);
+  }
+  try {
+    if (this.fd !== null) {
+      if (typeof data === 'string') {
+        writeSync(this.fd, data);
+      } else {
+        writeSync(this.fd, data, 0, data.byteLength, null);
+      }
+    } else if (this.path != null) {
+      appendFileSync(this.path, data, { mode: this.mode, flag: this.flags });
+    }
+    if (typeof cb === 'function') cb();
+    return true;
+  } catch (err) {
+    if (typeof cb === 'function') cb(err);
+    this.emit('error', err);
+    return false;
+  }
+};
+
+WriteStream.prototype.end = function end(chunk, encoding, callback) {
+  if (chunk !== undefined) this.write(chunk, encoding);
+  if (typeof callback === 'function') callback();
+  this.emit('finish');
+  this.emit('close');
+  return this;
+};
+
+WriteStream.prototype.destroy = function destroy(err) {
+  if (err) this.emit('error', err);
+  this.emit('close');
+  return this;
+};
+
+function createReadStream(filePath, options) {
+  return new ReadStream(filePath, options);
+}
+
+function createWriteStream(filePath, options) {
+  return new WriteStream(filePath, options);
 }
 
 function makeCallback(cb) {
@@ -1347,6 +1449,7 @@ module.exports = {
   writeSync,
   read,
   createReadStream,
+  createWriteStream,
   open,
   close,
   renameSync,
@@ -1380,6 +1483,10 @@ module.exports = {
   Stats,
   Dir,
   FSWatcher,
+  ReadStream,
+  WriteStream,
+  FileReadStream: ReadStream,
+  FileWriteStream: WriteStream,
 };
 module.exports.rename = rename;
 

@@ -66,6 +66,76 @@ bool GetBufferBytes(napi_env env, napi_value value, uint8_t** data, size_t* len)
   return false;
 }
 
+size_t TypedArrayBytesPerElement(napi_typedarray_type type) {
+  switch (type) {
+    case napi_int8_array:
+    case napi_uint8_array:
+    case napi_uint8_clamped_array:
+      return 1;
+    case napi_int16_array:
+    case napi_uint16_array:
+      return 2;
+    case napi_int32_array:
+    case napi_uint32_array:
+    case napi_float32_array:
+      return 4;
+    case napi_float64_array:
+    case napi_bigint64_array:
+    case napi_biguint64_array:
+      return 8;
+    default:
+      return 1;
+  }
+}
+
+bool GetBufferSourceBytes(napi_env env, napi_value value, uint8_t** data, size_t* len) {
+  static uint8_t kEmptyBufferSentinel = 0;
+  if (GetBufferBytes(env, value, data, len)) return true;
+
+  bool is_arraybuffer = false;
+  if (napi_is_arraybuffer(env, value, &is_arraybuffer) == napi_ok && is_arraybuffer) {
+    void* raw = nullptr;
+    size_t byte_len = 0;
+    if (napi_get_arraybuffer_info(env, value, &raw, &byte_len) != napi_ok) return false;
+    if (raw == nullptr && byte_len != 0) return false;
+    *data = raw != nullptr ? static_cast<uint8_t*>(raw) : &kEmptyBufferSentinel;
+    *len = byte_len;
+    return true;
+  }
+
+  bool is_typedarray = false;
+  if (napi_is_typedarray(env, value, &is_typedarray) == napi_ok && is_typedarray) {
+    napi_typedarray_type ta_type = napi_uint8_array;
+    size_t element_len = 0;
+    void* raw = nullptr;
+    napi_value ab = nullptr;
+    size_t byte_offset = 0;
+    if (napi_get_typedarray_info(env, value, &ta_type, &element_len, &raw, &ab, &byte_offset) != napi_ok) {
+      return false;
+    }
+    const size_t byte_len = element_len * TypedArrayBytesPerElement(ta_type);
+    if (raw == nullptr && byte_len != 0) return false;
+    *data = raw != nullptr ? static_cast<uint8_t*>(raw) : &kEmptyBufferSentinel;
+    *len = byte_len;
+    return true;
+  }
+
+  bool is_dataview = false;
+  if (napi_is_dataview(env, value, &is_dataview) == napi_ok && is_dataview) {
+    size_t byte_len = 0;
+    void* raw = nullptr;
+    napi_value ab = nullptr;
+    size_t byte_offset = 0;
+    if (napi_get_dataview_info(env, value, &byte_len, &raw, &ab, &byte_offset) != napi_ok) return false;
+    if (raw == nullptr && byte_len != 0) return false;
+    *data = raw != nullptr ? static_cast<uint8_t*>(raw) : &kEmptyBufferSentinel;
+    *len = byte_len;
+    return true;
+  }
+
+  return false;
+}
+
 napi_value MakeError(napi_env env, const char* code, const char* message) {
   napi_value code_v = nullptr;
   napi_value msg_v = nullptr;
@@ -249,8 +319,8 @@ napi_value CryptoRandomFillSync(napi_env env, napi_callback_info info) {
   if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok || argc < 1) return nullptr;
   uint8_t* data = nullptr;
   size_t len = 0;
-  if (!GetBufferBytes(env, argv[0], &data, &len)) {
-    ThrowError(env, "ERR_INVALID_ARG_TYPE", "buffer must be a Buffer");
+  if (!GetBufferSourceBytes(env, argv[0], &data, &len)) {
+    ThrowError(env, "ERR_INVALID_ARG_TYPE", "buffer must be an ArrayBuffer or ArrayBufferView");
     return nullptr;
   }
   int32_t offset = 0;

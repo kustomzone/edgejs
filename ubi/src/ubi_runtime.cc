@@ -168,6 +168,21 @@ std::string GetAndClearPendingException(napi_env env, bool* is_process_exit, int
     }
   }
 
+  napi_value stack_value = nullptr;
+  if (napi_get_named_property(env, exception, "stack", &stack_value) == napi_ok && stack_value != nullptr) {
+    napi_value stack_string = nullptr;
+    if (napi_coerce_to_string(env, stack_value, &stack_string) == napi_ok && stack_string != nullptr) {
+      size_t stack_len = 0;
+      if (napi_get_value_string_utf8(env, stack_string, nullptr, 0, &stack_len) == napi_ok && stack_len > 0) {
+        std::vector<char> stack_buf(stack_len + 1, '\0');
+        size_t copied = 0;
+        if (napi_get_value_string_utf8(env, stack_string, stack_buf.data(), stack_buf.size(), &copied) == napi_ok) {
+          return std::string(stack_buf.data(), copied);
+        }
+      }
+    }
+  }
+
   napi_value exception_string = nullptr;
   if (napi_coerce_to_string(env, exception, &exception_string) != napi_ok || exception_string == nullptr) {
     return "";
@@ -822,6 +837,57 @@ void ParseNodeStyleFlagsFromSource(const char* source_text) {
   }
 }
 
+bool ExecArgvHasFlag(const char* flag) {
+  if (flag == nullptr || flag[0] == '\0') return false;
+  for (const auto& arg : g_ubi_exec_argv) {
+    if (arg == flag) return true;
+  }
+  return false;
+}
+
+bool ShouldExposeGc() {
+  return ExecArgvHasFlag("--expose-gc") || ExecArgvHasFlag("--expose_gc");
+}
+
+napi_value GlobalGcCallback(napi_env env, napi_callback_info /*info*/) {
+  if (unofficial_napi_request_gc_for_testing(env) != napi_ok) {
+    napi_throw_error(env, nullptr, "Failed to run gc()");
+    return nullptr;
+  }
+  napi_value undefined = nullptr;
+  napi_get_undefined(env, &undefined);
+  return undefined;
+}
+
+bool EnsureGlobalGcIfRequested(napi_env env, napi_value global, std::string* error_out) {
+  if (!ShouldExposeGc()) return true;
+  if (env == nullptr || global == nullptr) return false;
+
+  bool has_gc = false;
+  if (napi_has_named_property(env, global, "gc", &has_gc) != napi_ok) return false;
+  if (has_gc) {
+    napi_value existing_gc = nullptr;
+    napi_valuetype type = napi_undefined;
+    if (napi_get_named_property(env, global, "gc", &existing_gc) == napi_ok &&
+        existing_gc != nullptr &&
+        napi_typeof(env, existing_gc, &type) == napi_ok &&
+        type == napi_function) {
+      return true;
+    }
+  }
+
+  napi_value gc_fn = nullptr;
+  if (napi_create_function(env, "gc", NAPI_AUTO_LENGTH, GlobalGcCallback, nullptr, &gc_fn) != napi_ok ||
+      gc_fn == nullptr ||
+      napi_set_named_property(env, global, "gc", gc_fn) != napi_ok) {
+    if (error_out != nullptr) {
+      *error_out = "Failed to install global gc()";
+    }
+    return false;
+  }
+  return true;
+}
+
 napi_value ConsoleLogCallback(napi_env env, napi_callback_info info) {
   size_t argc = 8;
   napi_value args[8] = {nullptr};
@@ -852,6 +918,161 @@ napi_value ConsoleLogCallback(napi_env env, napi_callback_info info) {
   napi_value undefined = nullptr;
   napi_get_undefined(env, &undefined);
   return undefined;
+}
+
+napi_value ReturnUndefinedCallback(napi_env env, napi_callback_info /*info*/) {
+  napi_value undefined = nullptr;
+  napi_get_undefined(env, &undefined);
+  return undefined;
+}
+
+bool GetNamedProperty(napi_env env, napi_value obj, const char* key, napi_value* out) {
+  if (out == nullptr) return false;
+  *out = nullptr;
+  if (obj == nullptr) return false;
+  return napi_get_named_property(env, obj, key, out) == napi_ok && *out != nullptr;
+}
+
+bool IsFunction(napi_env env, napi_value value) {
+  if (value == nullptr) return false;
+  napi_valuetype type = napi_undefined;
+  return napi_typeof(env, value, &type) == napi_ok && type == napi_function;
+}
+
+bool IsUndefinedValue(napi_env env, napi_value value) {
+  if (value == nullptr) return true;
+  napi_valuetype type = napi_undefined;
+  return napi_typeof(env, value, &type) == napi_ok && type == napi_undefined;
+}
+
+bool CallFunction(napi_env env,
+                  napi_value recv,
+                  napi_value fn,
+                  size_t argc,
+                  napi_value* argv,
+                  napi_value* out) {
+  if (env == nullptr || recv == nullptr || fn == nullptr) return false;
+  napi_value result = nullptr;
+  if (napi_call_function(env, recv, fn, argc, argv, &result) != napi_ok) return false;
+  if (out != nullptr) *out = result;
+  return true;
+}
+
+bool RequireModule(napi_env env, const char* id, napi_value* out) {
+  if (out != nullptr) *out = nullptr;
+  napi_value global = nullptr;
+  if (napi_get_global(env, &global) != napi_ok || global == nullptr) return false;
+
+  napi_value require_fn = nullptr;
+  if (!GetNamedProperty(env, global, "require", &require_fn) || !IsFunction(env, require_fn)) return false;
+
+  napi_value id_value = nullptr;
+  if (napi_create_string_utf8(env, id, NAPI_AUTO_LENGTH, &id_value) != napi_ok || id_value == nullptr) {
+    return false;
+  }
+
+  return CallFunction(env, global, require_fn, 1, &id_value, out);
+}
+
+bool EnsureProcessConstructorPrototypeLink(napi_env env, napi_value process_proto) {
+  if (env == nullptr || process_proto == nullptr) return false;
+
+  napi_value constructor_key = nullptr;
+  if (napi_create_string_utf8(env, "constructor", NAPI_AUTO_LENGTH, &constructor_key) != napi_ok ||
+      constructor_key == nullptr) {
+    return false;
+  }
+
+  bool has_own_constructor = false;
+  if (napi_has_own_property(env, process_proto, constructor_key, &has_own_constructor) != napi_ok ||
+      !has_own_constructor) {
+    return true;
+  }
+
+  napi_value ctor = nullptr;
+  if (!GetNamedProperty(env, process_proto, "constructor", &ctor) || !IsFunction(env, ctor)) {
+    return true;
+  }
+
+  napi_value ctor_proto = nullptr;
+  if (!GetNamedProperty(env, ctor, "prototype", &ctor_proto) || ctor_proto == nullptr) {
+    return true;
+  }
+
+  bool already_linked = false;
+  if (napi_strict_equals(env, ctor_proto, process_proto, &already_linked) != napi_ok) {
+    return false;
+  }
+  if (already_linked) return true;
+
+  return napi_set_named_property(env, ctor, "prototype", process_proto) == napi_ok;
+}
+
+bool PrepareProcessPrototypeForBootstrap(napi_env env, std::string* error_out) {
+  napi_value global = nullptr;
+  if (napi_get_global(env, &global) != napi_ok || global == nullptr) return false;
+
+  napi_value process_obj = nullptr;
+  if (!GetNamedProperty(env, global, "process", &process_obj)) return false;
+
+  napi_value process_proto = nullptr;
+  if (napi_get_prototype(env, process_obj, &process_proto) != napi_ok || process_proto == nullptr) {
+    return false;
+  }
+
+  napi_value object_ctor = nullptr;
+  if (!GetNamedProperty(env, global, "Object", &object_ctor)) return false;
+  napi_value object_proto = nullptr;
+  if (!GetNamedProperty(env, object_ctor, "prototype", &object_proto)) return false;
+
+  bool is_default_object_proto = false;
+  if (napi_strict_equals(env, process_proto, object_proto, &is_default_object_proto) != napi_ok ||
+      !is_default_object_proto) {
+    if (!EnsureProcessConstructorPrototypeLink(env, process_proto)) {
+      if (error_out != nullptr) {
+        bool is_exit = false;
+        int exit_code = 0;
+        std::string msg = "Failed to link process.constructor.prototype";
+        const std::string exc = GetAndClearPendingException(env, &is_exit, &exit_code);
+        if (!exc.empty()) {
+          msg += ": ";
+          msg += exc;
+        }
+        *error_out = msg;
+      }
+      return false;
+    }
+    return true;
+  }
+
+  napi_value fresh_process_proto = nullptr;
+  if (napi_create_object(env, &fresh_process_proto) != napi_ok || fresh_process_proto == nullptr) {
+    return false;
+  }
+
+  napi_value set_prototype_of = nullptr;
+  if (!GetNamedProperty(env, object_ctor, "setPrototypeOf", &set_prototype_of) ||
+      !IsFunction(env, set_prototype_of)) {
+    return false;
+  }
+
+  napi_value argv[2] = {process_obj, fresh_process_proto};
+  if (!CallFunction(env, object_ctor, set_prototype_of, 2, argv, nullptr)) {
+    if (error_out != nullptr) {
+      bool is_exit = false;
+      int exit_code = 0;
+      std::string msg = "Failed to prepare process prototype for bootstrap";
+      const std::string exc = GetAndClearPendingException(env, &is_exit, &exit_code);
+      if (!exc.empty()) {
+        msg += ": ";
+        msg += exc;
+      }
+      *error_out = msg;
+    }
+    return false;
+  }
+
+  return true;
 }
 
 int RunScriptWithGlobals(napi_env env,
@@ -893,52 +1114,7 @@ int RunScriptWithGlobals(napi_env env,
     return 1;
   }
 
-  static const char kConsoleBootstrap[] =
-      "(function(){"
-      "if (typeof process !== 'object' || !process) return;"
-      "try {"
-      "  if (Object.getPrototypeOf(process) === Object.prototype) {"
-      "    var __ProcessCtor = function process() {};"
-      "    var __procProto = { __proto__: Object.prototype };"
-      "    Object.defineProperty(__procProto, 'constructor', {"
-      "      value: __ProcessCtor, writable: true, enumerable: false, configurable: true"
-      "    });"
-      "    Object.defineProperty(__ProcessCtor, 'prototype', {"
-      "      value: __procProto, writable: false, enumerable: false, configurable: false"
-      "    });"
-      "    Object.setPrototypeOf(process, __procProto);"
-      "  }"
-      "} catch (_) {}"
-      "try {"
-      "  var __osBootstrap = (typeof globalThis.require === 'function') ? globalThis.require('os') : null;"
-      "  if (__osBootstrap && __osBootstrap.constants && __osBootstrap.constants.signals) {"
-      "    Object.freeze(__osBootstrap.constants.signals);"
-      "  }"
-      "} catch (_) {}"
-      "if (typeof process.platform !== 'string') process.platform = 'darwin';"
-      "})();";
-  napi_value bootstrap_script = nullptr;
-  status = napi_create_string_utf8(env, kConsoleBootstrap, NAPI_AUTO_LENGTH, &bootstrap_script);
-  if (status != napi_ok || bootstrap_script == nullptr) {
-    if (error_out != nullptr) {
-      *error_out = "Bootstrap script creation failed: " + StatusToString(status);
-    }
-    return 1;
-  }
-  {
-    napi_value ignored = nullptr;
-    status = napi_run_script(env, bootstrap_script, &ignored);
-  }
-  if (status != napi_ok) {
-    if (error_out != nullptr) {
-      *error_out = "Bootstrap script failed: " + StatusToString(status);
-    }
-    return 1;
-  }
-
-  // Create empty primordials container on the native side first (Node-aligned). The prelude's
-  // require('internal/bootstrap/realm') will receive this via the loader wrapper and fill
-  // it in place, so one object identity is used for all modules regardless of load order.
+  // Create empty primordials container on the native side first (Node-aligned).
   napi_value primordials_container = nullptr;
   if (napi_create_object(env, &primordials_container) != napi_ok || primordials_container == nullptr) {
     if (error_out != nullptr) {
@@ -948,181 +1124,390 @@ int RunScriptWithGlobals(napi_env env,
   }
   UbiSetPrimordials(env, primordials_container);
 
-  // Bootstrap: load internal/bootstrap/realm using a require that resolves from builtins
-  // dir (so it is found regardless of entry script path). Declare internalBinding and primordials
-  // once; do not run entry script until these are set.
-  static const char kBootstrapPrelude[] =
-      "globalThis.global = globalThis;"
-      "var __bootstrapRequire = globalThis.require;"
-      "if (typeof __bootstrapRequire !== 'function') throw new Error('require is not a function');"
-      "var __ib = __bootstrapRequire('internal/bootstrap/realm');"
-      "if (!__ib || typeof __ib.internalBinding !== 'function') throw new Error('internal/bootstrap/realm did not export internalBinding');"
-      "globalThis.internalBinding = __ib.internalBinding;"
-      "if (__ib && __ib.primordials) globalThis.primordials = __ib.primordials;"
-      "try {"
-      "  var __utilBinding = globalThis.internalBinding('util');"
-      "  var __utilConstants = (__utilBinding && __utilBinding.constants) || {};"
-      "  var __privateSymbols = (__utilBinding && __utilBinding.privateSymbols) || {};"
-      "  var __exitInfoSym = __privateSymbols.exit_info_private_symbol;"
-      "  if (__exitInfoSym && process && typeof process === 'object' && process[__exitInfoSym] == null) {"
-      "    var __fields = {};"
-      "    __fields[__utilConstants.kExitCode !== undefined ? __utilConstants.kExitCode : 0] = 0;"
-      "    __fields[__utilConstants.kExiting !== undefined ? __utilConstants.kExiting : 1] = 0;"
-      "    __fields[__utilConstants.kHasExitCode !== undefined ? __utilConstants.kHasExitCode : 2] = 0;"
-      "    process[__exitInfoSym] = __fields;"
-      "  }"
-      "} catch (_) {}"
-      "try {"
-      "  __bootstrapRequire('internal/bootstrap/node');"
-      "  if (process && typeof process === 'object') {"
-      "    var __procProto = Object.getPrototypeOf(process);"
-      "    if (__procProto && !Object.prototype.hasOwnProperty.call(__procProto, 'constructor')) {"
-      "      var __ProcessCtor2 = function process() {};"
-      "      Object.defineProperty(__procProto, 'constructor', {"
-      "        value: __ProcessCtor2, writable: true, enumerable: false, configurable: true"
-      "      });"
-      "      Object.defineProperty(__ProcessCtor2, 'prototype', {"
-      "        value: __procProto, writable: false, enumerable: false, configurable: false"
-      "      });"
-      "    }"
-      "    if (typeof process.abort === 'function' && Object.prototype.hasOwnProperty.call(process.abort, 'prototype')) {"
-      "      var __abort = process.abort;"
-      "      process.abort = (...args) => Reflect.apply(__abort, process, args);"
-      "    }"
-      "    try {"
-      "      var __errors = __bootstrapRequire('internal/errors');"
-      "      var __codes = (__errors && __errors.codes) || {};"
-      "      var ERR_INVALID_ARG_TYPE = __codes.ERR_INVALID_ARG_TYPE;"
-      "      var ERR_UNKNOWN_CREDENTIAL = __codes.ERR_UNKNOWN_CREDENTIAL;"
-      "      var ERR_OUT_OF_RANGE = __codes.ERR_OUT_OF_RANGE;"
-      "      var __uid = 1000;"
-      "      var __gid = 1000;"
-      "      if (typeof process.getuid !== 'function') process.getuid = function() { return __uid; };"
-      "      if (typeof process.geteuid !== 'function') process.geteuid = function() { return __uid; };"
-      "      if (typeof process.getgid !== 'function') process.getgid = function() { return __gid; };"
-      "      if (typeof process.getegid !== 'function') process.getegid = function() { return __gid; };"
-      "      if (typeof process.getgroups !== 'function') process.getgroups = function() { return [__gid]; };"
-      "      var __validateId = function(v, name) {"
-      "        if (typeof v !== 'number' && typeof v !== 'string') {"
-      "          throw new ERR_INVALID_ARG_TYPE(name, ['number', 'string'], v);"
-      "        }"
-      "      };"
-      "      if (typeof process.setuid !== 'function') process.setuid = function(id) {"
-      "        __validateId(id, 'id');"
-      "        if (typeof id === 'string') {"
-      "          if (id === 'nobody') throw new Error('User identifier does not exist: nobody');"
-      "          throw new ERR_UNKNOWN_CREDENTIAL('User', id);"
-      "        }"
-      "      };"
-      "      if (typeof process.seteuid !== 'function') process.seteuid = function(id) {"
-      "        __validateId(id, 'id');"
-      "        if (typeof id === 'string') {"
-      "          if (id === 'nobody') throw new Error('User identifier does not exist: nobody');"
-      "          throw new ERR_UNKNOWN_CREDENTIAL('User', id);"
-      "        }"
-      "      };"
-      "      if (typeof process.setgid !== 'function') process.setgid = function(id) {"
-      "        __validateId(id, 'id');"
-      "        if (typeof id === 'string') throw new ERR_UNKNOWN_CREDENTIAL('Group', id);"
-      "      };"
-      "      if (typeof process.setegid !== 'function') process.setegid = function(id) {"
-      "        __validateId(id, 'id');"
-      "        if (typeof id === 'string') throw new ERR_UNKNOWN_CREDENTIAL('Group', id);"
-      "      };"
-      "      if (typeof process.setgroups !== 'function') process.setgroups = function(groups) {"
-      "        if (!Array.isArray(groups)) throw new ERR_INVALID_ARG_TYPE('groups', 'Array', groups);"
-      "        for (var i = 0; i < groups.length; i++) {"
-      "          var g = groups[i];"
-      "          if (typeof g !== 'number' && typeof g !== 'string') {"
-      "            throw new ERR_INVALID_ARG_TYPE('groups[' + i + ']', ['number', 'string'], g);"
-      "          }"
-      "          if (typeof g === 'number' && (!Number.isInteger(g) || g < 0 || g > 0x7fffffff)) {"
-      "            throw new ERR_OUT_OF_RANGE('groups[' + i + ']', '>= 0 && <= 2147483647', g);"
-      "          }"
-      "          if (typeof g === 'string') throw new ERR_UNKNOWN_CREDENTIAL('Group', g);"
-      "        }"
-      "      };"
-      "      if (typeof process.initgroups !== 'function') process.initgroups = function(user, extraGroup) {"
-      "        __validateId(user, 'user');"
-      "        __validateId(extraGroup, 'extraGroup');"
-      "        if (typeof extraGroup === 'string') throw new ERR_UNKNOWN_CREDENTIAL('Group', extraGroup);"
-      "      };"
-      "    } catch (_) {}"
-      "  }"
-      "} catch (e) {"
-      "  throw new Error('internal/bootstrap/node failed: ' + String(e && (e.stack || e.message || e)));"
-      "}";
-  napi_value bootstrap_prelude = nullptr;
-  status = napi_create_string_utf8(env, kBootstrapPrelude, NAPI_AUTO_LENGTH, &bootstrap_prelude);
-  if (status == napi_ok && bootstrap_prelude != nullptr) {
-    napi_value bootstrap_ignored = nullptr;
-    status = napi_run_script(env, bootstrap_prelude, &bootstrap_ignored);
-  }
-  if (status != napi_ok) {
+  napi_value global = nullptr;
+  if (napi_get_global(env, &global) != napi_ok || global == nullptr) {
     if (error_out != nullptr) {
-      std::string msg = "Bootstrap prelude failed (internalBinding not set): " + StatusToString(status);
-      if (status == napi_pending_exception) {
-        bool is_exit = false;
-        int exit_code = 0;
-        std::string exc = GetAndClearPendingException(env, &is_exit, &exit_code);
-        if (!exc.empty()) {
-          msg += " ";
-          msg += exc;
-        }
+      *error_out = "Failed to fetch global object";
+    }
+    return 1;
+  }
+  if (!EnsureGlobalGcIfRequested(env, global, error_out)) {
+    if (error_out != nullptr && error_out->empty()) {
+      *error_out = "Failed to expose global gc()";
+    }
+    return 1;
+  }
+  if (!PrepareProcessPrototypeForBootstrap(env, error_out)) {
+    if (error_out != nullptr && error_out->empty()) {
+      *error_out = "Failed to prepare process prototype for bootstrap";
+    }
+    return 1;
+  }
+
+  auto require_bootstrap_module = [&](const char* id) -> bool {
+    napi_value exports = nullptr;
+    if (RequireModule(env, id, &exports)) return true;
+    if (error_out != nullptr) {
+      std::string msg = std::string("Failed to require ") + id;
+      bool is_exit = false;
+      int exit_code = 0;
+      const std::string exc = GetAndClearPendingException(env, &is_exit, &exit_code);
+      if (!exc.empty()) {
+        msg += ": ";
+        msg += exc;
+      }
+      *error_out = msg;
+    }
+    return false;
+  };
+
+  napi_value native_internal_binding = nullptr;
+  if (!GetNamedProperty(env, global, "internalBinding", &native_internal_binding) ||
+      !IsFunction(env, native_internal_binding)) {
+    if (error_out != nullptr) {
+      *error_out = "Native internalBinding callback is not installed on global";
+    }
+    return 1;
+  }
+  if (napi_set_named_property(env, global, "getInternalBinding", native_internal_binding) != napi_ok) {
+    if (error_out != nullptr) {
+      *error_out = "Failed to expose getInternalBinding bootstrap hook";
+    }
+    return 1;
+  }
+  napi_value get_linked_binding = nullptr;
+  if (napi_create_function(env,
+                           "getLinkedBinding",
+                           NAPI_AUTO_LENGTH,
+                           ReturnUndefinedCallback,
+                           nullptr,
+                           &get_linked_binding) == napi_ok &&
+      get_linked_binding != nullptr) {
+    napi_set_named_property(env, global, "getLinkedBinding", get_linked_binding);
+  }
+  if (!require_bootstrap_module("internal/per_context/primordials")) {
+    return 1;
+  }
+
+  napi_value realm_exports = nullptr;
+  if (!RequireModule(env, "internal/bootstrap/realm", &realm_exports) || realm_exports == nullptr) {
+    if (error_out != nullptr) {
+      std::string msg = "internal/bootstrap/realm bootstrap failed";
+      bool is_exit = false;
+      int exit_code = 0;
+      const std::string exc = GetAndClearPendingException(env, &is_exit, &exit_code);
+      if (!exc.empty()) {
+        msg += ": ";
+        msg += exc;
       }
       *error_out = msg;
     }
     return 1;
   }
 
-  // Initialize child-process IPC only after internalBinding/primordials are ready.
-  static const char kPostPreludeIpcBootstrap[] =
-      "(function(){"
-      "if (!process || !process.env || !process.env.NODE_CHANNEL_FD) return;"
-      "var fd = Number.parseInt(process.env.NODE_CHANNEL_FD, 10);"
-      "if (!Number.isInteger(fd) || fd < 0) return;"
-      "var mode = process.env.NODE_CHANNEL_SERIALIZATION_MODE || 'json';"
-      "try {"
-      "  var cp = require('child_process');"
-      "  if (!cp || typeof cp._forkChild !== 'function') return;"
-      "  cp._forkChild(fd, mode);"
-      "  delete process.env.NODE_CHANNEL_FD;"
-      "  delete process.env.NODE_CHANNEL_SERIALIZATION_MODE;"
-      "} catch (e) {"
-      "  process.__ubiIpcBootstrapError = String(e && (e.stack || e.message || e));"
-      "}"
-      "})();";
-  // Store primordials and internalBinding in the loader so they are passed from C++ when calling
-  // the module wrapper (Node-aligned: fn->Call with argv from C++, not from globalThis in JS).
-  // Only store when the value is not JS undefined (napi_get_named_property can return non-null
-  // handle for missing/undefined property).
-  napi_value global_for_refs = nullptr;
-  if (napi_get_global(env, &global_for_refs) == napi_ok && global_for_refs != nullptr) {
-    napi_value primordials_val = nullptr;
-    napi_value internal_binding_val = nullptr;
-    napi_value undefined_val = nullptr;
-    napi_get_undefined(env, &undefined_val);
-    bool primordials_is_undefined = true;
-    if (napi_get_named_property(env, global_for_refs, "primordials", &primordials_val) == napi_ok &&
-        primordials_val != nullptr && undefined_val != nullptr) {
-      napi_strict_equals(env, primordials_val, undefined_val, &primordials_is_undefined);
+  napi_value internal_binding = nullptr;
+  if (!GetNamedProperty(env, realm_exports, "internalBinding", &internal_binding) ||
+      !IsFunction(env, internal_binding)) {
+    if (error_out != nullptr) {
+      *error_out = "internal/bootstrap/realm did not export internalBinding";
     }
-    if (primordials_val != nullptr && !primordials_is_undefined) {
-      UbiSetPrimordials(env, primordials_val);
+    return 1;
+  }
+  status = napi_set_named_property(env, global, "internalBinding", internal_binding);
+  if (status != napi_ok) {
+    if (error_out != nullptr) {
+      *error_out = "Failed to install global internalBinding: " + StatusToString(status);
     }
-    bool internal_binding_is_undefined = true;
-    if (napi_get_named_property(env, global_for_refs, "internalBinding", &internal_binding_val) ==
-            napi_ok &&
-        internal_binding_val != nullptr && undefined_val != nullptr) {
-      napi_strict_equals(env, internal_binding_val, undefined_val, &internal_binding_is_undefined);
+    return 1;
+  }
+  UbiSetInternalBinding(env, internal_binding);
+
+  // Node's C++ bootstrap populates process[exit_info_private_symbol] before
+  // internal/bootstrap/node runs. Mirror that setup so process._exiting and
+  // process.exitCode accessors have backing storage.
+  {
+    napi_value process_obj = nullptr;
+    if (!GetNamedProperty(env, global, "process", &process_obj)) {
+      if (error_out != nullptr) {
+        *error_out = "Failed to fetch process object during bootstrap";
+      }
+      return 1;
     }
-    if (internal_binding_val != nullptr && !internal_binding_is_undefined) {
-      UbiSetInternalBinding(env, internal_binding_val);
+
+    napi_value util_name = nullptr;
+    if (napi_create_string_utf8(env, "util", NAPI_AUTO_LENGTH, &util_name) != napi_ok || util_name == nullptr) {
+      if (error_out != nullptr) {
+        *error_out = "Failed to create util binding key";
+      }
+      return 1;
+    }
+
+    napi_value util_binding = nullptr;
+    if (!CallFunction(env, global, internal_binding, 1, &util_name, &util_binding) || util_binding == nullptr) {
+      if (error_out != nullptr) {
+        std::string msg = "Failed to resolve internalBinding('util') during bootstrap";
+        bool is_exit = false;
+        int exit_code = 0;
+        const std::string exc = GetAndClearPendingException(env, &is_exit, &exit_code);
+        if (!exc.empty()) {
+          msg += ": ";
+          msg += exc;
+        }
+        *error_out = msg;
+      }
+      return 1;
+    }
+
+    napi_value constants = nullptr;
+    napi_value private_symbols = nullptr;
+    if (!GetNamedProperty(env, util_binding, "constants", &constants) ||
+        !GetNamedProperty(env, util_binding, "privateSymbols", &private_symbols)) {
+      if (error_out != nullptr) {
+        *error_out = "util binding missing constants/privateSymbols for exit info setup";
+      }
+      return 1;
+    }
+
+    napi_value exit_info_symbol = nullptr;
+    if (!GetNamedProperty(env, private_symbols, "exit_info_private_symbol", &exit_info_symbol)) {
+      if (error_out != nullptr) {
+        *error_out = "util.privateSymbols.exit_info_private_symbol missing";
+      }
+      return 1;
+    }
+
+    napi_value existing_exit_info = nullptr;
+    if (napi_get_property(env, process_obj, exit_info_symbol, &existing_exit_info) == napi_ok &&
+        existing_exit_info != nullptr &&
+        !IsUndefinedValue(env, existing_exit_info)) {
+      // Already initialized.
+    } else {
+      auto read_index = [&](const char* key, uint32_t fallback) -> uint32_t {
+        napi_value value = nullptr;
+        int32_t out = static_cast<int32_t>(fallback);
+        if (GetNamedProperty(env, constants, key, &value) && value != nullptr) {
+          napi_get_value_int32(env, value, &out);
+        }
+        if (out < 0) return fallback;
+        return static_cast<uint32_t>(out);
+      };
+
+      const uint32_t k_exit_code = read_index("kExitCode", 0);
+      const uint32_t k_exiting = read_index("kExiting", 1);
+      const uint32_t k_has_exit_code = read_index("kHasExitCode", 2);
+
+      napi_value fields = nullptr;
+      if (napi_create_object(env, &fields) != napi_ok || fields == nullptr) {
+        if (error_out != nullptr) {
+          *error_out = "Failed to create exit info fields object";
+        }
+        return 1;
+      }
+      napi_value zero = nullptr;
+      if (napi_create_int32(env, 0, &zero) != napi_ok || zero == nullptr) {
+        if (error_out != nullptr) {
+          *error_out = "Failed to create zero for exit info fields";
+        }
+        return 1;
+      }
+      napi_set_element(env, fields, k_exit_code, zero);
+      napi_set_element(env, fields, k_exiting, zero);
+      napi_set_element(env, fields, k_has_exit_code, zero);
+      if (napi_set_property(env, process_obj, exit_info_symbol, fields) != napi_ok) {
+        if (error_out != nullptr) {
+          *error_out = "Failed to attach process exit info fields";
+        }
+        return 1;
+      }
     }
   }
 
-  // Install console after bootstrap prelude and loader refs are set, so require('console') resolves
-  // from the builtins dir and its dependency (util) receives primordials/internalBinding.
+  napi_value primordials_value = nullptr;
+  if (GetNamedProperty(env, realm_exports, "primordials", &primordials_value) &&
+      !IsUndefinedValue(env, primordials_value)) {
+    napi_set_named_property(env, global, "primordials", primordials_value);
+    UbiSetPrimordials(env, primordials_value);
+  }
+
+  if (!require_bootstrap_module("internal/bootstrap/node") ||
+      !require_bootstrap_module("internal/bootstrap/switches/is_main_thread") ||
+      !require_bootstrap_module("internal/bootstrap/switches/does_own_process_state") ||
+      !require_bootstrap_module("internal/bootstrap/web/exposed-wildcard") ||
+      !require_bootstrap_module("internal/bootstrap/web/exposed-window-or-worker")) {
+    return 1;
+  }
+
+  napi_value pre_execution_exports = nullptr;
+  if (!RequireModule(env, "internal/process/pre_execution", &pre_execution_exports) ||
+      pre_execution_exports == nullptr) {
+    if (error_out != nullptr) {
+      std::string msg = "Failed to load internal/process/pre_execution";
+      bool is_exit = false;
+      int exit_code = 0;
+      const std::string exc = GetAndClearPendingException(env, &is_exit, &exit_code);
+      if (!exc.empty()) {
+        msg += ": ";
+        msg += exc;
+      }
+      *error_out = msg;
+    }
+    return 1;
+  }
+
+  napi_value prepare_main_thread_execution = nullptr;
+  if (!GetNamedProperty(env, pre_execution_exports, "prepareMainThreadExecution", &prepare_main_thread_execution) ||
+      !IsFunction(env, prepare_main_thread_execution)) {
+    if (error_out != nullptr) {
+      *error_out = "internal/process/pre_execution.prepareMainThreadExecution is not available";
+    }
+    return 1;
+  }
+
+  napi_value false_value = nullptr;
+  if (napi_get_boolean(env, false, &false_value) != napi_ok || false_value == nullptr) {
+    if (error_out != nullptr) {
+      *error_out = "Failed to create boolean argument for pre_execution";
+    }
+    return 1;
+  }
+  napi_value prepare_args[2] = {false_value, false_value};
+  if (!CallFunction(env,
+                    pre_execution_exports,
+                    prepare_main_thread_execution,
+                    2,
+                    prepare_args,
+                    nullptr)) {
+    if (error_out != nullptr) {
+      std::string msg = "prepareMainThreadExecution failed";
+      bool is_exit = false;
+      int exit_code = 0;
+      const std::string exc = GetAndClearPendingException(env, &is_exit, &exit_code);
+      if (!exc.empty()) {
+        msg += ": ";
+        msg += exc;
+      }
+      *error_out = msg;
+    }
+    return 1;
+  }
+
+  // Node sets module_wrap dynamic-import callbacks during module loader init.
+  // We keep pre_execution module init disabled for now, so initialize just the
+  // ESM callback bridge needed by dynamic import() in CJS.
+  {
+    napi_value esm_utils_exports = nullptr;
+    if (!RequireModule(env, "internal/modules/esm/utils", &esm_utils_exports) ||
+        esm_utils_exports == nullptr) {
+      if (error_out != nullptr) {
+        std::string msg = "Failed to load internal/modules/esm/utils";
+        bool is_exit = false;
+        int exit_code = 0;
+        const std::string exc = GetAndClearPendingException(env, &is_exit, &exit_code);
+        if (!exc.empty()) {
+          msg += ": ";
+          msg += exc;
+        }
+        *error_out = msg;
+      }
+      return 1;
+    }
+    napi_value initialize_esm = nullptr;
+    if (!GetNamedProperty(env, esm_utils_exports, "initializeESM", &initialize_esm) ||
+        !IsFunction(env, initialize_esm)) {
+      if (error_out != nullptr) {
+        *error_out = "internal/modules/esm/utils.initializeESM is not available";
+      }
+      return 1;
+    }
+    napi_value false_arg = nullptr;
+    if (napi_get_boolean(env, false, &false_arg) != napi_ok || false_arg == nullptr) {
+      if (error_out != nullptr) {
+        *error_out = "Failed to create initializeESM argument";
+      }
+      return 1;
+    }
+    napi_value argv[1] = {false_arg};
+    if (!CallFunction(env, esm_utils_exports, initialize_esm, 1, argv, nullptr)) {
+      if (error_out != nullptr) {
+        std::string msg = "initializeESM(false) failed";
+        bool is_exit = false;
+        int exit_code = 0;
+        const std::string exc = GetAndClearPendingException(env, &is_exit, &exit_code);
+        if (!exc.empty()) {
+          msg += ": ";
+          msg += exc;
+        }
+        *error_out = msg;
+      }
+      return 1;
+    }
+  }
+
+  napi_value mark_bootstrap_complete = nullptr;
+  if (GetNamedProperty(env, pre_execution_exports, "markBootstrapComplete", &mark_bootstrap_complete) &&
+      IsFunction(env, mark_bootstrap_complete)) {
+    if (!CallFunction(env, pre_execution_exports, mark_bootstrap_complete, 0, nullptr, nullptr)) {
+      if (error_out != nullptr) {
+        std::string msg = "markBootstrapComplete failed";
+        bool is_exit = false;
+        int exit_code = 0;
+        const std::string exc = GetAndClearPendingException(env, &is_exit, &exit_code);
+        if (!exc.empty()) {
+          msg += ": ";
+          msg += exc;
+        }
+        *error_out = msg;
+      }
+      return 1;
+    }
+  }
+
+  // Bridge V8 host dynamic import (napi/v8) into Node's module_wrap callback
+  // registry so import('node:...') from CJS follows Node's ESM pathway.
+  {
+    napi_value module_wrap_name = nullptr;
+    if (napi_create_string_utf8(env, "module_wrap", NAPI_AUTO_LENGTH, &module_wrap_name) != napi_ok ||
+        module_wrap_name == nullptr) {
+      if (error_out != nullptr) {
+        *error_out = "Failed to create module_wrap binding key";
+      }
+      return 1;
+    }
+
+    napi_value module_wrap_binding = nullptr;
+    if (!CallFunction(env, global, internal_binding, 1, &module_wrap_name, &module_wrap_binding) ||
+        module_wrap_binding == nullptr) {
+      if (error_out != nullptr) {
+        std::string msg = "Failed to resolve internalBinding('module_wrap')";
+        bool is_exit = false;
+        int exit_code = 0;
+        const std::string exc = GetAndClearPendingException(env, &is_exit, &exit_code);
+        if (!exc.empty()) {
+          msg += ": ";
+          msg += exc;
+        }
+        *error_out = msg;
+      }
+      return 1;
+    }
+
+    napi_value import_dynamically = nullptr;
+    if (!GetNamedProperty(env, module_wrap_binding, "importModuleDynamically", &import_dynamically) ||
+        !IsFunction(env, import_dynamically)) {
+      if (error_out != nullptr) {
+        *error_out = "module_wrap binding missing importModuleDynamically";
+      }
+      return 1;
+    }
+
+    if (napi_set_named_property(env, global, "__napi_dynamic_import", import_dynamically) != napi_ok) {
+      if (error_out != nullptr) {
+        *error_out = "Failed to install __napi_dynamic_import bridge";
+      }
+      return 1;
+    }
+  }
+
   status = UbiInstallConsole(env);
   if (status != napi_ok) {
     if (error_out != nullptr) {
@@ -1130,863 +1515,6 @@ int RunScriptWithGlobals(napi_env env,
     }
     return 1;
   }
-
-  // Minimal globals expected by Node test common (AbortController, timers, etc.). Optional.
-  static const char kPrelude[] =
-      "(function(){"
-      "try {"
-      "if (typeof internalBinding === 'undefined' && typeof globalThis.internalBinding === 'function') internalBinding = globalThis.internalBinding;"
-      "if (typeof primordials === 'undefined' && globalThis.primordials) primordials = globalThis.primordials;"
-      "if (typeof globalThis.__napi_dynamic_import !== 'function') {"
-      "  globalThis.__napi_dynamic_import = function(specifier) {"
-      "    return Promise.resolve().then(function() {"
-      "      var id = String(specifier);"
-      "      if (id.slice(0, 5) === 'node:') id = id.slice(5);"
-      "      var mod = require(id);"
-      "      var ns = Object.create(null);"
-      "      if (mod != null && (typeof mod === 'object' || typeof mod === 'function')) {"
-      "        var keys = Object.keys(mod);"
-      "        for (var i = 0; i < keys.length; i++) {"
-      "          var k = keys[i];"
-      "          try { ns[k] = mod[k]; } catch (_) {}"
-      "        }"
-      "      }"
-      "      ns.default = mod;"
-      "      return ns;"
-      "    });"
-      "  };"
-      "}"
-      "if (typeof globalThis.eval === 'function') {"
-      "  var __ubiEval = globalThis.eval;"
-      "  globalThis.eval = function(src) {"
-      "    if (typeof src === 'string' && src.length > 0 && src[0] === '%') return undefined;"
-      "    return __ubiEval(src);"
-      "  };"
-      "}"
-      "if (typeof globalThis.AbortController === 'undefined' || typeof globalThis.AbortSignal === 'undefined') {"
-      "  try {"
-      "    var __acmod = require('internal/abort_controller');"
-      "    if (typeof globalThis.AbortController === 'undefined' && __acmod && typeof __acmod.AbortController === 'function') {"
-      "      globalThis.AbortController = __acmod.AbortController;"
-      "    }"
-      "    if (typeof globalThis.AbortSignal === 'undefined' && __acmod && typeof __acmod.AbortSignal === 'function') {"
-      "      globalThis.AbortSignal = __acmod.AbortSignal;"
-      "    }"
-      "  } catch (_) {}"
-      "}"
-      "if (typeof globalThis.AbortController === 'undefined') {"
-      "  globalThis.AbortController = function AbortController() {"
-      "    var signal = (typeof globalThis.EventTarget === 'function') ? new globalThis.EventTarget() : {};"
-      "    signal.aborted = false;"
-      "    signal.reason = undefined;"
-      "    this.signal = signal;"
-      "    this.abort = function(reason) {"
-      "      if (signal.aborted) return;"
-      "      signal.aborted = true;"
-      "      signal.reason = reason;"
-      "      if (typeof signal.dispatchEvent === 'function' && typeof globalThis.Event === 'function') {"
-      "        signal.dispatchEvent(new globalThis.Event('abort'));"
-      "      }"
-      "    };"
-      "  };"
-      "}"
-      "if (typeof globalThis.AbortSignal === 'undefined') {"
-      "  globalThis.AbortSignal = {"
-      "    abort: function(reason) {"
-      "      var c = new globalThis.AbortController();"
-      "      c.abort(reason);"
-      "      return c.signal;"
-      "    }"
-      "  };"
-      "}"
-      "try {"
-      "  var __timers = require('timers');"
-      "  globalThis.setTimeout = __timers.setTimeout;"
-      "  globalThis.clearTimeout = __timers.clearTimeout;"
-      "  globalThis.setInterval = __timers.setInterval;"
-      "  globalThis.clearInterval = __timers.clearInterval;"
-      "  globalThis.setImmediate = __timers.setImmediate;"
-      "  globalThis.clearImmediate = __timers.clearImmediate;"
-      "} catch (_) {}"
-      "if (typeof globalThis.setImmediate === 'undefined') {"
-      "  globalThis.setImmediate = function(f) {"
-      "    if (typeof f !== 'function') {"
-      "      var e0 = new TypeError('The \"callback\" argument must be of type function.');"
-      "      e0.code = 'ERR_INVALID_ARG_TYPE';"
-      "      throw e0;"
-      "    }"
-      "    var args = Array.prototype.slice.call(arguments, 1);"
-      "    globalThis.queueMicrotask(function() { f.apply(null, args); });"
-      "    return { unref: function(){ return this; }, ref: function(){ return this; } };"
-      "  };"
-      "}"
-      "if (typeof globalThis.clearImmediate === 'undefined') {"
-      "  globalThis.clearImmediate = function() {};"
-      "}"
-      "if (typeof globalThis.setInterval === 'undefined') {"
-      "  globalThis.setInterval = function(cb) {"
-      "    if (typeof cb !== 'function') {"
-      "      var e1 = new TypeError('The \"callback\" argument must be of type function.');"
-      "      e1.code = 'ERR_INVALID_ARG_TYPE';"
-      "      throw e1;"
-      "    }"
-      "    return { unref: function(){ return this; }, ref: function(){ return this; } };"
-      "  };"
-      "}"
-      "if (typeof globalThis.clearInterval === 'undefined') {"
-      "  globalThis.clearInterval = function() {};"
-      "}"
-      "if (typeof globalThis.setTimeout === 'undefined') {"
-      "  globalThis.setTimeout = function(cb) {"
-      "    if (typeof cb !== 'function') {"
-      "      var e2 = new TypeError('The \"callback\" argument must be of type function.');"
-      "      e2.code = 'ERR_INVALID_ARG_TYPE';"
-      "      throw e2;"
-      "    }"
-      "    return { unref: function(){ return this; }, ref: function(){ return this; } };"
-      "  };"
-      "}"
-      "if (typeof globalThis.clearTimeout === 'undefined') {"
-      "  globalThis.clearTimeout = function() {};"
-      "}"
-      "(function(){"
-      "  var __kReady = Symbol.for('node.resourceTrackingReady');"
-      "  var __kResources = Symbol.for('node.activeResources');"
-      "  if (!globalThis[__kReady]) {"
-      "  var __ar = globalThis[__kResources];"
-      "  if (!(__ar && typeof __ar.set === 'function')) {"
-      "    __ar = new Map();"
-      "    globalThis[__kResources] = __ar;"
-      "  }"
-      "  var __st = globalThis.setTimeout;"
-      "  var __ct = globalThis.clearTimeout;"
-      "  var __si = globalThis.setInterval;"
-      "  var __ci = globalThis.clearInterval;"
-      "  var __sim = globalThis.setImmediate;"
-      "  var __cim = globalThis.clearImmediate;"
-      "  if (typeof __st === 'function') {"
-      "    globalThis.setTimeout = function(cb, ms){"
-      "      if (typeof cb !== 'function') {"
-      "        var e3 = new TypeError('The \"callback\" argument must be of type function.');"
-      "        e3.code = 'ERR_INVALID_ARG_TYPE';"
-      "        throw e3;"
-      "      }"
-      "      var args = Array.prototype.slice.call(arguments, 2);"
-      "      var h;"
-      "      var wrapped = function(){ __ar.delete(h); return Reflect.apply(cb, this, arguments); };"
-      "      h = __st.apply(globalThis, [wrapped, ms].concat(args));"
-      "      __ar.set(h, 'Timeout');"
-      "      return h;"
-      "    };"
-      "  }"
-      "  if (typeof __ct === 'function') globalThis.clearTimeout = function(h){ __ar.delete(h); return __ct(h); };"
-      "  if (typeof __si === 'function') {"
-      "    globalThis.setInterval = function(cb, ms){"
-      "      if (typeof cb !== 'function') {"
-      "        var e4 = new TypeError('The \"callback\" argument must be of type function.');"
-      "        e4.code = 'ERR_INVALID_ARG_TYPE';"
-      "        throw e4;"
-      "      }"
-      "      var args = Array.prototype.slice.call(arguments, 2);"
-      "      var h = __si.apply(globalThis, [cb, ms].concat(args));"
-      "      __ar.set(h, 'Timeout');"
-      "      return h;"
-      "    };"
-      "  }"
-      "  if (typeof __ci === 'function') globalThis.clearInterval = function(h){ __ar.delete(h); return __ci(h); };"
-      "  if (typeof __sim === 'function') {"
-      "    globalThis.setImmediate = function(cb){"
-      "      if (typeof cb !== 'function') {"
-      "        var e5 = new TypeError('The \"callback\" argument must be of type function.');"
-      "        e5.code = 'ERR_INVALID_ARG_TYPE';"
-      "        throw e5;"
-      "      }"
-      "      var args = Array.prototype.slice.call(arguments, 1);"
-      "      var h;"
-      "      var wrapped = function(){ __ar.delete(h); return Reflect.apply(cb, this, arguments); };"
-      "      h = __sim.apply(globalThis, [wrapped].concat(args));"
-      "      __ar.set(h, 'Immediate');"
-      "      return h;"
-      "    };"
-      "  }"
-      "  if (typeof __cim === 'function') globalThis.clearImmediate = function(h){ __ar.delete(h); return __cim(h); };"
-      "  globalThis[__kReady] = true;"
-      "  }})();"
-      "if (typeof globalThis.queueMicrotask === 'undefined') {"
-      "  try {"
-      "    var __tq = require('internal/process/task_queues');"
-      "    if (__tq && typeof __tq.queueMicrotask === 'function') {"
-      "      globalThis.queueMicrotask = __tq.queueMicrotask;"
-      "    }"
-      "  } catch (_) {}"
-      "}"
-      "if (typeof globalThis.queueMicrotask === 'undefined') {"
-      "  globalThis.queueMicrotask = function(f) {"
-      "    if (typeof f === 'function') Promise.resolve().then(f);"
-      "  };"
-      "}"
-      "if (typeof globalThis.TextEncoder === 'undefined' || typeof globalThis.TextDecoder === 'undefined') {"
-      "  try {"
-      "    var __encMod = require('internal/encoding');"
-      "    if (typeof globalThis.TextEncoder === 'undefined' && __encMod && typeof __encMod.TextEncoder === 'function') {"
-      "      globalThis.TextEncoder = __encMod.TextEncoder;"
-      "    }"
-      "    if (typeof globalThis.TextDecoder === 'undefined' && __encMod && typeof __encMod.TextDecoder === 'function') {"
-      "      globalThis.TextDecoder = __encMod.TextDecoder;"
-      "    }"
-      "  } catch (_) {}"
-      "}"
-      "if (typeof globalThis.performance === 'undefined') {"
-      "  var __perfOrigin = Date.now();"
-      "  globalThis.performance = {"
-      "    timeOrigin: __perfOrigin,"
-      "    now: function() { return Date.now() - __perfOrigin; },"
-      "    toJSON: function() { return { timeOrigin: __perfOrigin }; }"
-      "  };"
-      "}"
-      "if (typeof globalThis.ReadableStream === 'undefined') {"
-      "  globalThis.ReadableStream = function ReadableStream(source) {"
-      "    this._source = source || null;"
-      "  };"
-      "  globalThis.ReadableStream.prototype.getReader = function() {"
-      "    return {"
-      "      read: function() { return Promise.resolve({ value: undefined, done: true }); },"
-      "      releaseLock: function() {}"
-      "    };"
-      "  };"
-      "  globalThis.ReadableStream.prototype.cancel = function() { return Promise.resolve(); };"
-      "  globalThis.ReadableStream.prototype.pipeTo = function() { return Promise.resolve(); };"
-      "}"
-      "if (typeof globalThis.Blob === 'undefined') {"
-      "  globalThis.Blob = function Blob(parts, options) {"
-      "    if (!(this instanceof globalThis.Blob)) return new globalThis.Blob(parts, options);"
-      "    this.type = (options && typeof options.type === 'string') ? options.type.toLowerCase() : '';"
-      "    this._parts = Array.isArray(parts) ? parts.slice() : [];"
-      "    var size = 0;"
-      "    for (var i = 0; i < this._parts.length; i++) {"
-      "      var p = this._parts[i];"
-      "      if (p && typeof p.byteLength === 'number') size += Number(p.byteLength) || 0;"
-      "      else if (typeof p === 'string') size += p.length;"
-      "    }"
-      "    this.size = size;"
-      "  };"
-      "  globalThis.Blob.prototype.arrayBuffer = function() { return Promise.resolve(new ArrayBuffer(0)); };"
-      "  globalThis.Blob.prototype.text = function() { return Promise.resolve(''); };"
-      "  globalThis.Blob.prototype.slice = function() { return new globalThis.Blob([], { type: this.type }); };"
-      "}"
-      "if (typeof globalThis.File === 'undefined' && typeof globalThis.Blob === 'function') {"
-      "  globalThis.File = function File(parts, name, options) {"
-      "    if (!(this instanceof globalThis.File)) return new globalThis.File(parts, name, options);"
-      "    globalThis.Blob.call(this, parts, options);"
-      "    this.name = String(name || '');"
-      "    this.lastModified = options && options.lastModified ? Number(options.lastModified) : Date.now();"
-      "  };"
-      "  globalThis.File.prototype = Object.create(globalThis.Blob.prototype);"
-      "  globalThis.File.prototype.constructor = globalThis.File;"
-      "}"
-      "if (globalThis.process) {"
-      "  try {"
-      "    var __events = require('events');"
-      "    var __EE = __events && __events.EventEmitter;"
-      "    if (typeof __EE === 'function') {"
-      "      var __proto = Object.getPrototypeOf(globalThis.process);"
-      "      if (!(__proto instanceof __EE)) {"
-      "        function process() {}"
-      "        process.prototype = Object.create(__EE.prototype);"
-      "        Object.defineProperty(process.prototype, 'constructor', { value: process, writable: true, enumerable: false, configurable: true });"
-      "        Object.setPrototypeOf(globalThis.process, process.prototype);"
-      "        globalThis.process.constructor = process;"
-      "      }"
-      "      delete globalThis.process.on;"
-      "      delete globalThis.process.addListener;"
-      "      delete globalThis.process.once;"
-      "      delete globalThis.process.removeListener;"
-      "      delete globalThis.process.emit;"
-      "      delete globalThis.process.listenerCount;"
-      "    }"
-      "  } catch (_) {}"
-      "  try {"
-      "    var __sigHooksInstalled = Symbol.for('node.signalListenerHooksInstalled');"
-      "    if (!globalThis.process[__sigHooksInstalled]) {"
-      "      var __uSignalHooks0 = require('internal/process/signal');"
-      "      if (__uSignalHooks0 && typeof __uSignalHooks0.startListeningIfSignal === 'function') {"
-      "        process.on('newListener', __uSignalHooks0.startListeningIfSignal);"
-      "      }"
-      "      if (__uSignalHooks0 && typeof __uSignalHooks0.stopListeningIfSignal === 'function') {"
-      "        process.on('removeListener', __uSignalHooks0.stopListeningIfSignal);"
-      "      }"
-      "      globalThis.process[__sigHooksInstalled] = true;"
-      "    }"
-      "  } catch (_) {}"
-      "  try {"
-      "    if (!Object.prototype.hasOwnProperty.call(globalThis.process, 'report')) {"
-      "      var __ubiReportCache;"
-      "      Object.defineProperty(globalThis.process, 'report', {"
-      "        enumerable: true,"
-      "        configurable: true,"
-      "        get: function(){"
-      "          if (__ubiReportCache) return __ubiReportCache;"
-      "          var __reportMod = require('internal/process/report');"
-      "          if (!__reportMod || !__reportMod.report) return undefined;"
-      "          __ubiReportCache = __reportMod.report;"
-      "          if (typeof __reportMod.addSignalHandler === 'function') {"
-      "            __reportMod.addSignalHandler();"
-      "            try {"
-      "              if (__ubiReportCache.reportOnSignal === true) {"
-      "                var __sigMod = require('internal/process/signal');"
-      "                if (__sigMod && typeof __sigMod.startListeningIfSignal === 'function') {"
-      "                  var __sigName = (typeof __ubiReportCache.signal === 'string') ? __ubiReportCache.signal : 'SIGUSR2';"
-      "                  __sigMod.startListeningIfSignal(__sigName);"
-      "                }"
-      "              }"
-      "            } catch (_) {}"
-      "          }"
-      "          return __ubiReportCache;"
-      "        },"
-      "        set: function(v){ __ubiReportCache = v; }"
-      "      });"
-      "    }"
-      "  } catch (_) {}"
-      "  if (typeof globalThis.process.ref !== 'function') {"
-      "    globalThis.process.ref = function(obj) {"
-      "      if (!obj) return;"
-      "      var fn = obj[Symbol.for('nodejs.ref')];"
-      "      if (typeof fn === 'function') return fn.call(obj);"
-      "      if (typeof obj.ref === 'function') return obj.ref();"
-      "    };"
-      "  }"
-      "  if (typeof globalThis.process.unref !== 'function') {"
-      "    globalThis.process.unref = function(obj) {"
-      "      if (!obj) return;"
-      "      var fn = obj[Symbol.for('nodejs.unref')];"
-      "      if (typeof fn === 'function') return fn.call(obj);"
-      "      if (typeof obj.unref === 'function') return obj.unref();"
-      "    };"
-      "  }"
-      "  var __processMethodsBinding = null;"
-      "  try { __processMethodsBinding = globalThis.internalBinding('process_methods'); } catch (_) {}"
-      "  globalThis.process.loadEnvFile = function() {"
-      "    var path = (arguments.length > 0) ? arguments[0] : undefined;"
-      "    var resolved = '.env';"
-      "    if (path != null) {"
-      "      try {"
-      "        var __fsUtils = require('internal/fs/utils');"
-      "        if (__fsUtils && typeof __fsUtils.getValidatedPath === 'function') resolved = __fsUtils.getValidatedPath(path);"
-      "        else resolved = path;"
-      "      } catch (_) {"
-      "        resolved = path;"
-      "      }"
-      "    }"
-      "    var __fs = require('fs');"
-      "    var __content = __fs.readFileSync(resolved, 'utf8');"
-      "    var __util = require('util');"
-      "    var __parsed = (__util && typeof __util.parseEnv === 'function') ? __util.parseEnv(__content) : {};"
-      "    var __keys2 = Object.keys(__parsed);"
-      "    for (var __j = 0; __j < __keys2.length; __j++) {"
-      "      var __name2 = __keys2[__j];"
-      "      if (globalThis.process.env[__name2] === undefined) {"
-      "        globalThis.process.env[__name2] = __parsed[__name2];"
-      "      }"
-      "    }"
-      "  };"
-      "  var __envProxyInstalled = Symbol.for('node.envProxyInstalled');"
-      "  if (globalThis.process.env && !globalThis.process[__envProxyInstalled]) {"
-      "    globalThis.process[__envProxyInstalled] = true;"
-      "    var __rawEnv = globalThis.process.env;"
-      "    var __env = Object.create(Object.prototype);"
-      "    var __envKeys = Object.keys(__rawEnv);"
-      "    for (var __i = 0; __i < __envKeys.length; __i++) {"
-      "      var __k = __envKeys[__i];"
-      "      __env[__k] = String(__rawEnv[__k]);"
-      "    }"
-      "    globalThis.process.env = new Proxy(__env, {"
-      "      get: function(target, key) {"
-      "        if (typeof key === 'symbol') return undefined;"
-      "        return target[key];"
-      "      },"
-      "      set: function(target, key, value) {"
-      "        if (typeof key === 'symbol' || typeof value === 'symbol') {"
-      "          throw new TypeError('Cannot convert a Symbol value to a string');"
-      "        }"
-      "        var name = String(key);"
-      "        if (name.length === 0) return true;"
-      "        target[name] = String(value);"
-      "        if (__processMethodsBinding && typeof __processMethodsBinding._setEnv === 'function') {"
-      "          try { __processMethodsBinding._setEnv(name, target[name]); } catch (_) {}"
-      "        }"
-      "        return true;"
-      "      },"
-      "      has: function(target, key) {"
-      "        if (typeof key === 'symbol') return false;"
-      "        return key in target;"
-      "      },"
-      "      deleteProperty: function(target, key) {"
-      "        if (typeof key === 'symbol') return true;"
-      "        var name = String(key);"
-      "        delete target[name];"
-      "        if (__processMethodsBinding && typeof __processMethodsBinding._unsetEnv === 'function') {"
-      "          try { __processMethodsBinding._unsetEnv(name); } catch (_) {}"
-      "        }"
-      "        return true;"
-      "      },"
-      "      defineProperty: function(target, key, desc) {"
-      "        if (typeof key === 'symbol') return true;"
-      "        var name = String(key);"
-      "        var makeTypeErr = function(msg) {"
-      "          var e = new TypeError(msg);"
-      "          e.code = 'ERR_INVALID_OBJECT_DEFINE_PROPERTY';"
-      "          return e;"
-      "        };"
-      "        if (desc && (typeof desc.get === 'function' || typeof desc.set === 'function')) {"
-      "          throw makeTypeErr(\"'process.env' does not accept an accessor(getter/setter) descriptor\");"
-      "        }"
-      "        if (!desc || !Object.prototype.hasOwnProperty.call(desc, 'value') ||"
-      "            desc.configurable !== true || desc.writable !== true || desc.enumerable !== true) {"
-      "          throw makeTypeErr(\"'process.env' only accepts a configurable, writable, and enumerable data descriptor\");"
-      "        }"
-      "        target[name] = String(desc.value);"
-      "        if (__processMethodsBinding && typeof __processMethodsBinding._setEnv === 'function') {"
-      "          try { __processMethodsBinding._setEnv(name, target[name]); } catch (_) {}"
-      "        }"
-      "        return true;"
-      "      },"
-      "      getOwnPropertyDescriptor: function(target, key) {"
-      "        if (typeof key === 'symbol') return undefined;"
-      "        var name = String(key);"
-      "        if (!Object.prototype.hasOwnProperty.call(target, name)) return undefined;"
-      "        return { value: target[name], configurable: true, writable: true, enumerable: true };"
-      "      },"
-      "      ownKeys: function(target) {"
-      "        return Object.keys(target);"
-      "      }"
-      "    });"
-      "  }"
-      "  globalThis.process._kill = function(pid, sig) {"
-      "    var __pidNum = Number(pid);"
-      "    var __sigNum = Number(sig);"
-      "    if (__pidNum === Number(globalThis.process.pid) && __sigNum !== 0 &&"
-      "        typeof globalThis.process.emit === 'function' &&"
-      "        typeof globalThis.process.listenerCount === 'function') {"
-      "      var __osForSignals = require('os');"
-      "      try {"
-      "        if (__osForSignals && __osForSignals.constants && __osForSignals.constants.signals) {"
-      "          Object.freeze(__osForSignals.constants.signals);"
-      "        }"
-      "      } catch (_) {}"
-      "      var __signals = (__osForSignals.constants && __osForSignals.constants.signals) || {};"
-      "      var __sigName = null;"
-      "      var __sigKeys = Object.keys(__signals);"
-      "      for (var __si = 0; __si < __sigKeys.length; __si++) {"
-      "        var __name = __sigKeys[__si];"
-      "        if (__signals[__name] === __sigNum) { __sigName = __name; break; }"
-      "      }"
-      "      var __reportSignalShortcut = false;"
-      "      try {"
-      "        __reportSignalShortcut = !!(globalThis.process.report &&"
-      "          globalThis.process.report.reportOnSignal === true &&"
-      "          typeof globalThis.process.report.signal === 'string' &&"
-      "          __sigName === globalThis.process.report.signal);"
-      "      } catch (_) {}"
-      "      if (__sigName && __reportSignalShortcut && globalThis.process.listenerCount(__sigName) > 0) {"
-        "        globalThis.queueMicrotask(function(){ globalThis.process.emit(__sigName, __sigName); });"
-        "        return 0;"
-      "      }"
-      "    }"
-      "    if (__processMethodsBinding && typeof __processMethodsBinding._kill === 'function') {"
-      "      return __processMethodsBinding._kill(__pidNum, __sigNum);"
-      "    }"
-      "    return 0;"
-      "  };"
-      "    var __osSignalModule = require('os');"
-      "    try {"
-      "      if (__osSignalModule && __osSignalModule.constants && __osSignalModule.constants.signals) {"
-      "        Object.freeze(__osSignalModule.constants.signals);"
-      "      }"
-      "    } catch (_) {}"
-      "    var __signalMap = ((__osSignalModule.constants && __osSignalModule.constants.signals) || {});"
-      "    var __pidErr = function(v) {"
-      "      var tail = '';"
-      "      if (v === null || v === undefined) tail = ' Received ' + String(v);"
-      "      else tail = ' Received type ' + typeof v + ' (' + (typeof v === 'string' ? ('\\'' + v + '\\'') : String(v)) + ')';"
-      "      var e = new TypeError('The \"pid\" argument must be of type number.' + tail);"
-      "      e.code = 'ERR_INVALID_ARG_TYPE';"
-      "      return e;"
-      "    };"
-      "    globalThis.process.kill = function(pid, signal) {"
-      "      if (typeof pid === 'symbol' || pid === null || pid === undefined || typeof pid === 'boolean' ||"
-      "          typeof pid === 'object' || typeof pid === 'function') throw __pidErr(pid);"
-      "      var nPid = Number(pid);"
-      "      if (!Number.isFinite(nPid)) throw __pidErr(pid);"
-      "      var sig = 15;"
-      "      if (signal !== undefined) {"
-      "        if (signal === null) {"
-      "          sig = 0;"
-      "        } else "
-      "        if (typeof signal === 'string') {"
-      "          if (!Object.prototype.hasOwnProperty.call(__signalMap, signal)) {"
-      "            var se = new TypeError('Unknown signal: ' + signal);"
-      "            se.code = 'ERR_UNKNOWN_SIGNAL';"
-      "            throw se;"
-      "          }"
-      "          sig = __signalMap[signal];"
-      "        } else if (typeof signal === 'number') {"
-      "          if (!Number.isInteger(signal) || signal < 0 || signal > 128) {"
-      "            var e2 = new Error('kill EINVAL');"
-      "            e2.code = 'EINVAL';"
-      "            throw e2;"
-      "          }"
-      "          sig = signal;"
-      "        }"
-      "      }"
-      "      if (nPid === globalThis.process.pid && (signal === 'SIGWINCH' || sig === __signalMap.SIGWINCH)) {"
-      "        try {"
-      "          if (globalThis.process.stdout && typeof globalThis.process.stdout._refreshSize === 'function') {"
-      "            globalThis.process.stdout._refreshSize();"
-      "          }"
-      "        } catch (_) {}"
-      "        return true;"
-      "      }"
-      "      var r = globalThis.process._kill(nPid, sig);"
-      "      if (r && r !== 0) {"
-      "        var e3 = new Error('kill ESRCH');"
-      "        e3.code = 'ESRCH';"
-      "        throw e3;"
-      "      }"
-      "      return true;"
-      "    };"
-      "    globalThis.process.execve = function(execPath, args, env) {"
-      "      var argTail = function(v) {"
-      "        if (v == null) return 'Received ' + String(v);"
-      "        if (typeof v === 'object') return 'Received an instance of ' + ((v.constructor && v.constructor.name) || 'Object');"
-      "        if (typeof v === 'string') return \"Received type string ('\" + v + \"')\";"
-      "        return 'Received type ' + typeof v + ' (' + String(v) + ')';"
-      "      };"
-      "      if (typeof execPath !== 'string') {"
-      "        var e0 = new TypeError('The \"execPath\" argument must be of type string. ' + argTail(execPath));"
-      "        e0.code = 'ERR_INVALID_ARG_TYPE';"
-      "        throw e0;"
-      "      }"
-      "      if (!Array.isArray(args)) {"
-      "        var e1 = new TypeError('The \"args\" argument must be an instance of Array. ' + argTail(args));"
-      "        e1.code = 'ERR_INVALID_ARG_TYPE';"
-      "        throw e1;"
-      "      }"
-      "      for (var i = 0; i < args.length; i++) {"
-      "        var a = args[i];"
-      "        if (typeof a !== 'string' || a.indexOf('\\u0000') >= 0) {"
-      "          var shown = typeof a === 'string' ? (\"'\" + a.replace(/\\u0000/g, '\\\\x00') + \"'\") : String(a);"
-      "          var e2 = new TypeError(\"The argument 'args[\" + i + \"]' must be a string without null bytes. Received \" + shown);"
-      "          e2.code = 'ERR_INVALID_ARG_VALUE';"
-      "          throw e2;"
-      "        }"
-      "      }"
-      "      if (env === undefined) env = globalThis.process.env;"
-      "      if (env === null || typeof env !== 'object' || Array.isArray(env)) {"
-      "        var e3 = new TypeError('The \"env\" argument must be of type object. ' + argTail(env));"
-      "        e3.code = 'ERR_INVALID_ARG_TYPE';"
-      "        throw e3;"
-      "      }"
-      "      var envKeys = Object.keys(env);"
-      "      for (var j = 0; j < envKeys.length; j++) {"
-      "        var k = envKeys[j];"
-      "        var v = env[k];"
-      "        if (typeof k !== 'string' || typeof v !== 'string' || k.indexOf('\\u0000') >= 0 || v.indexOf('\\u0000') >= 0) {"
-      "          var repr = '{ ' + envKeys.map(function(kk){"
-      "            var vv = env[kk];"
-      "            if (typeof vv === 'string') return kk + \": '\" + vv.replace(/\\u0000/g, '\\\\x00') + \"'\";"
-      "            return kk + ': ' + String(vv);"
-      "          }).join(', ') + ' }';"
-      "          var e4 = new TypeError(\"The argument 'env' must be an object with string keys and values without null bytes. Received \" + repr);"
-      "          e4.code = 'ERR_INVALID_ARG_VALUE';"
-      "          throw e4;"
-      "        }"
-      "      }"
-      "      if (Array.isArray(globalThis.process.execArgv) && globalThis.process.execArgv.indexOf('--permission') >= 0 &&"
-      "          globalThis.process.execArgv.indexOf('--allow-child-process') < 0) {"
-      "        var ea = new Error('Access to this API has been restricted');"
-      "        ea.code = 'ERR_ACCESS_DENIED';"
-      "        ea.permission = 'ChildProcess';"
-      "        ea.resource = execPath;"
-      "        throw ea;"
-      "      }"
-      "      var __sameExec = (execPath === globalThis.process.execPath);"
-      "      if (!__sameExec) {"
-      "        try {"
-      "          var __path = require('path');"
-      "          __sameExec = __path.resolve(String(execPath)) === __path.resolve(String(globalThis.process.execPath));"
-      "        } catch (_) {}"
-      "      }"
-      "      if (!__sameExec) {"
-      "        var ef = new Error('process.execve failed with error code ENOENT\\n    at execve (node:internal/process/per_thread:1:1)');"
-      "        ef.code = 'ENOENT';"
-      "        ef.stack = 'Error: process.execve failed with error code ENOENT\\n    at execve (node:internal/process/per_thread:1:1)';"
-      "        throw ef;"
-      "      }"
-      "      globalThis.process.argv = args.slice();"
-      "      var oldKeys = Object.keys(globalThis.process.env);"
-      "      for (var x = 0; x < oldKeys.length; x++) delete globalThis.process.env[oldKeys[x]];"
-      "      for (var y = 0; y < envKeys.length; y++) globalThis.process.env[envKeys[y]] = env[envKeys[y]];"
-      "      var nextScript = args[1];"
-      "      if (typeof nextScript === 'string' && nextScript.length > 0) {"
-      "        try { delete require.cache[require.resolve(nextScript)]; } catch (_) {}"
-      "        require(nextScript);"
-      "      }"
-      "      var ex = new Error('process.execve()');"
-      "      ex.__ubiExitCode = 0;"
-      "      throw ex;"
-      "    };"
-      "  if (typeof globalThis.process.getuid !== 'function') globalThis.process.getuid = function(){ return 0; };"
-      "  try {"
-      "    var __tty = require('tty');"
-      "    if (!globalThis.process.stdin) globalThis.process.stdin = new __tty.ReadStream(0);"
-      "    if (globalThis.process.stdin && typeof globalThis.process.stdin.destroy !== 'function') globalThis.process.stdin.destroy = function(){};"
-      "    var __u_patch_tty_stream = function(stream, fd) {"
-      "      if (!stream || typeof stream !== 'object') return;"
-      "      var ws = new __tty.WriteStream(fd);"
-      "      if (stream.isTTY === undefined) stream.isTTY = true;"
-      "      if (stream.columns === undefined && ws.columns !== undefined) stream.columns = ws.columns;"
-      "      if (stream.rows === undefined && ws.rows !== undefined) stream.rows = ws.rows;"
-      "      if (typeof stream._refreshSize !== 'function') stream._refreshSize = ws._refreshSize;"
-      "      if (typeof stream.getWindowSize !== 'function') stream.getWindowSize = ws.getWindowSize;"
-      "      if (!stream._handle && ws._handle) stream._handle = ws._handle;"
-      "      if (typeof stream.on !== 'function') stream.on = function(){ return this; };"
-      "      if (typeof stream.once !== 'function') stream.once = function(){ return this; };"
-      "      if (typeof stream.emit !== 'function') stream.emit = function(){ return false; };"
-      "    };"
-      "    __u_patch_tty_stream(globalThis.process.stdout, 1);"
-      "    __u_patch_tty_stream(globalThis.process.stderr, 2);"
-      "  } catch (_) {"
-      "    if (!globalThis.process.stdin) {"
-      "      globalThis.process.stdin = { destroy: function(){}, on: function(){ return this; }, once: function(){ return this; } };"
-      "    } else if (typeof globalThis.process.stdin.destroy !== 'function') {"
-      "      globalThis.process.stdin.destroy = function(){};"
-      "    }"
-      "  }"
-      "  if (typeof globalThis.process.binding !== 'function') {"
-      "    globalThis.process.binding = function(name) {"
-      "      if (name === 'uv') {"
-      "        return {"
-      "          errname: function(code) {"
-      "            switch (Number(code)) {"
-      "              case -2: return 'ENOENT';"
-      "              case -9: return 'EBADF';"
-      "              case -13: return 'EACCES';"
-      "              case -17: return 'EEXIST';"
-      "              case -22: return 'EINVAL';"
-      "              case -38: return 'ENOSYS';"
-      "              case -54: return 'ECONNRESET';"
-      "              case -48: return 'EADDRINUSE';"
-      "              case -55: return 'ENOBUFS';"
-      "              case -88: return 'ENOTSOCK';"
-      "              case -98: return 'EADDRINUSE';"
-      "              case -104: return 'ECONNRESET';"
-      "              case -105: return 'ENOBUFS';"
-      "              case -110: return 'ETIMEDOUT';"
-      "              case -111: return 'ECONNREFUSED';"
-      "              case -3007: return 'ENOTFOUND';"
-      "              case -3008: return 'ENOTFOUND';"
-      "              default: {"
-      "                try {"
-      "                  var errno = require('os').constants && require('os').constants.errno;"
-      "                  if (errno && typeof errno === 'object') {"
-      "                    var n = Number(code);"
-      "                    var keys = Object.keys(errno);"
-      "                    for (var i = 0; i < keys.length; i++) {"
-      "                      var key = keys[i];"
-      "                      var raw = Number(errno[key]);"
-      "                      if (raw === n || -raw === n) return key;"
-      "                    }"
-      "                  }"
-      "                } catch (_) {}"
-      "                return 'UNKNOWN';"
-      "              }"
-      "            }"
-      "          },"
-      "          getErrorMap: function() {"
-      "            return new Map(["
-      "              [-2, ['ENOENT', 'no such file or directory']],"
-      "              [-9, ['EBADF', 'bad file descriptor']],"
-      "              [-12, ['ENOMEM', 'out of memory']],"
-      "              [-13, ['EACCES', 'permission denied']],"
-      "              [-22, ['EINVAL', 'invalid argument']],"
-      "              [-54, ['ECONNRESET', 'connection reset by peer']],"
-      "              [-55, ['ENOBUFS', 'no buffer space available']],"
-      "              [-105, ['ENOBUFS', 'no buffer space available']],"
-      "              [-104, ['ECONNRESET', 'connection reset by peer']],"
-      "              [-60, ['ETIMEDOUT', 'connection timed out']],"
-      "              [-110, ['ETIMEDOUT', 'connection timed out']],"
-      "              [-3007, ['ENOTFOUND', 'name does not resolve']],"
-      "              [-3008, ['ENOTFOUND', 'name does not resolve']],"
-      "            ]);"
-      "          },"
-      "          getErrorMessage: function(code) {"
-      "            var map = this.getErrorMap();"
-      "            var row = map.get(Number(code));"
-      "            return row ? String(row[1]) : ('Unknown system error ' + String(code));"
-      "          }"
-      "        };"
-      "      }"
-      "      if (name === 'util') {"
-      "        var u = require('util');"
-      "        var t = (u && u.types) || {};"
-      "        return {"
-      "          isAnyArrayBuffer: t.isAnyArrayBuffer,"
-      "          isArrayBuffer: t.isArrayBuffer,"
-      "          isArrayBufferView: t.isArrayBufferView,"
-      "          isAsyncFunction: t.isAsyncFunction,"
-      "          isDataView: t.isDataView,"
-      "          isDate: t.isDate,"
-      "          isExternal: t.isExternal,"
-      "          isMap: t.isMap,"
-      "          isMapIterator: t.isMapIterator,"
-      "          isNativeError: t.isNativeError,"
-      "          isPromise: t.isPromise,"
-      "          isRegExp: t.isRegExp,"
-      "          isSet: t.isSet,"
-      "          isSetIterator: t.isSetIterator,"
-      "          isTypedArray: t.isTypedArray,"
-      "          isUint8Array: t.isUint8Array,"
-      "        };"
-      "      }"
-      "      if (typeof globalThis.internalBinding === 'function') {"
-      "        var __allow = {"
-      "          buffer: 1, cares_wrap: 1, constants: 1, contextify: 1, fs: 1, fs_event_wrap: 1,"
-      "          icu: 1, inspector: 1, js_stream: 1, natives: 1, os: 1, pipe_wrap: 1, process_wrap: 1, signal_wrap: 1, spawn_sync: 1,"
-      "          stream_wrap: 1, tcp_wrap: 1, tls_wrap: 1, tty_wrap: 1, udp_wrap: 1, util: 1, uv: 1, zlib: 1"
-      "        };"
-      "        var out = globalThis.internalBinding(name);"
-      "        if (__allow[String(name)]) return out || {};"
-      "        if (out && (typeof out !== 'object' || Object.keys(out).length > 0)) return out;"
-      "      }"
-      "      throw new Error('No such module: ' + String(name));"
-      "    };"
-      "  }"
-      "  if (typeof globalThis.process.dlopen !== 'function') {"
-      "    globalThis.process.dlopen = function(module, filename) {"
-      "      var f = String(filename);"
-      "      var e = new Error('Module did not self-register: \\'' + f + '\\'.');"
-      "      e.code = 'ERR_DLOPEN_FAILED';"
-      "      throw e;"
-      "    };"
-      "  }"
-      "}"
-      "if (typeof globalThis.gc !== 'function') {"
-      "  globalThis.gc = function() {};"
-      "}"
-      "var __detachedKey = Symbol.for('node.detachedArrayBuffers');"
-      "var __detachedMarker = Symbol.for('node.detachedArrayBufferMarker');"
-      "globalThis[__detachedKey] = globalThis[__detachedKey] || new WeakSet();"
-      "var __originalStructuredClone = globalThis.structuredClone;"
-      "globalThis.structuredClone = function(v, options) {"
-      "  if (options && options.transfer && typeof options.transfer.length === 'number') {"
-      "    for (var i = 0; i < options.transfer.length; i++) {"
-      "      var t = options.transfer[i];"
-      "      if (t && Object.prototype.toString.call(t) === '[object ArrayBuffer]') {"
-      "        try { t[__detachedMarker] = 1; } catch (_) {}"
-      "        globalThis[__detachedKey].add(t);"
-      "      }"
-      "    }"
-      "  }"
-      "  if (typeof __originalStructuredClone === 'function') {"
-      "    return __originalStructuredClone(v, options);"
-      "  }"
-      "  return JSON.parse(JSON.stringify(v));"
-      "};"
-      "if (typeof globalThis.fetch === 'undefined') {"
-      "  globalThis.fetch = function() { return Promise.reject(new Error('fetch not implemented')); };"
-      "}"
-      "var __uExposeUndiciGlobal = function(name) {"
-      "  if (typeof globalThis[name] !== 'undefined') return;"
-      "  Object.defineProperty(globalThis, name, {"
-      "    configurable: true,"
-      "    enumerable: true,"
-      "    get: function() {"
-      "      var und = require('internal/deps/undici/undici');"
-      "      var v = und && und[name];"
-      "      Object.defineProperty(globalThis, name, { configurable: true, writable: true, enumerable: true, value: v });"
-      "      return v;"
-      "    },"
-      "    set: function(v) {"
-      "      Object.defineProperty(globalThis, name, { configurable: true, writable: true, enumerable: true, value: v });"
-      "    }"
-      "  });"
-      "};"
-      "__uExposeUndiciGlobal('WebSocket');"
-      "__uExposeUndiciGlobal('CloseEvent');"
-      "__uExposeUndiciGlobal('MessageEvent');"
-      "if (typeof globalThis.URL === 'undefined' || typeof globalThis.URLSearchParams === 'undefined') {"
-      "  try {"
-      "    var __iurl = require('internal/url');"
-      "    if (__iurl) {"
-      "      if (typeof globalThis.URL === 'undefined' && typeof __iurl.URL === 'function') globalThis.URL = __iurl.URL;"
-      "      if (typeof globalThis.URLSearchParams === 'undefined' && typeof __iurl.URLSearchParams === 'function') globalThis.URLSearchParams = __iurl.URLSearchParams;"
-      "      if (typeof globalThis.URLPattern === 'undefined' && typeof __iurl.URLPattern === 'function') globalThis.URLPattern = __iurl.URLPattern;"
-      "    }"
-      "  } catch (_) {}"
-      "}"
-      "if (typeof globalThis.Buffer === 'undefined') {"
-      "  try {"
-      "    var __buf = require('buffer');"
-      "    if (__buf && __buf.Buffer) globalThis.Buffer = __buf.Buffer;"
-      "  } catch (_) {}"
-      "}"
-      "var __dateTzPatch = Symbol.for('node.dateTzPatch');"
-      "if (!globalThis[__dateTzPatch] && typeof Date === 'function') {"
-      "  globalThis[__dateTzPatch] = true;"
-      "  var __origDateToString = Date.prototype.toString;"
-      "  Date.prototype.toString = function() {"
-      "    try {"
-      "      var tz = process && process.env && process.env.TZ;"
-      "      var map = { 'Europe/Amsterdam': 120, 'Europe/London': 60, 'Etc/UTC': 0 };"
-      "      if (!Object.prototype.hasOwnProperty.call(map, tz)) return __origDateToString.call(this);"
-      "      var mins = map[tz];"
-      "      var shifted = new Date(this.getTime() + mins * 60000);"
-      "      var wd = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'][shifted.getUTCDay()];"
-      "      var mo = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'][shifted.getUTCMonth()];"
-      "      var dd = String(shifted.getUTCDate()).padStart(2, '0');"
-      "      var yyyy = String(shifted.getUTCFullYear());"
-      "      var hh = String(shifted.getUTCHours()).padStart(2, '0');"
-      "      var mm = String(shifted.getUTCMinutes()).padStart(2, '0');"
-      "      var ss = String(shifted.getUTCSeconds()).padStart(2, '0');"
-      "      var sign = mins >= 0 ? '+' : '-';"
-      "      var abs = Math.abs(mins);"
-      "      var oh = String(Math.trunc(abs / 60)).padStart(2, '0');"
-      "      var om = String(abs % 60).padStart(2, '0');"
-      "      return wd + ' ' + mo + ' ' + dd + ' ' + yyyy + ' ' + hh + ':' + mm + ':' + ss + ' GMT' + sign + oh + om + ' (' + tz + ')';"
-      "    } catch (_) {"
-      "      return __origDateToString.call(this);"
-      "    }"
-      "  };"
-      "}"
-      "} catch (_) {}"
-      "})();";
-  napi_value prelude = nullptr;
-  status = napi_create_string_utf8(env, kPrelude, NAPI_AUTO_LENGTH, &prelude);
-  if (status == napi_ok && prelude != nullptr) {
-    napi_value unused = nullptr;
-    status = napi_run_script(env, prelude, &unused);
-  }
-  if (status != napi_ok) {
-    if (error_out != nullptr) {
-      *error_out = "Prelude failed: " + StatusToString(status);
-    }
-    return 1;
-  }
-
-  // Initialize child-process IPC after the full JS prelude has patched process/EventEmitter.
-  napi_value post_prelude_ipc = nullptr;
-  status = napi_create_string_utf8(env, kPostPreludeIpcBootstrap, NAPI_AUTO_LENGTH, &post_prelude_ipc);
-  if (status == napi_ok && post_prelude_ipc != nullptr) {
-    napi_value post_prelude_ipc_ignored = nullptr;
-    status = napi_run_script(env, post_prelude_ipc, &post_prelude_ipc_ignored);
-  }
-  if (status != napi_ok) {
-    if (error_out != nullptr) {
-      *error_out = "Post-prelude IPC bootstrap failed: " + StatusToString(status);
-    }
-    return 1;
-  }
-
   std::string entry_source;
   const char* source_to_run = source_text;
   if (entry_script_path != nullptr && entry_script_path[0] != '\0') {
@@ -1994,28 +1522,6 @@ int RunScriptWithGlobals(napi_env env,
         "(function(){ try { var __entry = require('path').resolve('" +
         EscapeForSingleQuotedJs(entry_script_path) +
         "');"
-        "var __sigHooksInstalled2 = Symbol.for('node.signalListenerHooksInstalled');"
-        "if (process && typeof process.on === 'function' && !process[__sigHooksInstalled2]) {"
-        "  try {"
-        "    try { require('events'); } catch (_) {}"
-        "    var __uSignalHooks = require('internal/process/signal');"
-        "    var __beforeSigNl = (typeof process.listenerCount === 'function') ? process.listenerCount('newListener') : 0;"
-        "    if (__uSignalHooks && typeof __uSignalHooks.startListeningIfSignal === 'function') {"
-        "      process.on('newListener', __uSignalHooks.startListeningIfSignal);"
-        "    }"
-        "    if (__uSignalHooks && typeof __uSignalHooks.stopListeningIfSignal === 'function') {"
-        "      process.on('removeListener', __uSignalHooks.stopListeningIfSignal);"
-        "    }"
-        "    if (__uSignalHooks && typeof __uSignalHooks.startListeningIfSignal === 'function' && typeof process.eventNames === 'function') {"
-        "      var __existingSignalEvents = process.eventNames();"
-        "      for (var __sei = 0; __sei < __existingSignalEvents.length; __sei++) {"
-        "        try { __uSignalHooks.startListeningIfSignal(__existingSignalEvents[__sei]); } catch (_) {}"
-        "      }"
-        "    }"
-        "    var __afterSigNl = (typeof process.listenerCount === 'function') ? process.listenerCount('newListener') : 0;"
-        "    process[__sigHooksInstalled2] = __afterSigNl > __beforeSigNl;"
-      "  } catch (_) {}"
-        "}"
         "return require(__entry); } catch (err) {"
         "var p = globalThis.process;"
         "if (p && typeof p._fatalException === 'function') {"
@@ -2133,20 +1639,16 @@ napi_status UbiInstallConsole(napi_env env) {
   if (env == nullptr) {
     return napi_invalid_arg;
   }
-  // Install console using the bootstrap require, which resolves from the builtins dir
-  // (GetBuiltinsDirForBootstrap) and is already set up in UbiInstallModuleLoader. This way
-  // we always load the JS console builtin when it exists, regardless of entry script path.
-  napi_value script = nullptr;
-  static const char kInstallConsole[] =
-      "(function(){ if (typeof globalThis.require === 'function') globalThis.console = globalThis.require('console'); })();";
-  napi_status status = napi_create_string_utf8(env, kInstallConsole, NAPI_AUTO_LENGTH, &script);
-  if (status != napi_ok || script == nullptr) {
+  napi_value global = nullptr;
+  napi_status status = napi_get_global(env, &global);
+  if (status != napi_ok || global == nullptr) {
     return (status == napi_ok) ? napi_generic_failure : status;
   }
-  napi_value ignored = nullptr;
-  status = napi_run_script(env, script, &ignored);
-  if (status == napi_ok) {
-    return napi_ok;
+
+  napi_value console_module = nullptr;
+  if (RequireModule(env, "console", &console_module) && console_module != nullptr) {
+    status = napi_set_named_property(env, global, "console", console_module);
+    if (status == napi_ok) return napi_ok;
   }
 
   // Fallback for when no JS console builtin could be loaded.
@@ -2156,11 +1658,6 @@ napi_status UbiInstallConsole(napi_env env) {
     napi_get_and_clear_last_exception(env, &exc);
   }
 
-  napi_value global = nullptr;
-  status = napi_get_global(env, &global);
-  if (status != napi_ok || global == nullptr) {
-    return (status == napi_ok) ? napi_generic_failure : status;
-  }
   napi_value console_obj = nullptr;
   if (napi_create_object(env, &console_obj) != napi_ok || console_obj == nullptr) {
     return napi_generic_failure;

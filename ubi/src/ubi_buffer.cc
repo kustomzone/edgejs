@@ -228,12 +228,20 @@ bool IsValueTrackedDetachedArrayBuffer(napi_env env, napi_value value) {
   return detached;
 }
 
+bool IsArrayBufferDetached(napi_env env, napi_value value) {
+  bool detached = false;
+  if (value != nullptr && napi_is_detached_arraybuffer(env, value, &detached) == napi_ok && detached) {
+    return true;
+  }
+  return IsValueTrackedDetachedArrayBuffer(env, value);
+}
+
 bool ExtractValidationBytesOrThrow(napi_env env, napi_value value, uint8_t** data, size_t* len) {
   if (value == nullptr || data == nullptr || len == nullptr) return false;
 
   bool is_ab = false;
   if (napi_is_arraybuffer(env, value, &is_ab) == napi_ok && is_ab) {
-    if (IsValueTrackedDetachedArrayBuffer(env, value)) {
+    if (IsArrayBufferDetached(env, value)) {
       napi_throw_error(env, "ERR_INVALID_STATE", "Cannot validate on a detached buffer");
       return false;
     }
@@ -258,7 +266,7 @@ bool ExtractValidationBytesOrThrow(napi_env env, napi_value value, uint8_t** dat
     size_t byte_offset = 0;
     if (napi_get_typedarray_info(env, value, &type, &element_len, &ptr, &arraybuffer, &byte_offset) == napi_ok &&
         arraybuffer != nullptr &&
-        IsValueTrackedDetachedArrayBuffer(env, arraybuffer)) {
+        IsArrayBufferDetached(env, arraybuffer)) {
       napi_throw_error(env, "ERR_INVALID_STATE", "Cannot validate on a detached buffer");
       return false;
     }

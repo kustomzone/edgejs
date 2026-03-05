@@ -1,14 +1,8 @@
 'use strict';
 
-function isKeyObject() {
-  return false;
-}
+const path = require('path');
 
-function isCryptoKey() {
-  return false;
-}
-
-module.exports = {
-  isKeyObject,
-  isCryptoKey,
-};
+module.exports = require(path.resolve(
+  __dirname,
+  '../../../../../node-lib/internal/crypto/keys.js',
+));

@@ -28,10 +28,30 @@ function debuglog(_set, cb) {
 }
 
 function debugWithTimer(_set, cb) {
-  const startTimer = () => {};
-  const endTimer = () => {};
-  const logTimer = () => {};
-  if (typeof cb === 'function') cb(startTimer, endTimer, logTimer);
+  let initialized = false;
+  let startImpl = () => {};
+  let endImpl = () => {};
+  let logImpl = () => {};
+
+  function init() {
+    if (initialized) return;
+    initialized = true;
+    if (typeof cb === 'function') cb(startImpl, endImpl, logImpl);
+  }
+
+  const startTimer = (...args) => {
+    init();
+    return startImpl(...args);
+  };
+  const endTimer = (...args) => {
+    init();
+    return endImpl(...args);
+  };
+  const logTimer = (...args) => {
+    init();
+    return logImpl(...args);
+  };
+
   return { startTimer, endTimer, logTimer };
 }
 

@@ -18,12 +18,6 @@ napi_value GetNamed(napi_env env, napi_value obj, const char* key) {
   return out;
 }
 
-bool HasNamed(napi_env env, napi_value obj, const char* key) {
-  if (obj == nullptr) return false;
-  bool has_prop = false;
-  return napi_has_named_property(env, obj, key, &has_prop) == napi_ok && has_prop;
-}
-
 bool IsTruthy(napi_env env, napi_value value) {
   if (value == nullptr) return false;
   napi_valuetype t = napi_undefined;
@@ -42,7 +36,7 @@ bool IsTruthy(napi_env env, napi_value value) {
     if (napi_get_value_string_utf8(env, value, text.data(), text.size(), &copied) != napi_ok) return false;
     text.resize(copied);
     for (char& c : text) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    return text == "1" || text == "true" || text == "yes" || text == "on";
+    return !(text.empty() || text == "0" || text == "false" || text == "no" || text == "off");
   }
   return false;
 }
@@ -55,13 +49,14 @@ bool HasIntl(napi_env env) {
   return napi_typeof(env, intl, &t) == napi_ok && (t == napi_object || t == napi_function);
 }
 
-bool HasProcessNested(napi_env env, const char* first_key, const char* second_key) {
+bool GetTruthyProcessNested(napi_env env, const char* first_key, const char* second_key) {
   napi_value global = GetGlobal(env);
   napi_value process = GetNamed(env, global, "process");
   if (process == nullptr) return false;
   napi_value first = GetNamed(env, process, first_key);
   if (first == nullptr) return false;
-  return HasNamed(env, first, second_key);
+  napi_value value = GetNamed(env, first, second_key);
+  return IsTruthy(env, value);
 }
 
 bool GetProcessConfigVariable(napi_env env, const char* key) {
@@ -93,11 +88,12 @@ napi_value ResolveConfig(napi_env env, const ResolveOptions& /*options*/) {
   if (napi_create_object(env, &out) != napi_ok || out == nullptr) return Undefined(env);
 
   const bool has_intl = HasIntl(env);
-  const bool has_inspector = HasProcessNested(env, "features", "inspector");
-  const bool has_tracing = HasProcessNested(env, "features", "tracing");
-  const bool has_openssl = HasProcessNested(env, "versions", "openssl");
+  const bool has_inspector = GetTruthyProcessNested(env, "features", "inspector");
+  const bool has_tracing = GetTruthyProcessNested(env, "features", "tracing");
+  const bool has_openssl = GetTruthyProcessNested(env, "versions", "openssl");
   const bool openssl_is_boringssl =
-      HasProcessNested(env, "versions", "boringssl") || HasProcessNested(env, "features", "openssl_is_boringssl");
+      GetTruthyProcessNested(env, "versions", "boringssl") ||
+      GetTruthyProcessNested(env, "features", "openssl_is_boringssl");
   const bool has_small_icu = false;
   const bool fips_mode =
       GetProcessConfigVariable(env, "openssl_is_fips") || GetProcessConfigVariable(env, "node_fipsinstall");

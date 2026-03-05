@@ -150,25 +150,7 @@ void EnsureNatives(napi_env env, napi_value binding) {
   if (has_natives) return;
 
   napi_value natives = nullptr;
-  napi_value global = GetGlobal(env);
-  napi_value process = nullptr;
-  napi_value process_binding = nullptr;
-  napi_value name = nullptr;
-  if (global != nullptr &&
-      napi_get_named_property(env, global, "process", &process) == napi_ok &&
-      process != nullptr &&
-      napi_get_named_property(env, process, "binding", &process_binding) == napi_ok &&
-      process_binding != nullptr) {
-    napi_valuetype binding_type = napi_undefined;
-    if (napi_typeof(env, process_binding, &binding_type) == napi_ok && binding_type == napi_function &&
-        napi_create_string_utf8(env, "natives", NAPI_AUTO_LENGTH, &name) == napi_ok && name != nullptr &&
-        napi_call_function(env, process, process_binding, 1, &name, &natives) == napi_ok &&
-        natives != nullptr) {
-      // keep natives
-    }
-  }
-
-  if (natives == nullptr) napi_create_object(env, &natives);
+  napi_create_object(env, &natives);
   if (natives != nullptr) napi_set_named_property(env, binding, "natives", natives);
 }
 

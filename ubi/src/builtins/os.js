@@ -54,9 +54,17 @@ const {
   },
   hideStackFrames,
 } = require('internal/errors');
-const {
-  validateInt32,
-} = require('internal/validators');
+function validateInt32Compat(value, name, min, max) {
+  const validators = require('internal/validators');
+  if (validators && typeof validators.validateInt32 === 'function') {
+    return validators.validateInt32(value, name, min, max);
+  }
+  if (typeof value !== 'number') {
+    const err = new TypeError(`The "${name}" argument must be of type number.`);
+    err.code = 'ERR_INVALID_ARG_TYPE';
+    throw err;
+  }
+}
 
 const binding = internalBinding('os');
 const constants = (internalBinding('constants') || {}).os || {};
@@ -218,8 +226,8 @@ function setPriority(pid, priority) {
     priority = pid;
     pid = 0;
   }
-  validateInt32(pid, 'pid');
-  validateInt32(priority, 'priority', -20, 19);
+  validateInt32Compat(pid, 'pid');
+  validateInt32Compat(priority, 'priority', -20, 19);
   const ctx = {};
   if (_setPriority(pid, priority, ctx) !== 0) {
     throw new ERR_SYSTEM_ERROR(ctx);
@@ -228,7 +236,7 @@ function setPriority(pid, priority) {
 
 function getPriority(pid) {
   if (pid === undefined) pid = 0;
-  else validateInt32(pid, 'pid');
+  else validateInt32Compat(pid, 'pid');
   const ctx = {};
   const priority = _getPriority(pid, ctx);
   if (priority === undefined) {

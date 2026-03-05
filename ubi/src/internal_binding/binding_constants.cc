@@ -232,6 +232,7 @@ void NormalizeConstantsShape(napi_env env, napi_value constants) {
   napi_value normalized_signals = CreateBestEffortNullProtoObject(env);
   if (!IsObjectLike(env, normalized_signals)) return;
   CopyOwnProperties(env, src_signals, normalized_signals);
+  napi_object_freeze(env, normalized_signals);
   napi_set_named_property(env, os_obj, "signals", normalized_signals);
 }
 

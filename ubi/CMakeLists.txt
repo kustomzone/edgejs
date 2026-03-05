@@ -251,6 +251,7 @@ add_library(ubi_runtime STATIC
   src/ubi_module_loader.cc
   src/internal_binding/dispatch.cc
   src/internal_binding/binding_async_wrap.cc
+  src/internal_binding/binding_blob.cc
   src/internal_binding/binding_buffer.cc
   src/internal_binding/binding_builtins.cc
   src/internal_binding/binding_cares_wrap.cc
@@ -265,8 +266,12 @@ add_library(ubi_runtime STATIC
   src/internal_binding/binding_http_parser.cc
   src/internal_binding/binding_module_wrap.cc
   src/internal_binding/binding_modules.cc
+  src/internal_binding/binding_messaging.cc
+  src/internal_binding/binding_mksnapshot.cc
   src/internal_binding/binding_options.cc
   src/internal_binding/binding_os.cc
+  src/internal_binding/binding_performance.cc
+  src/internal_binding/binding_permission.cc
   src/internal_binding/binding_pipe_wrap.cc
   src/internal_binding/binding_process_methods.cc
   src/internal_binding/binding_process_wrap.cc
@@ -287,6 +292,8 @@ add_library(ubi_runtime STATIC
   src/internal_binding/binding_url_pattern.cc
   src/internal_binding/binding_util.cc
   src/internal_binding/binding_uv.cc
+  src/internal_binding/binding_wasm_web_api.cc
+  src/internal_binding/binding_worker.cc
   src/ubi_errors_binding.cc
   "${PROJECT_ROOT}/deps/llhttp/src/api.c"
   "${PROJECT_ROOT}/deps/llhttp/src/http.c"

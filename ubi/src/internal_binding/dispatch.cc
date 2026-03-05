@@ -8,6 +8,7 @@
 namespace internal_binding {
 
 napi_value ResolveAsyncWrap(napi_env env, const ResolveOptions& options);
+napi_value ResolveBlob(napi_env env, const ResolveOptions& options);
 napi_value ResolveBuffer(napi_env env, const ResolveOptions& options);
 napi_value ResolveBuiltins(napi_env env, const ResolveOptions& options);
 napi_value ResolveCaresWrap(napi_env env, const ResolveOptions& options);
@@ -22,8 +23,12 @@ napi_value ResolveFs(napi_env env, const ResolveOptions& options);
 napi_value ResolveHttpParser(napi_env env, const ResolveOptions& options);
 napi_value ResolveModuleWrap(napi_env env, const ResolveOptions& options);
 napi_value ResolveModules(napi_env env, const ResolveOptions& options);
+napi_value ResolveMksnapshot(napi_env env, const ResolveOptions& options);
+napi_value ResolveMessaging(napi_env env, const ResolveOptions& options);
 napi_value ResolveOptionsBinding(napi_env env, const ResolveOptions& options);
 napi_value ResolveOs(napi_env env, const ResolveOptions& options);
+napi_value ResolvePerformance(napi_env env, const ResolveOptions& options);
+napi_value ResolvePermission(napi_env env, const ResolveOptions& options);
 napi_value ResolvePipeWrap(napi_env env, const ResolveOptions& options);
 napi_value ResolveProcessMethods(napi_env env, const ResolveOptions& options);
 napi_value ResolveProcessWrap(napi_env env, const ResolveOptions& options);
@@ -44,6 +49,8 @@ napi_value ResolveUrl(napi_env env, const ResolveOptions& options);
 napi_value ResolveUrlPattern(napi_env env, const ResolveOptions& options);
 napi_value ResolveUtil(napi_env env, const ResolveOptions& options);
 napi_value ResolveUv(napi_env env, const ResolveOptions& options);
+napi_value ResolveWasmWebApi(napi_env env, const ResolveOptions& options);
+napi_value ResolveWorker(napi_env env, const ResolveOptions& options);
 
 namespace {
 
@@ -54,8 +61,9 @@ struct BindingResolverEntry {
   ResolverFn resolver;
 };
 
-constexpr std::array<BindingResolverEntry, 37> kResolvers = {{
+constexpr std::array<BindingResolverEntry, 44> kResolvers = {{
     {"async_wrap", ResolveAsyncWrap},
+    {"blob", ResolveBlob},
     {"buffer", ResolveBuffer},
     {"builtins", ResolveBuiltins},
     {"cares_wrap", ResolveCaresWrap},
@@ -70,8 +78,12 @@ constexpr std::array<BindingResolverEntry, 37> kResolvers = {{
     {"http_parser", ResolveHttpParser},
     {"module_wrap", ResolveModuleWrap},
     {"modules", ResolveModules},
+    {"mksnapshot", ResolveMksnapshot},
+    {"messaging", ResolveMessaging},
     {"options", ResolveOptionsBinding},
     {"os", ResolveOs},
+    {"performance", ResolvePerformance},
+    {"permission", ResolvePermission},
     {"pipe_wrap", ResolvePipeWrap},
     {"process_methods", ResolveProcessMethods},
     {"process_wrap", ResolveProcessWrap},
@@ -92,6 +104,8 @@ constexpr std::array<BindingResolverEntry, 37> kResolvers = {{
     {"url_pattern", ResolveUrlPattern},
     {"util", ResolveUtil},
     {"uv", ResolveUv},
+    {"wasm_web_api", ResolveWasmWebApi},
+    {"worker", ResolveWorker},
 }};
 
 }  // namespace

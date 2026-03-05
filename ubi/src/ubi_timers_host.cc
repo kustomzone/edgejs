@@ -410,3 +410,18 @@ napi_value UbiInstallTimersHostBinding(napi_env env) {
 
   return binding;
 }
+
+int32_t UbiGetActiveTimeoutCount() {
+  // Must match internal/timers.js timeoutInfo[0].
+  if (g_timers_state.timeout_info_ptr == nullptr) return 0;
+  const int32_t count = g_timers_state.timeout_info_ptr[0];
+  return count > 0 ? count : 0;
+}
+
+uint32_t UbiGetActiveImmediateRefCount() {
+  // Must match internal/timers.js immediateInfo[kRefCount], where kRefCount = 1.
+  if (g_timers_state.immediate_info_ptr == nullptr) return 0;
+  constexpr int kRefCount = 1;
+  const int32_t count = g_timers_state.immediate_info_ptr[kRefCount];
+  return count > 0 ? static_cast<uint32_t>(count) : 0;
+}

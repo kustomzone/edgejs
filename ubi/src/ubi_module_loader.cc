@@ -31,6 +31,7 @@
 #include <sstream>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "uv.h"
@@ -78,6 +79,46 @@ std::unordered_map<napi_env, TaskQueueBindingState> g_task_queue_states;
 std::unordered_map<napi_env, TraceEventsBindingState> g_trace_events_states;
 std::unordered_map<napi_env, napi_ref> g_contextify_binding_refs;
 std::vector<RequireContext*> g_require_contexts;
+std::unordered_set<napi_env> g_loader_cleanup_hook_registered;
+
+void RemoveRequireContextsForState(ModuleLoaderState* state) {
+  if (state == nullptr) return;
+  auto it = g_require_contexts.begin();
+  while (it != g_require_contexts.end()) {
+    RequireContext* ctx = *it;
+    if (ctx != nullptr && ctx->state == state) {
+      delete ctx;
+      it = g_require_contexts.erase(it);
+      continue;
+    }
+    ++it;
+  }
+}
+
+void OnModuleLoaderEnvCleanup(void* arg) {
+  napi_env env = static_cast<napi_env>(arg);
+  g_loader_cleanup_hook_registered.erase(env);
+
+  auto loader_it = g_loader_states.find(env);
+  if (loader_it != g_loader_states.end()) {
+    ModuleLoaderState* state = &loader_it->second;
+    RemoveRequireContextsForState(state);
+    g_loader_states.erase(loader_it);
+  }
+
+  g_task_queue_states.erase(env);
+  g_trace_events_states.erase(env);
+  g_contextify_binding_refs.erase(env);
+}
+
+void EnsureModuleLoaderCleanupHook(napi_env env) {
+  if (env == nullptr) return;
+  auto [it, inserted] = g_loader_cleanup_hook_registered.emplace(env);
+  if (!inserted) return;
+  if (napi_add_env_cleanup_hook(env, OnModuleLoaderEnvCleanup, env) != napi_ok) {
+    g_loader_cleanup_hook_registered.erase(it);
+  }
+}
 
 std::string ReadTextFile(const fs::path& path) {
   std::ifstream in(path);
@@ -359,6 +400,8 @@ bool ResolveBuiltinPath(const std::string& specifier, const std::string& base_di
   }
   static const fs::path runtime_builtins_dir =
       fs::absolute(fs::path(__FILE__).parent_path() / "builtins").lexically_normal();
+  static const fs::path upstream_node_lib_dir =
+      fs::absolute(fs::path(__FILE__).parent_path() / ".." / ".." / "node-lib").lexically_normal();
   fs::path resolved;
   if (id == "internal/test/binding") {
     fs::path internal_test_binding = runtime_builtins_dir / "internal_test_binding.js";
@@ -371,8 +414,6 @@ bool ResolveBuiltinPath(const std::string& specifier, const std::string& base_di
   // This avoids an extra shim layer that can expose partially initialized wrapper
   // exports during circular loads (e.g. events <-> internal/util call paths).
   if (id == "internal/util" || id == "internal/util/inspect") {
-    static const fs::path upstream_node_lib_dir =
-        fs::absolute(fs::path(__FILE__).parent_path() / ".." / ".." / "node-lib").lexically_normal();
     fs::path upstream_candidate = upstream_node_lib_dir / (id + ".js");
     if (ResolveAsFile(upstream_candidate, &resolved)) {
       *out = resolved.lexically_normal();
@@ -411,7 +452,48 @@ bool ResolveBuiltinPath(const std::string& specifier, const std::string& base_di
     *out = resolved.lexically_normal();
     return true;
   }
+
+  // Final fallback for internal builtins that are not mirrored under
+  // ubi/src/builtins yet: resolve directly from node-lib.
+  if (id.rfind("internal/", 0) == 0) {
+    candidate = upstream_node_lib_dir / (id + ".js");
+    if (ResolveAsFile(candidate, &resolved)) {
+      *out = resolved.lexically_normal();
+      return true;
+    }
+  }
   return false;
+}
+
+bool TryGetBuiltinIdFromResolvedPath(const fs::path& resolved_path, std::string* out_id) {
+  if (out_id == nullptr) return false;
+  static const fs::path runtime_builtins_dir =
+      fs::absolute(fs::path(__FILE__).parent_path() / "builtins").lexically_normal();
+  static const fs::path upstream_node_lib_dir =
+      fs::absolute(fs::path(__FILE__).parent_path() / ".." / ".." / "node-lib").lexically_normal();
+
+  const fs::path normalized = fs::absolute(resolved_path).lexically_normal();
+  auto derive_id = [&](const fs::path& root) -> bool {
+    const fs::path rel = normalized.lexically_relative(root);
+    const std::string rel_text = rel.generic_string();
+    if (rel_text.empty() || rel_text == "." || rel_text.rfind("..", 0) == 0) return false;
+    if (rel.extension() != ".js") return false;
+    std::string id = rel_text;
+    id.resize(id.size() - 3);  // trim ".js"
+    if (id == "internal_test_binding") id = "internal/test/binding";
+    *out_id = std::move(id);
+    return true;
+  };
+
+  return derive_id(runtime_builtins_dir) || derive_id(upstream_node_lib_dir);
+}
+
+std::string ModuleSourceUrlForResolvedPath(const fs::path& resolved_path) {
+  std::string builtin_id;
+  if (TryGetBuiltinIdFromResolvedPath(resolved_path, &builtin_id)) {
+    return "node:" + builtin_id;
+  }
+  return resolved_path.string();
 }
 
 // Directory to use when loading bootstrap builtins in the prelude, so they are found regardless of entry_dir.
@@ -998,6 +1080,13 @@ static napi_value OptionsGetCLIOptionsValuesCallback(napi_env env, napi_callback
       {"--test-timeout", 0},
   };
   const std::vector<const char*> array_defaults = {
+      "--allow-addons",
+      "--allow-child-process",
+      "--allow-fs-read",
+      "--allow-fs-write",
+      "--allow-inspector",
+      "--allow-wasi",
+      "--allow-worker",
       "--conditions",
       "--disable-warning",
       "--env-file",
@@ -1022,6 +1111,13 @@ static napi_value OptionsGetCLIOptionsValuesCallback(napi_env env, napi_callback
   for (const char* key : array_defaults) SetArrayProperty(env, out, key);
 
   const std::unordered_map<std::string, bool> array_option_set = {
+      {"--allow-addons", true},
+      {"--allow-child-process", true},
+      {"--allow-fs-read", true},
+      {"--allow-fs-write", true},
+      {"--allow-inspector", true},
+      {"--allow-wasi", true},
+      {"--allow-worker", true},
       {"--conditions", true},
       {"--disable-warning", true},
       {"--env-file", true},
@@ -2680,13 +2776,14 @@ bool EvaluateJsModule(napi_env env,
   if (source.empty()) {
     return ThrowLoaderError(env, ("Failed to read module source: " + resolved_path.string()).c_str());
   }
+  const std::string source_url = ModuleSourceUrlForResolvedPath(resolved_path);
 
   // Node-aligned: compile the wrapper as a function, then call it from C++ with (internalBinding, primordials)
   // as arguments (realm->primordials() in Node). No JS expression like globalThis.primordials at call time.
   const std::string wrapped_source =
       "(function(internalBinding, primordials) {"
       "return function(exports, require, module, __filename, __dirname) {\n" + source +
-      "\n//# sourceURL=" + resolved_path.string() + "\n};"
+      "\n//# sourceURL=" + source_url + "\n};"
       "})";
   napi_value script_source = nullptr;
   if (napi_create_string_utf8(env, wrapped_source.c_str(), NAPI_AUTO_LENGTH, &script_source) != napi_ok ||
@@ -3044,6 +3141,7 @@ napi_status UbiInstallModuleLoader(napi_env env, const char* entry_script_path) 
   if (env == nullptr) {
     return napi_invalid_arg;
   }
+  EnsureModuleLoaderCleanupHook(env);
 
   fs::path entry_path;
   if (entry_script_path != nullptr && entry_script_path[0] != '\0') {
@@ -3053,6 +3151,7 @@ napi_status UbiInstallModuleLoader(napi_env env, const char* entry_script_path) 
   }
 
   auto& state = g_loader_states[env];
+  RemoveRequireContextsForState(&state);
   auto ctx_it = g_contextify_binding_refs.find(env);
   if (ctx_it != g_contextify_binding_refs.end()) {
     if (ctx_it->second != nullptr) {

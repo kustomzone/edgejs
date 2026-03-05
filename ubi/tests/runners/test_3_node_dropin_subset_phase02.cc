@@ -1,13 +1,19 @@
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 #if !defined(_WIN32)
 #include <cerrno>
+#if defined(__APPLE__)
+#include <crt_externs.h>
+#endif
 #include <fcntl.h>
 #include <sys/file.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #else
 #include <process.h>
@@ -45,13 +51,51 @@ std::string MakeTestSerialId(std::string_view key) {
   return std::to_string(id);
 }
 
-void SetOrUnsetEnv(const char* name, const std::string* value) {
-  if (value != nullptr) {
-    setenv(name, value->c_str(), 1);
-  } else {
-    unsetenv(name);
+using EnvSnapshot = std::unordered_map<std::string, std::string>;
+
+EnvSnapshot CaptureEnvSnapshot() {
+  EnvSnapshot snapshot;
+#if defined(_WIN32)
+  extern char** _environ;
+  char** envp = _environ;
+#elif defined(__APPLE__)
+  char** envp = *_NSGetEnviron();
+#else
+  extern char** environ;
+  char** envp = ::environ;
+#endif
+  if (envp == nullptr) {
+    return snapshot;
+  }
+  for (; *envp != nullptr; ++envp) {
+    std::string entry(*envp);
+    const size_t eq = entry.find('=');
+    if (eq == std::string::npos) continue;
+    snapshot.emplace(entry.substr(0, eq), entry.substr(eq + 1));
+  }
+  return snapshot;
+}
+
+void RestoreEnvSnapshot(const EnvSnapshot& snapshot) {
+  const EnvSnapshot current = CaptureEnvSnapshot();
+  for (const auto& [name, _] : current) {
+    if (snapshot.find(name) == snapshot.end()) {
+      unsetenv(name.c_str());
+    }
+  }
+  for (const auto& [name, value] : snapshot) {
+    setenv(name.c_str(), value.c_str(), 1);
   }
 }
+
+class ScopedEnvSnapshot {
+ public:
+  ScopedEnvSnapshot() : snapshot_(CaptureEnvSnapshot()) {}
+  ~ScopedEnvSnapshot() { RestoreEnvSnapshot(snapshot_); }
+
+ private:
+  EnvSnapshot snapshot_;
+};
 
 bool StartsWith(std::string_view s, std::string_view prefix) {
   return s.size() >= prefix.size() && s.substr(0, prefix.size()) == prefix;
@@ -71,6 +115,7 @@ bool ScriptStartsWithFlagsHeader(const std::filesystem::path& script_path) {
     return false;
   }
 
+  bool in_block_comment = false;
   std::string line;
   while (std::getline(in, line)) {
     std::string_view view(line);
@@ -78,10 +123,36 @@ bool ScriptStartsWithFlagsHeader(const std::filesystem::path& script_path) {
       view.remove_suffix(1);
     }
     view = TrimLeadingAsciiWhitespace(view);
-    if (view.empty()) {
-      continue;
+    if (view.empty()) continue;
+
+    if (in_block_comment) {
+      const size_t end = view.find("*/");
+      if (end == std::string_view::npos) continue;
+      in_block_comment = false;
+      view.remove_prefix(end + 2);
+      view = TrimLeadingAsciiWhitespace(view);
+      if (view.empty()) continue;
     }
-    return StartsWith(view, "// Flags:");
+
+    if (StartsWith(view, "// Flags:")) return true;
+    if (StartsWith(view, "//")) continue;
+    if (StartsWith(view, "#!")) continue;
+
+    if (StartsWith(view, "/*")) {
+      const size_t end = view.find("*/");
+      if (end == std::string_view::npos) {
+        in_block_comment = true;
+        continue;
+      }
+      view.remove_prefix(end + 2);
+      view = TrimLeadingAsciiWhitespace(view);
+      if (view.empty()) continue;
+      if (StartsWith(view, "// Flags:")) return true;
+      if (StartsWith(view, "//")) continue;
+      return false;
+    }
+
+    return false;
   }
   return false;
 }
@@ -165,6 +236,8 @@ int RunRawNodeTestScript(napi_env env,
                          std::string* error_out,
                          bool keep_event_loop_alive = false);
 
+int RunRawNodeTestScriptInSubprocess(const char* node_test_relative_path, std::string* error_out);
+
 int RunNodeCompatScript(napi_env env, const char* relative_path, std::string* error_out) {
   return RunRawNodeTestScript(env, relative_path, error_out, false);
 }
@@ -177,6 +250,10 @@ int RunRawNodeTestScript(napi_env env,
                          bool keep_event_loop_alive) {
 #if defined(NAPI_V8_NODE_ROOT_PATH) || defined(PROJECT_ROOT_PATH)
   namespace fs = std::filesystem;
+  ScopedEnvSnapshot env_snapshot;
+  std::error_code cwd_ec;
+  const fs::path original_cwd = fs::current_path(cwd_ec);
+  const bool restore_cwd = !cwd_ec;
   const std::string rel_path = node_test_relative_path ? std::string(node_test_relative_path) : std::string();
   const bool has_suite_prefix = rel_path.find('/') != std::string::npos;
   const std::string script_rel = has_suite_prefix ? rel_path : ("parallel/" + rel_path);
@@ -192,31 +269,7 @@ int RunRawNodeTestScript(napi_env env,
     return 0;
   }
   const std::string node_test_dir = (node_root_path / "test").string();
-  std::string prior_test_serial_id;
-  bool had_prior_test_serial_id = false;
-  if (const char* existing = std::getenv("TEST_SERIAL_ID")) {
-    prior_test_serial_id = existing;
-    had_prior_test_serial_id = true;
-  }
-  std::string prior_test_thread_id;
-  bool had_prior_test_thread_id = false;
-  if (const char* existing = std::getenv("TEST_THREAD_ID")) {
-    prior_test_thread_id = existing;
-    had_prior_test_thread_id = true;
-  }
-  std::string prior_test_parallel;
-  bool had_prior_test_parallel = false;
-  if (const char* existing = std::getenv("TEST_PARALLEL")) {
-    prior_test_parallel = existing;
-    had_prior_test_parallel = true;
-  }
   const std::string test_serial_id = MakeTestSerialId(script_rel);
-  std::string prior_known_globals;
-  bool had_prior_known_globals = false;
-  if (const char* existing = std::getenv("NODE_TEST_KNOWN_GLOBALS")) {
-    prior_known_globals = existing;
-    had_prior_known_globals = true;
-  }
   setenv("NODE_TEST_DIR", node_test_dir.c_str(), 1);
   setenv("NODE_TEST_KNOWN_GLOBALS", "0", 1);
   setenv("TEST_SERIAL_ID", test_serial_id.c_str(), 1);
@@ -252,40 +305,117 @@ int RunRawNodeTestScript(napi_env env,
       napi_set_named_property(env, env_v, "TEST_PARALLEL", parallel_v);
     }
   }
-  std::string prior_loop_timeout;
-  bool had_prior_loop_timeout = false;
   if (keep_event_loop_alive) {
-    if (const char* existing = std::getenv("UBI_LOOP_TIMEOUT_MS")) {
-      prior_loop_timeout = existing;
-      had_prior_loop_timeout = true;
-    }
-    if (!had_prior_loop_timeout) {
+    if (std::getenv("UBI_LOOP_TIMEOUT_MS") == nullptr) {
       setenv("UBI_LOOP_TIMEOUT_MS", "10000", 1);
     }
   }
   const int exit_code =
       UbiRunScriptFileWithLoop(env, script_path_absolute.c_str(), error_out, keep_event_loop_alive);
-  unsetenv("NODE_TEST_DIR");
-  SetOrUnsetEnv("TEST_SERIAL_ID", had_prior_test_serial_id ? &prior_test_serial_id : nullptr);
-  SetOrUnsetEnv("TEST_THREAD_ID", had_prior_test_thread_id ? &prior_test_thread_id : nullptr);
-  SetOrUnsetEnv("TEST_PARALLEL", had_prior_test_parallel ? &prior_test_parallel : nullptr);
-  if (had_prior_known_globals) {
-    setenv("NODE_TEST_KNOWN_GLOBALS", prior_known_globals.c_str(), 1);
-  } else {
-    unsetenv("NODE_TEST_KNOWN_GLOBALS");
-  }
-  if (keep_event_loop_alive) {
-    if (had_prior_loop_timeout) {
-      setenv("UBI_LOOP_TIMEOUT_MS", prior_loop_timeout.c_str(), 1);
-    } else {
-      unsetenv("UBI_LOOP_TIMEOUT_MS");
-    }
+  if (restore_cwd) {
+    std::error_code restore_ec;
+    fs::current_path(original_cwd, restore_ec);
   }
   return exit_code;
 #else
   (void)env;
   (void)node_test_relative_path;
   (void)error_out;
+  return -1;
+#endif
+}
+
+std::filesystem::path ResolveUbiCliPathForRawSubprocess() {
+  namespace fs = std::filesystem;
+  if (const char* explicit_path = std::getenv("UBI_EXEC_PATH");
+      explicit_path != nullptr && explicit_path[0] != '\0') {
+    return fs::path(explicit_path);
+  }
+
+  const fs::path cwd = fs::current_path();
+  const std::vector<fs::path> candidates = {
+      cwd / "build-ubi" / "ubi",
+      cwd / "build" / "ubi",
+      cwd.parent_path() / "build-ubi" / "ubi",
+      cwd.parent_path() / "build" / "ubi",
+  };
+  for (const fs::path& candidate : candidates) {
+    std::error_code ec;
+    if (!fs::exists(candidate, ec) || ec) continue;
+    if (fs::is_directory(candidate, ec) || ec) continue;
+    return fs::absolute(candidate).lexically_normal();
+  }
+  return fs::path("ubi");
+}
+
+int RunRawNodeTestScriptInSubprocess(const char* node_test_relative_path, std::string* error_out) {
+#if defined(NAPI_V8_NODE_ROOT_PATH) || defined(PROJECT_ROOT_PATH)
+#if defined(_WIN32)
+  (void)node_test_relative_path;
+  if (error_out != nullptr) {
+    *error_out = "Raw subprocess runner is not implemented on win32.";
+  }
+  return -1;
+#else
+  (void)ResolveUbiCliPathForRawSubprocess;
+  int status = 0;
+  const pid_t child_pid = fork();
+  if (child_pid < 0) {
+    const int fork_errno = errno;
+    if (error_out != nullptr) {
+      *error_out = "fork failed: " + std::string(std::strerror(fork_errno));
+    }
+    return 1;
+  }
+
+  if (child_pid == 0) {
+    void* scope = nullptr;
+    napi_env env = nullptr;
+    if (unofficial_napi_create_env(8, &env, &scope) != napi_ok || env == nullptr) {
+      _exit(70);
+    }
+    std::string child_error;
+    const int child_exit = RunRawNodeTestScript(env, node_test_relative_path, &child_error, false);
+    if (!child_error.empty()) {
+      (void)write(STDERR_FILENO, child_error.c_str(), child_error.size());
+      (void)write(STDERR_FILENO, "\n", 1);
+    }
+    if (scope != nullptr) {
+      (void)unofficial_napi_release_env(scope);
+    }
+    _exit(child_exit);
+  }
+
+  while (waitpid(child_pid, &status, 0) < 0) {
+    if (errno == EINTR) continue;
+    const int wait_errno = errno;
+    if (error_out != nullptr) {
+      *error_out = "waitpid failed: " + std::string(std::strerror(wait_errno));
+    }
+    return 1;
+  }
+
+  int exit_code = 1;
+  if (WIFEXITED(status)) {
+    exit_code = WEXITSTATUS(status);
+  } else if (WIFSIGNALED(status)) {
+    exit_code = 128 + WTERMSIG(status);
+  }
+
+  if (error_out != nullptr) {
+    if (exit_code == 0) {
+      error_out->clear();
+    } else {
+      *error_out = "subprocess exit(" + std::to_string(exit_code) + ")";
+    }
+  }
+  return exit_code;
+#endif
+#else
+  (void)node_test_relative_path;
+  if (error_out != nullptr) {
+    *error_out = "Raw Node tests require node test root path definitions.";
+  }
   return -1;
 #endif
 }
@@ -694,11 +824,33 @@ TEST_F(Test3NodeDropinSubsetPhase02, NodeCompatEventEmitterMethodNamesTest) {
     if (RawNodeScriptStartsWithFlagsHeader(script_name)) {       \
       GTEST_SKIP() << "Skipping Node.js raw test with // Flags header: " << script_name; \
     }                                                            \
-    EnvScope s(runtime_.get());                                 \
     std::string error;                                          \
-    const int exit_code = RunRawNodeTestScript(s.env, script_name, &error); \
+    const int exit_code = RunRawNodeTestScriptInSubprocess(script_name, &error); \
     EXPECT_EQ(exit_code, 0) << "error=" << error;               \
     EXPECT_TRUE(error.empty()) << "error=" << error;            \
+  }
+
+#define DEFINE_RAW_NODE_SUBPROCESS_TEST(test_name, script_name) \
+  TEST_F(Test3NodeDropinSubsetPhase02, test_name) {             \
+    if (RawNodeScriptStartsWithFlagsHeader(script_name)) {      \
+      GTEST_SKIP() << "Skipping Node.js raw test with // Flags header: " << script_name; \
+    }                                                            \
+    std::string error;                                           \
+    const int exit_code = RunRawNodeTestScriptInSubprocess(script_name, &error); \
+    EXPECT_EQ(exit_code, 0) << "error=" << error;               \
+    EXPECT_TRUE(error.empty()) << "error=" << error;            \
+  }
+
+#define DEFINE_RAW_NODE_IN_PROCESS_TEST(test_name, script_name)  \
+  TEST_F(Test3NodeDropinSubsetPhase02, test_name) {              \
+    if (RawNodeScriptStartsWithFlagsHeader(script_name)) {       \
+      GTEST_SKIP() << "Skipping Node.js raw test with // Flags header: " << script_name; \
+    }                                                             \
+    EnvScope s(runtime_.get());                                   \
+    std::string error;                                            \
+    const int exit_code = RunRawNodeTestScript(s.env, script_name, &error); \
+    EXPECT_EQ(exit_code, 0) << "error=" << error;                \
+    EXPECT_TRUE(error.empty()) << "error=" << error;             \
   }
 
 DEFINE_RAW_NODE_TEST(RawBufferAllocFromNodeTest, "test-buffer-alloc.js")
@@ -813,33 +965,42 @@ DEFINE_RAW_NODE_TEST(RawQuerystringMaxKeysNonFiniteFromNodeTest, "test-querystri
 DEFINE_RAW_NODE_TEST(RawQuerystringEscapeFromNodeTest, "test-querystring-escape.js")
 
 // Raw Node process tests
-DEFINE_RAW_NODE_TEST(RawProcessFeaturesFromNodeTest, "test-process-features.js")
-DEFINE_RAW_NODE_TEST(RawProcessAbortFromNodeTest, "test-process-abort.js")
-DEFINE_RAW_NODE_TEST(RawProcessArgv0FromNodeTest, "test-process-argv-0.js")
-DEFINE_RAW_NODE_TEST(RawProcessAvailableMemoryFromNodeTest, "test-process-available-memory.js")
-DEFINE_RAW_NODE_TEST(RawProcessChdirFromNodeTest, "test-process-chdir.js")
-DEFINE_RAW_NODE_TEST(RawProcessChdirErrormessageFromNodeTest, "test-process-chdir-errormessage.js")
-DEFINE_RAW_NODE_TEST(RawProcessExecpathFromNodeTest, "test-process-execpath.js")
-DEFINE_RAW_NODE_TEST(RawProcessExecArgvFromNodeTest, "test-process-exec-argv.js")
-DEFINE_RAW_NODE_TEST(RawProcessConfigFromNodeTest, "test-process-config.js")
-DEFINE_RAW_NODE_TEST(RawProcessConstantsNoatimeFromNodeTest, "test-process-constants-noatime.js")
-DEFINE_RAW_NODE_TEST(RawProcessConstrainedMemoryFromNodeTest, "test-process-constrained-memory.js")
-DEFINE_RAW_NODE_TEST(RawProcessCpuUsageFromNodeTest, "test-process-cpuUsage.js")
-DEFINE_RAW_NODE_TEST(RawProcessDefaultFromNodeTest, "test-process-default.js")
-DEFINE_RAW_NODE_TEST(RawProcessEmitwarningFromNodeTest, "test-process-emitwarning.js")
-DEFINE_RAW_NODE_TEST(RawProcessEmitFromNodeTest, "test-process-emit.js")
-DEFINE_RAW_NODE_TEST(RawProcessEnvFromNodeTest, "test-process-env.js")
-DEFINE_RAW_NODE_TEST(RawProcessEnvAllowedFlagsFromNodeTest, "test-process-env-allowed-flags.js")
-DEFINE_RAW_NODE_TEST(RawProcessEnvAllowedFlagsAreDocumentedFromNodeTest, "test-process-env-allowed-flags-are-documented.js")
-DEFINE_RAW_NODE_TEST(RawProcessEnvDeleteFromNodeTest, "test-process-env-delete.js")
-DEFINE_RAW_NODE_TEST(RawProcessEnvIgnoreGetterSetterFromNodeTest, "test-process-env-ignore-getter-setter.js")
-DEFINE_RAW_NODE_TEST(RawProcessEnvSideeffectsFromNodeTest, "test-process-env-sideeffects.js")
-DEFINE_RAW_NODE_TEST(RawProcessEnvSymbolsFromNodeTest, "test-process-env-symbols.js")
-DEFINE_RAW_NODE_TEST(RawProcessBindingUtilFromNodeTest, "test-process-binding-util.js")
-DEFINE_RAW_NODE_TEST(RawProcessBindingFromNodeTest, "test-process-binding.js")
-DEFINE_RAW_NODE_TEST(RawProcessBindingInternalbindingAllowlistFromNodeTest, "test-process-binding-internalbinding-allowlist.js")
-DEFINE_RAW_NODE_TEST(RawProcessDlopenErrorMessageCrashFromNodeTest, "test-process-dlopen-error-message-crash.js")
-DEFINE_RAW_NODE_TEST(RawProcessEnvTzFromNodeTest, "test-process-env-tz.js")
+DEFINE_RAW_NODE_IN_PROCESS_TEST(RawProcessFeaturesFromNodeTest, "test-process-features.js")
+DEFINE_RAW_NODE_IN_PROCESS_TEST(RawProcessAbortFromNodeTest, "test-process-abort.js")
+TEST_F(Test3NodeDropinSubsetPhase02, RawProcessArgv0FromNodeTest) {
+  if (RawNodeScriptStartsWithFlagsHeader("test-process-argv-0.js")) {
+    GTEST_SKIP() << "Skipping Node.js raw test with // Flags header: test-process-argv-0.js";
+  }
+  EnvScope s(runtime_.get());
+  std::string error;
+  const int exit_code = RunRawNodeTestScript(s.env, "test-process-argv-0.js", &error);
+  EXPECT_EQ(exit_code, 0) << "error=" << error;
+  EXPECT_TRUE(error.empty()) << "error=" << error;
+}
+DEFINE_RAW_NODE_IN_PROCESS_TEST(RawProcessAvailableMemoryFromNodeTest, "test-process-available-memory.js")
+DEFINE_RAW_NODE_IN_PROCESS_TEST(RawProcessChdirFromNodeTest, "test-process-chdir.js")
+DEFINE_RAW_NODE_IN_PROCESS_TEST(RawProcessChdirErrormessageFromNodeTest, "test-process-chdir-errormessage.js")
+DEFINE_RAW_NODE_IN_PROCESS_TEST(RawProcessExecpathFromNodeTest, "test-process-execpath.js")
+DEFINE_RAW_NODE_IN_PROCESS_TEST(RawProcessExecArgvFromNodeTest, "test-process-exec-argv.js")
+DEFINE_RAW_NODE_IN_PROCESS_TEST(RawProcessConfigFromNodeTest, "test-process-config.js")
+DEFINE_RAW_NODE_IN_PROCESS_TEST(RawProcessConstantsNoatimeFromNodeTest, "test-process-constants-noatime.js")
+DEFINE_RAW_NODE_IN_PROCESS_TEST(RawProcessConstrainedMemoryFromNodeTest, "test-process-constrained-memory.js")
+DEFINE_RAW_NODE_IN_PROCESS_TEST(RawProcessCpuUsageFromNodeTest, "test-process-cpuUsage.js")
+DEFINE_RAW_NODE_IN_PROCESS_TEST(RawProcessDefaultFromNodeTest, "test-process-default.js")
+DEFINE_RAW_NODE_IN_PROCESS_TEST(RawProcessEmitwarningFromNodeTest, "test-process-emitwarning.js")
+DEFINE_RAW_NODE_IN_PROCESS_TEST(RawProcessEmitFromNodeTest, "test-process-emit.js")
+DEFINE_RAW_NODE_IN_PROCESS_TEST(RawProcessEnvFromNodeTest, "test-process-env.js")
+DEFINE_RAW_NODE_IN_PROCESS_TEST(RawProcessEnvAllowedFlagsFromNodeTest, "test-process-env-allowed-flags.js")
+DEFINE_RAW_NODE_IN_PROCESS_TEST(RawProcessEnvAllowedFlagsAreDocumentedFromNodeTest, "test-process-env-allowed-flags-are-documented.js")
+DEFINE_RAW_NODE_IN_PROCESS_TEST(RawProcessEnvDeleteFromNodeTest, "test-process-env-delete.js")
+DEFINE_RAW_NODE_IN_PROCESS_TEST(RawProcessEnvIgnoreGetterSetterFromNodeTest, "test-process-env-ignore-getter-setter.js")
+DEFINE_RAW_NODE_IN_PROCESS_TEST(RawProcessEnvSideeffectsFromNodeTest, "test-process-env-sideeffects.js")
+DEFINE_RAW_NODE_IN_PROCESS_TEST(RawProcessEnvSymbolsFromNodeTest, "test-process-env-symbols.js")
+DEFINE_RAW_NODE_IN_PROCESS_TEST(RawProcessBindingUtilFromNodeTest, "test-process-binding-util.js")
+DEFINE_RAW_NODE_IN_PROCESS_TEST(RawProcessBindingFromNodeTest, "test-process-binding.js")
+DEFINE_RAW_NODE_IN_PROCESS_TEST(RawProcessBindingInternalbindingAllowlistFromNodeTest, "test-process-binding-internalbinding-allowlist.js")
+DEFINE_RAW_NODE_IN_PROCESS_TEST(RawProcessDlopenErrorMessageCrashFromNodeTest, "test-process-dlopen-error-message-crash.js")
+DEFINE_RAW_NODE_IN_PROCESS_TEST(RawProcessEnvTzFromNodeTest, "test-process-env-tz.js")
 
 // Raw Node crypto tests (phase 1 gate)
 DEFINE_RAW_NODE_TEST(RawCryptoFromNodeTest, "test-crypto.js")
@@ -951,25 +1112,25 @@ DEFINE_RAW_NODE_TEST(RawTestTlsClientcertengineInvalidArgTypeFromNodeTest, "test
 DEFINE_RAW_NODE_TEST(RawTestTlsClientcertengineUnsupportedFromNodeTest, "test-tls-clientcertengine-unsupported.js")
 DEFINE_RAW_NODE_TEST(RawTestTlsSessionTimeoutErrorsFromNodeTest, "test-tls-session-timeout-errors.js")
 
-DEFINE_RAW_NODE_TEST(RawProcessExecveFromNodeTest, "test-process-execve.js")
-DEFINE_RAW_NODE_TEST(RawProcessExecveValidationFromNodeTest, "test-process-execve-validation.js")
-DEFINE_RAW_NODE_TEST(RawProcessExecveAbortFromNodeTest, "test-process-execve-abort.js")
-DEFINE_RAW_NODE_TEST(RawProcessExecveOnExitFromNodeTest, "test-process-execve-on-exit.js")
-DEFINE_RAW_NODE_TEST(RawProcessExecvePermissionFailFromNodeTest, "test-process-execve-permission-fail.js")
-DEFINE_RAW_NODE_TEST(RawProcessExecvePermissionGrantedFromNodeTest, "test-process-execve-permission-granted.js")
-DEFINE_RAW_NODE_TEST(RawProcessExceptionCaptureFromNodeTest, "test-process-exception-capture.js")
-DEFINE_RAW_NODE_TEST(RawProcessExceptionCaptureErrorsFromNodeTest, "test-process-exception-capture-errors.js")
-DEFINE_RAW_NODE_TEST(RawProcessExceptionCaptureShouldAbortOnUncaughtFromNodeTest, "test-process-exception-capture-should-abort-on-uncaught.js")
-DEFINE_RAW_NODE_TEST(RawProcessExceptionCaptureShouldAbortOnUncaughtSetflagsfromstringFromNodeTest, "test-process-exception-capture-should-abort-on-uncaught-setflagsfromstring.js")
-DEFINE_RAW_NODE_TEST(RawProcessExternalStdioCloseFromNodeTest, "test-process-external-stdio-close.js")
-DEFINE_RAW_NODE_TEST(RawProcessExternalStdioCloseSpawnFromNodeTest, "test-process-external-stdio-close-spawn.js")
-DEFINE_RAW_NODE_TEST(RawProcessGetactivehandlesFromNodeTest, "test-process-getactivehandles.js")
-DEFINE_RAW_NODE_TEST(RawProcessGetactiverequestsFromNodeTest, "test-process-getactiverequests.js")
-DEFINE_RAW_NODE_TEST(RawProcessGetactiveresourcesFromNodeTest, "test-process-getactiveresources.js")
-DEFINE_RAW_NODE_TEST(RawProcessGetactiveresourcesTrackActiveRequestsFromNodeTest, "test-process-getactiveresources-track-active-requests.js")
-DEFINE_RAW_NODE_TEST(RawProcessGetactiveresourcesTrackTimerLifetimeFromNodeTest, "test-process-getactiveresources-track-timer-lifetime.js")
-DEFINE_RAW_NODE_TEST(RawProcessGetactiveresourcesTrackMultipleTimersFromNodeTest, "test-process-getactiveresources-track-multiple-timers.js")
-DEFINE_RAW_NODE_TEST(RawProcessGetactiveresourcesTrackIntervalLifetimeFromNodeTest, "test-process-getactiveresources-track-interval-lifetime.js")
+DEFINE_RAW_NODE_SUBPROCESS_TEST(RawProcessExecveFromNodeTest, "test-process-execve.js")
+DEFINE_RAW_NODE_SUBPROCESS_TEST(RawProcessExecveValidationFromNodeTest, "test-process-execve-validation.js")
+DEFINE_RAW_NODE_SUBPROCESS_TEST(RawProcessExecveAbortFromNodeTest, "test-process-execve-abort.js")
+DEFINE_RAW_NODE_SUBPROCESS_TEST(RawProcessExecveOnExitFromNodeTest, "test-process-execve-on-exit.js")
+DEFINE_RAW_NODE_SUBPROCESS_TEST(RawProcessExecvePermissionFailFromNodeTest, "test-process-execve-permission-fail.js")
+DEFINE_RAW_NODE_SUBPROCESS_TEST(RawProcessExecvePermissionGrantedFromNodeTest, "test-process-execve-permission-granted.js")
+DEFINE_RAW_NODE_IN_PROCESS_TEST(RawProcessExceptionCaptureFromNodeTest, "test-process-exception-capture.js")
+DEFINE_RAW_NODE_IN_PROCESS_TEST(RawProcessExceptionCaptureErrorsFromNodeTest, "test-process-exception-capture-errors.js")
+DEFINE_RAW_NODE_IN_PROCESS_TEST(RawProcessExceptionCaptureShouldAbortOnUncaughtFromNodeTest, "test-process-exception-capture-should-abort-on-uncaught.js")
+DEFINE_RAW_NODE_IN_PROCESS_TEST(RawProcessExceptionCaptureShouldAbortOnUncaughtSetflagsfromstringFromNodeTest, "test-process-exception-capture-should-abort-on-uncaught-setflagsfromstring.js")
+DEFINE_RAW_NODE_IN_PROCESS_TEST(RawProcessExternalStdioCloseFromNodeTest, "test-process-external-stdio-close.js")
+DEFINE_RAW_NODE_IN_PROCESS_TEST(RawProcessExternalStdioCloseSpawnFromNodeTest, "test-process-external-stdio-close-spawn.js")
+DEFINE_RAW_NODE_IN_PROCESS_TEST(RawProcessGetactivehandlesFromNodeTest, "test-process-getactivehandles.js")
+DEFINE_RAW_NODE_IN_PROCESS_TEST(RawProcessGetactiverequestsFromNodeTest, "test-process-getactiverequests.js")
+DEFINE_RAW_NODE_IN_PROCESS_TEST(RawProcessGetactiveresourcesFromNodeTest, "test-process-getactiveresources.js")
+DEFINE_RAW_NODE_IN_PROCESS_TEST(RawProcessGetactiveresourcesTrackActiveRequestsFromNodeTest, "test-process-getactiveresources-track-active-requests.js")
+DEFINE_RAW_NODE_IN_PROCESS_TEST(RawProcessGetactiveresourcesTrackTimerLifetimeFromNodeTest, "test-process-getactiveresources-track-timer-lifetime.js")
+DEFINE_RAW_NODE_IN_PROCESS_TEST(RawProcessGetactiveresourcesTrackMultipleTimersFromNodeTest, "test-process-getactiveresources-track-multiple-timers.js")
+DEFINE_RAW_NODE_IN_PROCESS_TEST(RawProcessGetactiveresourcesTrackIntervalLifetimeFromNodeTest, "test-process-getactiveresources-track-interval-lifetime.js")
 DEFINE_RAW_NODE_TEST(RawTimersFromNodeTest, "test-timers.js")
 DEFINE_RAW_NODE_TEST(RawTimersArgsFromNodeTest, "test-timers-args.js")
 DEFINE_RAW_NODE_TEST(RawTimersThisFromNodeTest, "test-timers-this.js")
@@ -984,41 +1145,41 @@ DEFINE_RAW_NODE_TEST(RawTimersUserCallFromNodeTest, "test-timers-user-call.js")
 DEFINE_RAW_NODE_TEST(RawTimersToPrimitiveFromNodeTest, "test-timers-to-primitive.js")
 DEFINE_RAW_NODE_TEST(RawTimersNowFromNodeTest, "test-timers-now.js")
 DEFINE_RAW_NODE_TEST(RawTimersPromisesSchedulerFromNodeTest, "test-timers-promises-scheduler.js")
-DEFINE_RAW_NODE_TEST(RawProcessHrtimeBigintFromNodeTest, "test-process-hrtime-bigint.js")
-DEFINE_RAW_NODE_TEST(RawProcessHrtimeFromNodeTest, "test-process-hrtime.js")
-DEFINE_RAW_NODE_TEST(RawProcessKillNullFromNodeTest, "test-process-kill-null.js")
-DEFINE_RAW_NODE_TEST(RawProcessKillPidFromNodeTest, "test-process-kill-pid.js")
-DEFINE_RAW_NODE_TEST(RawProcessNextTickFromNodeTest, "test-process-next-tick.js")
-DEFINE_RAW_NODE_TEST(RawProcessPpidFromNodeTest, "test-process-ppid.js")
-DEFINE_RAW_NODE_TEST(RawProcessPrototypeFromNodeTest, "test-process-prototype.js")
-DEFINE_RAW_NODE_TEST(RawProcessRawDebugFromNodeTest, "test-process-raw-debug.js")
-DEFINE_RAW_NODE_TEST(RawProcessRefUnrefFromNodeTest, "test-process-ref-unref.js")
-DEFINE_RAW_NODE_TEST(RawProcessReleaseFromNodeTest, "test-process-release.js")
-DEFINE_RAW_NODE_TEST(RawProcessSetsourcemapsenabledFromNodeTest, "test-process-setsourcemapsenabled.js")
-DEFINE_RAW_NODE_TEST(RawProcessBeforeexitFromNodeTest, "test-process-beforeexit.js")
-DEFINE_RAW_NODE_TEST(RawProcessThreadCpuUsageMainThreadFromNodeTest, "test-process-threadCpuUsage-main-thread.js")
-DEFINE_RAW_NODE_TEST(RawProcessExitHandlerFromNodeTest, "test-process-exit-handler.js")
-DEFINE_RAW_NODE_TEST(RawProcessUmaskFromNodeTest, "test-process-umask.js")
-DEFINE_RAW_NODE_TEST(RawProcessUmaskMaskFromNodeTest, "test-process-umask-mask.js")
-DEFINE_RAW_NODE_TEST(RawProcessUptimeFromNodeTest, "test-process-uptime.js")
-DEFINE_RAW_NODE_TEST(RawProcessExitCodeFromNodeTest, "test-process-exit-code.js")
-DEFINE_RAW_NODE_TEST(RawProcessExitCodeValidationFromNodeTest, "test-process-exit-code-validation.js")
-DEFINE_RAW_NODE_TEST(RawProcessExitFromNodeTest, "test-process-exit.js")
-DEFINE_RAW_NODE_TEST(RawProcessExitFromBeforeExitFromNodeTest, "test-process-exit-from-before-exit.js")
-DEFINE_RAW_NODE_TEST(RawProcessExitRecursiveFromNodeTest, "test-process-exit-recursive.js")
-DEFINE_RAW_NODE_TEST(RawProcessReallyExitFromNodeTest, "test-process-really-exit.js")
-DEFINE_RAW_NODE_TEST(RawProcessEuidEgidFromNodeTest, "test-process-euid-egid.js")
-DEFINE_RAW_NODE_TEST(RawProcessInitgroupsFromNodeTest, "test-process-initgroups.js")
-DEFINE_RAW_NODE_TEST(RawProcessNoDeprecationFromNodeTest, "test-process-no-deprecation.js")
-DEFINE_RAW_NODE_TEST(RawProcessRedirectWarningsFromNodeTest, "test-process-redirect-warnings.js")
-DEFINE_RAW_NODE_TEST(RawProcessRedirectWarningsEnvFromNodeTest, "test-process-redirect-warnings-env.js")
-DEFINE_RAW_NODE_TEST(RawProcessSetgroupsFromNodeTest, "test-process-setgroups.js")
-DEFINE_RAW_NODE_TEST(RawProcessTitleCliFromNodeTest, "test-process-title-cli.js")
-DEFINE_RAW_NODE_TEST(RawProcessUidGidFromNodeTest, "test-process-uid-gid.js")
-DEFINE_RAW_NODE_TEST(RawProcessLoadEnvFileFromNodeTest, "test-process-load-env-file.js")
-DEFINE_RAW_NODE_TEST(RawProcessVersionsFromNodeTest, "test-process-versions.js")
-DEFINE_RAW_NODE_TEST(RawProcessWarningFromNodeTest, "test-process-warning.js")
-DEFINE_RAW_NODE_TEST(RawProcessUncaughtExceptionMonitorFromNodeTest, "test-process-uncaught-exception-monitor.js")
+DEFINE_RAW_NODE_IN_PROCESS_TEST(RawProcessHrtimeBigintFromNodeTest, "test-process-hrtime-bigint.js")
+DEFINE_RAW_NODE_IN_PROCESS_TEST(RawProcessHrtimeFromNodeTest, "test-process-hrtime.js")
+DEFINE_RAW_NODE_IN_PROCESS_TEST(RawProcessKillNullFromNodeTest, "test-process-kill-null.js")
+DEFINE_RAW_NODE_IN_PROCESS_TEST(RawProcessKillPidFromNodeTest, "test-process-kill-pid.js")
+DEFINE_RAW_NODE_IN_PROCESS_TEST(RawProcessNextTickFromNodeTest, "test-process-next-tick.js")
+DEFINE_RAW_NODE_IN_PROCESS_TEST(RawProcessPpidFromNodeTest, "test-process-ppid.js")
+DEFINE_RAW_NODE_IN_PROCESS_TEST(RawProcessPrototypeFromNodeTest, "test-process-prototype.js")
+DEFINE_RAW_NODE_IN_PROCESS_TEST(RawProcessRawDebugFromNodeTest, "test-process-raw-debug.js")
+DEFINE_RAW_NODE_IN_PROCESS_TEST(RawProcessRefUnrefFromNodeTest, "test-process-ref-unref.js")
+DEFINE_RAW_NODE_IN_PROCESS_TEST(RawProcessReleaseFromNodeTest, "test-process-release.js")
+DEFINE_RAW_NODE_IN_PROCESS_TEST(RawProcessSetsourcemapsenabledFromNodeTest, "test-process-setsourcemapsenabled.js")
+DEFINE_RAW_NODE_IN_PROCESS_TEST(RawProcessBeforeexitFromNodeTest, "test-process-beforeexit.js")
+DEFINE_RAW_NODE_IN_PROCESS_TEST(RawProcessThreadCpuUsageMainThreadFromNodeTest, "test-process-threadCpuUsage-main-thread.js")
+DEFINE_RAW_NODE_IN_PROCESS_TEST(RawProcessExitHandlerFromNodeTest, "test-process-exit-handler.js")
+DEFINE_RAW_NODE_IN_PROCESS_TEST(RawProcessUmaskFromNodeTest, "test-process-umask.js")
+DEFINE_RAW_NODE_IN_PROCESS_TEST(RawProcessUmaskMaskFromNodeTest, "test-process-umask-mask.js")
+DEFINE_RAW_NODE_SUBPROCESS_TEST(RawProcessUptimeFromNodeTest, "test-process-uptime.js")
+DEFINE_RAW_NODE_IN_PROCESS_TEST(RawProcessExitCodeFromNodeTest, "test-process-exit-code.js")
+DEFINE_RAW_NODE_IN_PROCESS_TEST(RawProcessExitCodeValidationFromNodeTest, "test-process-exit-code-validation.js")
+DEFINE_RAW_NODE_IN_PROCESS_TEST(RawProcessExitFromNodeTest, "test-process-exit.js")
+DEFINE_RAW_NODE_IN_PROCESS_TEST(RawProcessExitFromBeforeExitFromNodeTest, "test-process-exit-from-before-exit.js")
+DEFINE_RAW_NODE_IN_PROCESS_TEST(RawProcessExitRecursiveFromNodeTest, "test-process-exit-recursive.js")
+DEFINE_RAW_NODE_IN_PROCESS_TEST(RawProcessReallyExitFromNodeTest, "test-process-really-exit.js")
+DEFINE_RAW_NODE_IN_PROCESS_TEST(RawProcessEuidEgidFromNodeTest, "test-process-euid-egid.js")
+DEFINE_RAW_NODE_IN_PROCESS_TEST(RawProcessInitgroupsFromNodeTest, "test-process-initgroups.js")
+DEFINE_RAW_NODE_IN_PROCESS_TEST(RawProcessNoDeprecationFromNodeTest, "test-process-no-deprecation.js")
+DEFINE_RAW_NODE_IN_PROCESS_TEST(RawProcessRedirectWarningsFromNodeTest, "test-process-redirect-warnings.js")
+DEFINE_RAW_NODE_IN_PROCESS_TEST(RawProcessRedirectWarningsEnvFromNodeTest, "test-process-redirect-warnings-env.js")
+DEFINE_RAW_NODE_IN_PROCESS_TEST(RawProcessSetgroupsFromNodeTest, "test-process-setgroups.js")
+DEFINE_RAW_NODE_IN_PROCESS_TEST(RawProcessTitleCliFromNodeTest, "test-process-title-cli.js")
+DEFINE_RAW_NODE_IN_PROCESS_TEST(RawProcessUidGidFromNodeTest, "test-process-uid-gid.js")
+DEFINE_RAW_NODE_IN_PROCESS_TEST(RawProcessLoadEnvFileFromNodeTest, "test-process-load-env-file.js")
+DEFINE_RAW_NODE_IN_PROCESS_TEST(RawProcessVersionsFromNodeTest, "test-process-versions.js")
+DEFINE_RAW_NODE_IN_PROCESS_TEST(RawProcessWarningFromNodeTest, "test-process-warning.js")
+DEFINE_RAW_NODE_IN_PROCESS_TEST(RawProcessUncaughtExceptionMonitorFromNodeTest, "test-process-uncaught-exception-monitor.js")
 
 // Raw Node util tests
 DEFINE_RAW_NODE_TEST(RawUtilFromNodeTest, "test-util.js")

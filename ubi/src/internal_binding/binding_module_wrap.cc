@@ -1,5 +1,6 @@
 #include "internal_binding/dispatch.h"
 
+#include <string>
 #include <unordered_map>
 
 #include "internal_binding/helpers.h"
@@ -100,6 +101,113 @@ void SetNamedMethod(napi_env env, napi_value obj, const char* key, napi_callback
   if (napi_create_function(env, key, NAPI_AUTO_LENGTH, cb, nullptr, &fn) == napi_ok && fn != nullptr) {
     napi_set_named_property(env, obj, key, fn);
   }
+}
+
+bool IsFunctionValue(napi_env env, napi_value value) {
+  if (value == nullptr) return false;
+  napi_valuetype type = napi_undefined;
+  return napi_typeof(env, value, &type) == napi_ok && type == napi_function;
+}
+
+std::string ValueToUtf8(napi_env env, napi_value value) {
+  if (value == nullptr) return {};
+  napi_value str = nullptr;
+  if (napi_coerce_to_string(env, value, &str) != napi_ok || str == nullptr) return {};
+  size_t len = 0;
+  if (napi_get_value_string_utf8(env, str, nullptr, 0, &len) != napi_ok) return {};
+  std::string out(len + 1, '\0');
+  size_t copied = 0;
+  if (napi_get_value_string_utf8(env, str, out.data(), out.size(), &copied) != napi_ok) return {};
+  out.resize(copied);
+  return out;
+}
+
+bool StartsWithNodeScheme(const std::string& specifier) {
+  return specifier.rfind("node:", 0) == 0;
+}
+
+napi_value CreateCjsNamespaceFromRequire(napi_env env, const std::string& specifier) {
+  napi_value global = GetGlobal(env);
+  if (global == nullptr) return nullptr;
+
+  napi_value require_fn = nullptr;
+  if (napi_get_named_property(env, global, "require", &require_fn) != napi_ok || !IsFunctionValue(env, require_fn)) {
+    return nullptr;
+  }
+
+  napi_value specifier_value = nullptr;
+  if (napi_create_string_utf8(env, specifier.c_str(), NAPI_AUTO_LENGTH, &specifier_value) != napi_ok ||
+      specifier_value == nullptr) {
+    return nullptr;
+  }
+
+  napi_value exports_value = nullptr;
+  if (napi_call_function(env, global, require_fn, 1, &specifier_value, &exports_value) != napi_ok ||
+      exports_value == nullptr) {
+    return nullptr;
+  }
+
+  napi_value namespace_obj = nullptr;
+  if (napi_create_object(env, &namespace_obj) != napi_ok || namespace_obj == nullptr) {
+    return nullptr;
+  }
+  napi_set_named_property(env, namespace_obj, "default", exports_value);
+
+  napi_valuetype exports_type = napi_undefined;
+  if (napi_typeof(env, exports_value, &exports_type) != napi_ok ||
+      (exports_type != napi_object && exports_type != napi_function)) {
+    return namespace_obj;
+  }
+
+  napi_value keys = nullptr;
+  if (napi_get_property_names(env, exports_value, &keys) != napi_ok || keys == nullptr) {
+    return namespace_obj;
+  }
+  uint32_t key_count = 0;
+  if (napi_get_array_length(env, keys, &key_count) != napi_ok) {
+    return namespace_obj;
+  }
+  for (uint32_t i = 0; i < key_count; ++i) {
+    napi_value key = nullptr;
+    if (napi_get_element(env, keys, i, &key) != napi_ok || key == nullptr) continue;
+    const std::string key_utf8 = ValueToUtf8(env, key);
+    if (key_utf8.empty() || key_utf8 == "default") continue;
+    napi_value value = nullptr;
+    if (napi_get_property(env, exports_value, key, &value) != napi_ok || value == nullptr) continue;
+    napi_set_property(env, namespace_obj, key, value);
+  }
+  return namespace_obj;
+}
+
+napi_value GetVmDynamicImportDefaultInternalSymbol(napi_env env) {
+  napi_value global = GetGlobal(env);
+  if (global == nullptr) return Undefined(env);
+
+  napi_value internal_binding = nullptr;
+  if (napi_get_named_property(env, global, "internalBinding", &internal_binding) != napi_ok ||
+      !IsFunctionValue(env, internal_binding)) {
+    return Undefined(env);
+  }
+
+  napi_value symbols_name = nullptr;
+  if (napi_create_string_utf8(env, "symbols", NAPI_AUTO_LENGTH, &symbols_name) != napi_ok ||
+      symbols_name == nullptr) {
+    return Undefined(env);
+  }
+
+  napi_value symbols_binding = nullptr;
+  if (napi_call_function(env, global, internal_binding, 1, &symbols_name, &symbols_binding) != napi_ok ||
+      symbols_binding == nullptr) {
+    return Undefined(env);
+  }
+
+  napi_value symbol_value = nullptr;
+  if (napi_get_named_property(
+          env, symbols_binding, "vm_dynamic_import_default_internal", &symbol_value) != napi_ok ||
+      symbol_value == nullptr) {
+    return Undefined(env);
+  }
+  return symbol_value;
 }
 
 napi_value ModuleWrapCtor(napi_env env, napi_callback_info info) {
@@ -368,6 +476,62 @@ napi_value ModuleWrapSetInitializeImportMetaObjectCallback(napi_env env, napi_ca
   return Undefined(env);
 }
 
+napi_value ModuleWrapImportModuleDynamically(napi_env env, napi_callback_info info) {
+  auto* state = GetBindingState(env);
+  if (state == nullptr) return Undefined(env);
+
+  size_t argc = 2;
+  napi_value argv[2] = {nullptr, nullptr};
+  napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+  if (argc < 1 || argv[0] == nullptr) return Undefined(env);
+  const std::string specifier = ValueToUtf8(env, argv[0]);
+  const bool is_node_builtin = StartsWithNodeScheme(specifier);
+
+  if (is_node_builtin) {
+    napi_value namespace_obj = CreateCjsNamespaceFromRequire(env, specifier);
+    if (namespace_obj != nullptr) return namespace_obj;
+  }
+
+  napi_value cb = GetRefValue(env, state->import_module_dynamically_ref);
+  if (!IsFunctionValue(env, cb)) {
+    if (is_node_builtin) {
+      napi_value namespace_obj = CreateCjsNamespaceFromRequire(env, specifier);
+      if (namespace_obj != nullptr) return namespace_obj;
+    }
+    napi_throw_error(env, nullptr, "Not supported");
+    return nullptr;
+  }
+
+  napi_value referrer_symbol = GetVmDynamicImportDefaultInternalSymbol(env);
+  napi_value phase = nullptr;
+  if (napi_create_int32(env, kEvaluationPhase, &phase) != napi_ok || phase == nullptr) {
+    return Undefined(env);
+  }
+  napi_value attrs = nullptr;
+  if (napi_create_object(env, &attrs) != napi_ok || attrs == nullptr) {
+    return Undefined(env);
+  }
+  napi_value referrer_name = (argc >= 2 && argv[1] != nullptr) ? argv[1] : Undefined(env);
+
+  napi_value call_argv[5] = {referrer_symbol, argv[0], phase, attrs, referrer_name};
+  napi_value global = GetGlobal(env);
+  if (global == nullptr) return Undefined(env);
+  napi_value result = nullptr;
+  if (napi_call_function(env, global, cb, 5, call_argv, &result) != napi_ok) {
+    if (is_node_builtin) {
+      bool has_exception = false;
+      if (napi_is_exception_pending(env, &has_exception) == napi_ok && has_exception) {
+        napi_value ignored = nullptr;
+        napi_get_and_clear_last_exception(env, &ignored);
+      }
+      napi_value namespace_obj = CreateCjsNamespaceFromRequire(env, specifier);
+      if (namespace_obj != nullptr) return namespace_obj;
+    }
+    return nullptr;
+  }
+  return result != nullptr ? result : Undefined(env);
+}
+
 napi_value ModuleWrapCreateRequiredModuleFacade(napi_env env, napi_callback_info info) {
   size_t argc = 1;
   napi_value argv[1] = {nullptr};
@@ -439,6 +603,7 @@ napi_value ResolveModuleWrap(napi_env env, const ResolveOptions& /*options*/) {
   SetNamedMethod(env, binding, "setImportModuleDynamicallyCallback", ModuleWrapSetImportModuleDynamicallyCallback);
   SetNamedMethod(
       env, binding, "setInitializeImportMetaObjectCallback", ModuleWrapSetInitializeImportMetaObjectCallback);
+  SetNamedMethod(env, binding, "importModuleDynamically", ModuleWrapImportModuleDynamically);
   SetNamedMethod(env, binding, "createRequiredModuleFacade", ModuleWrapCreateRequiredModuleFacade);
   SetNamedMethod(env, binding, "throwIfPromiseRejected", ModuleWrapThrowIfPromiseRejected);
 

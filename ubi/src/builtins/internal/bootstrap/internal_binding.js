@@ -136,6 +136,9 @@ function internalBinding(name) {
     throw new Error('internalBinding native hook is not installed');
   }
   const binding = nativeInternalBinding(key);
+  if (Array.isArray(process.moduleLoadList)) {
+    process.moduleLoadList.push(`Internal Binding ${key}`);
+  }
 
   kInternalBindingCache.set(key, binding);
   return binding;

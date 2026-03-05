@@ -34,16 +34,19 @@
 #include "cjs_module_lexer_version.h"
 #include "node_version.h"
 #include "unofficial_napi.h"
+#include "ubi_timers_host.h"
 
 #if defined(_WIN32)
 #include <stdlib.h>
 extern char** _environ;
 #elif defined(__APPLE__)
+#include <fcntl.h>
 #include <mach-o/dyld.h>
 #include <signal.h>
 #include <unistd.h>
 extern char** environ;
 #else
+#include <fcntl.h>
 #include <signal.h>
 #include <unistd.h>
 extern char** environ;
@@ -1601,9 +1604,112 @@ napi_value ProcessMethodsDebugProcessCallback(napi_env env, napi_callback_info i
 #endif
 }
 
-napi_value ProcessMethodsExecveCallback(napi_env env, napi_callback_info /*info*/) {
-  ThrowErrorWithCode(env, "ERR_UBI_NOT_SUPPORTED", "process.execve() is not supported in Ubi runtime.");
+napi_value ProcessMethodsExecveCallback(napi_env env, napi_callback_info info) {
+#if defined(_WIN32) || defined(__PASE__)
+  ThrowErrorWithCode(env,
+                     "ERR_FEATURE_UNAVAILABLE_ON_PLATFORM",
+                     "process.execve is not available on this platform.");
   return nullptr;
+#else
+  size_t argc = 3;
+  napi_value argv[3] = {nullptr, nullptr, nullptr};
+  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok || argc < 3 ||
+      argv[0] == nullptr || argv[1] == nullptr || argv[2] == nullptr) {
+    ThrowTypeErrorWithCode(env, "ERR_MISSING_ARGS", "Invalid number of arguments.");
+    return nullptr;
+  }
+
+  napi_valuetype executable_type = napi_undefined;
+  bool argv_is_array = false;
+  bool envp_is_array = false;
+  if (napi_typeof(env, argv[0], &executable_type) != napi_ok || executable_type != napi_string ||
+      napi_is_array(env, argv[1], &argv_is_array) != napi_ok || !argv_is_array ||
+      napi_is_array(env, argv[2], &envp_is_array) != napi_ok || !envp_is_array) {
+    ThrowTypeErrorWithCode(env, "ERR_INVALID_ARG_TYPE", "process.execve expects (string, string[], string[]).");
+    return nullptr;
+  }
+
+  const std::string executable = NapiValueToUtf8(env, argv[0]);
+  if (executable.empty()) {
+    ThrowTypeErrorWithCode(env, "ERR_INVALID_ARG_VALUE", "The \"execPath\" argument must be a non-empty string.");
+    return nullptr;
+  }
+
+  uint32_t argv_len = 0;
+  uint32_t envp_len = 0;
+  if (napi_get_array_length(env, argv[1], &argv_len) != napi_ok ||
+      napi_get_array_length(env, argv[2], &envp_len) != napi_ok) {
+    ThrowTypeErrorWithCode(env, "ERR_INVALID_ARG_VALUE", "Failed to read process.execve arguments.");
+    return nullptr;
+  }
+
+  std::vector<std::string> argv_storage(argv_len);
+  std::vector<char*> argv_exec(argv_len + 1, nullptr);
+  for (uint32_t i = 0; i < argv_len; ++i) {
+    napi_value item = nullptr;
+    if (napi_get_element(env, argv[1], i, &item) != napi_ok || item == nullptr) {
+      ThrowTypeErrorWithCode(env, "ERR_INVALID_ARG_VALUE", "Failed to deserialize argument.");
+      return nullptr;
+    }
+    argv_storage[i] = NapiValueToUtf8(env, item);
+    argv_exec[i] = argv_storage[i].data();
+  }
+  argv_exec[argv_len] = nullptr;
+
+  std::vector<std::string> envp_storage(envp_len);
+  std::vector<char*> envp_exec(envp_len + 1, nullptr);
+  for (uint32_t i = 0; i < envp_len; ++i) {
+    napi_value item = nullptr;
+    if (napi_get_element(env, argv[2], i, &item) != napi_ok || item == nullptr) {
+      ThrowTypeErrorWithCode(env, "ERR_INVALID_ARG_VALUE", "Failed to deserialize environment variable.");
+      return nullptr;
+    }
+    envp_storage[i] = NapiValueToUtf8(env, item);
+    envp_exec[i] = envp_storage[i].data();
+  }
+  envp_exec[envp_len] = nullptr;
+
+  auto persist_standard_stream = [](int fd) -> int {
+    const int flags = fcntl(fd, F_GETFD, 0);
+    if (flags < 0) return -1;
+    return fcntl(fd, F_SETFD, flags & ~FD_CLOEXEC);
+  };
+
+  if (persist_standard_stream(0) < 0 || persist_standard_stream(1) < 0 || persist_standard_stream(2) < 0) {
+    ThrowSystemError(env, uv_translate_sys_error(errno), "fcntl");
+    return nullptr;
+  }
+
+  execve(executable.c_str(), argv_exec.data(), envp_exec.data());
+  const int execve_errno = errno;
+  int uv_execve_errno = uv_translate_sys_error(execve_errno);
+  if (uv_execve_errno == 0) uv_execve_errno = UV_EIO;
+  const char* execve_code = uv_err_name(uv_execve_errno);
+  if (execve_code == nullptr) execve_code = "UNKNOWN";
+
+  ThrowSystemError(env, uv_execve_errno, "execve", executable);
+  std::string stack_message;
+  bool has_pending_exception = false;
+  if (napi_is_exception_pending(env, &has_pending_exception) == napi_ok && has_pending_exception) {
+    napi_value exception = nullptr;
+    if (napi_get_and_clear_last_exception(env, &exception) == napi_ok && exception != nullptr) {
+      napi_value stack_value = nullptr;
+      if (napi_get_named_property(env, exception, "stack", &stack_value) == napi_ok &&
+          stack_value != nullptr) {
+        stack_message = NapiValueToUtf8(env, stack_value);
+      }
+      if (stack_message.empty()) {
+        stack_message = NapiValueToUtf8(env, exception);
+      }
+    }
+  }
+
+  std::cerr << "process.execve failed with error code " << execve_code << "\n";
+  if (!stack_message.empty()) {
+    std::cerr << stack_message << "\n";
+  }
+  std::abort();
+#endif
 }
 
 napi_value ProcessMethodsPatchProcessObjectCallback(napi_env env, napi_callback_info info) {
@@ -1638,6 +1744,25 @@ napi_value ProcessMethodsPatchProcessObjectCallback(napi_env env, napi_callback_
   CopyNamedProperty(env, process_obj, argv[0], "debugPort");
   CopyNamedProperty(env, process_obj, argv[0], "execPath");
   CopyNamedProperty(env, process_obj, argv[0], "versions");
+
+  // Node's process object has a custom constructor on its prototype where
+  // constructor.prototype points back to that same process prototype.
+  napi_value process_proto = nullptr;
+  if (napi_get_prototype(env, argv[0], &process_proto) == napi_ok && process_proto != nullptr) {
+    napi_value constructor_key = nullptr;
+    bool has_own_constructor = false;
+    if (napi_create_string_utf8(env, "constructor", NAPI_AUTO_LENGTH, &constructor_key) == napi_ok &&
+        constructor_key != nullptr &&
+        napi_has_own_property(env, process_proto, constructor_key, &has_own_constructor) == napi_ok &&
+        has_own_constructor) {
+      napi_value ctor = nullptr;
+      napi_valuetype ctor_type = napi_undefined;
+      if (napi_get_named_property(env, process_proto, "constructor", &ctor) == napi_ok && ctor != nullptr &&
+          napi_typeof(env, ctor, &ctor_type) == napi_ok && ctor_type == napi_function) {
+        napi_set_named_property(env, ctor, "prototype", process_proto);
+      }
+    }
+  }
 
   napi_value undefined = nullptr;
   napi_get_undefined(env, &undefined);
@@ -1831,7 +1956,39 @@ napi_value ProcessMethodsGetActiveResourcesInfoCallback(napi_env env, napi_callb
       "  } catch {}"
       "  return out;"
       "})()";
-  return RunScriptOrEmptyArray(env, kScript);
+  napi_value out = RunScriptOrEmptyArray(env, kScript);
+  bool is_array = false;
+  if (out == nullptr || napi_is_array(env, out, &is_array) != napi_ok || !is_array) {
+    napi_create_array(env, &out);
+  }
+  if (out == nullptr) return nullptr;
+
+  uint32_t length = 0;
+  napi_get_array_length(env, out, &length);
+
+  const int32_t timeout_count = UbiGetActiveTimeoutCount();
+  if (timeout_count > 0) {
+    napi_value timeout_name = nullptr;
+    if (napi_create_string_utf8(env, "Timeout", NAPI_AUTO_LENGTH, &timeout_name) == napi_ok &&
+        timeout_name != nullptr) {
+      for (int32_t i = 0; i < timeout_count; ++i) {
+        napi_set_element(env, out, length++, timeout_name);
+      }
+    }
+  }
+
+  const uint32_t immediate_count = UbiGetActiveImmediateRefCount();
+  if (immediate_count > 0) {
+    napi_value immediate_name = nullptr;
+    if (napi_create_string_utf8(env, "Immediate", NAPI_AUTO_LENGTH, &immediate_name) == napi_ok &&
+        immediate_name != nullptr) {
+      for (uint32_t i = 0; i < immediate_count; ++i) {
+        napi_set_element(env, out, length++, immediate_name);
+      }
+    }
+  }
+
+  return out;
 }
 
 napi_value ProcessMethodsDlopenCallback(napi_env env, napi_callback_info info) {
@@ -2614,21 +2771,22 @@ napi_status UbiInstallProcessObject(napi_env env,
   napi_value features_obj = nullptr;
   status = napi_create_object(env, &features_obj);
   if (status != napi_ok || features_obj == nullptr) return (status == napi_ok) ? napi_generic_failure : status;
-  napi_value inspector_true = nullptr;
-  status = napi_get_boolean(env, true, &inspector_true);
-  if (status != napi_ok || inspector_true == nullptr) return (status == napi_ok) ? napi_generic_failure : status;
-  status = napi_set_named_property(env, features_obj, "inspector", inspector_true);
-  if (status != napi_ok) return status;
+  napi_value true_value = nullptr;
+  status = napi_get_boolean(env, true, &true_value);
+  if (status != napi_ok || true_value == nullptr) return (status == napi_ok) ? napi_generic_failure : status;
   napi_value false_value = nullptr;
   status = napi_get_boolean(env, false, &false_value);
   if (status != napi_ok || false_value == nullptr) return (status == napi_ok) ? napi_generic_failure : status;
+  // Keep this aligned with available native bindings.
+  status = napi_set_named_property(env, features_obj, "inspector", false_value);
+  if (status != napi_ok) return status;
   const char* feature_keys[] = {"debug", "uv", "ipv6", "openssl_is_boringssl", "tls_alpn", "tls_sni",
                                 "tls_ocsp", "tls", "cached_builtins", "require_module"};
   for (const char* key : feature_keys) {
     if (napi_set_named_property(env, features_obj, key, false_value) != napi_ok) return napi_generic_failure;
   }
   // Keep compatibility with currently imported crypto test subset.
-  if (napi_set_named_property(env, features_obj, "openssl_is_boringssl", inspector_true) != napi_ok) {
+  if (napi_set_named_property(env, features_obj, "openssl_is_boringssl", true_value) != napi_ok) {
     return napi_generic_failure;
   }
   if (napi_set_named_property(env, features_obj, "typescript", false_value) != napi_ok) return napi_generic_failure;
