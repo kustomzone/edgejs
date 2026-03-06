@@ -11,6 +11,7 @@
 
 #include "internal_binding/helpers.h"
 #include "../ubi_env_loop.h"
+#include "../ubi_handle_wrap.h"
 #include "../ubi_module_loader.h"
 #include "../ubi_path.h"
 #include "ubi_active_resource.h"
@@ -1244,14 +1245,8 @@ napi_value FileHandleIsStreamBase(napi_env env, napi_callback_info info) {
 }
 
 struct StatWatcherWrap {
-  napi_env env = nullptr;
-  napi_ref wrapper_ref = nullptr;
+  UbiHandleWrap handle_wrap{};
   uv_fs_poll_t handle{};
-  bool initialized = false;
-  bool closing = false;
-  bool closed = false;
-  bool finalized = false;
-  bool delete_on_close = false;
   bool referenced = true;
   bool use_bigint = false;
   int64_t async_id = 0;
@@ -1267,36 +1262,32 @@ StatWatcherWrap* UnwrapStatWatcher(napi_env env, napi_value this_arg) {
 void OnStatWatcherClosed(uv_handle_t* handle) {
   auto* wrap = static_cast<StatWatcherWrap*>(handle != nullptr ? handle->data : nullptr);
   if (wrap == nullptr) return;
-  wrap->closing = false;
-  wrap->closed = true;
-  wrap->initialized = false;
-  if (wrap->finalized || wrap->delete_on_close) {
-    ResetRef(wrap->env, &wrap->wrapper_ref);
+  wrap->handle_wrap.state = kUbiHandleClosed;
+  UbiHandleWrapReleaseWrapperRef(&wrap->handle_wrap);
+  UbiHandleWrapMaybeCallOnClose(&wrap->handle_wrap);
+  if (wrap->handle_wrap.finalized || wrap->handle_wrap.delete_on_close) {
+    UbiHandleWrapDeleteRefIfPresent(wrap->handle_wrap.env, &wrap->handle_wrap.wrapper_ref);
     delete wrap;
   }
 }
 
 void CloseStatWatcher(StatWatcherWrap* wrap) {
-  if (wrap == nullptr || wrap->closed || wrap->closing) return;
-  if (!wrap->initialized) {
-    wrap->closed = true;
-    return;
-  }
-  wrap->closing = true;
+  if (wrap == nullptr || wrap->handle_wrap.state != kUbiHandleInitialized) return;
+  wrap->handle_wrap.state = kUbiHandleClosing;
   uv_close(reinterpret_cast<uv_handle_t*>(&wrap->handle), OnStatWatcherClosed);
 }
 
 void OnStatWatcherChange(uv_fs_poll_t* handle, int status, const uv_stat_t* prev, const uv_stat_t* curr) {
   auto* wrap = static_cast<StatWatcherWrap*>(handle != nullptr ? handle->data : nullptr);
-  if (wrap == nullptr || wrap->env == nullptr) return;
+  if (wrap == nullptr || wrap->handle_wrap.env == nullptr) return;
 
-  napi_value self = GetRefValue(wrap->env, wrap->wrapper_ref);
+  napi_value self = UbiHandleWrapGetRefValue(wrap->handle_wrap.env, wrap->handle_wrap.wrapper_ref);
   if (self == nullptr) return;
   napi_value onchange = nullptr;
   napi_valuetype type = napi_undefined;
-  if (napi_get_named_property(wrap->env, self, "onchange", &onchange) != napi_ok ||
+  if (napi_get_named_property(wrap->handle_wrap.env, self, "onchange", &onchange) != napi_ok ||
       onchange == nullptr ||
-      napi_typeof(wrap->env, onchange, &type) != napi_ok ||
+      napi_typeof(wrap->handle_wrap.env, onchange, &type) != napi_ok ||
       type != napi_function) {
     return;
   }
@@ -1307,23 +1298,23 @@ void OnStatWatcherChange(uv_fs_poll_t* handle, int status, const uv_stat_t* prev
   if (prev != nullptr) prev_copy = *prev;
 
   napi_value argv[2] = {nullptr, nullptr};
-  napi_create_int32(wrap->env, status, &argv[0]);
-  argv[1] = CreateStatWatcherArray(wrap->env, wrap->use_bigint, &curr_copy, &prev_copy);
+  napi_create_int32(wrap->handle_wrap.env, status, &argv[0]);
+  argv[1] = CreateStatWatcherArray(wrap->handle_wrap.env, wrap->use_bigint, &curr_copy, &prev_copy);
 
   napi_value ignored = nullptr;
-  UbiMakeCallback(wrap->env, self, onchange, 2, argv, &ignored);
+  UbiMakeCallback(wrap->handle_wrap.env, self, onchange, 2, argv, &ignored);
 }
 
 void StatWatcherFinalize(napi_env env, void* data, void* /*hint*/) {
   auto* wrap = static_cast<StatWatcherWrap*>(data);
   if (wrap == nullptr) return;
-  wrap->finalized = true;
-  if (!wrap->initialized || wrap->closed) {
-    ResetRef(env, &wrap->wrapper_ref);
+  wrap->handle_wrap.finalized = true;
+  UbiHandleWrapDeleteRefIfPresent(env, &wrap->handle_wrap.wrapper_ref);
+  if (wrap->handle_wrap.state == kUbiHandleUninitialized || wrap->handle_wrap.state == kUbiHandleClosed) {
     delete wrap;
     return;
   }
-  wrap->delete_on_close = true;
+  wrap->handle_wrap.delete_on_close = true;
   CloseStatWatcher(wrap);
 }
 
@@ -1334,12 +1325,12 @@ napi_value StatWatcherCtor(napi_env env, napi_callback_info info) {
   napi_get_cb_info(env, info, &argc, argv, &this_arg, nullptr);
   if (this_arg == nullptr) return nullptr;
   auto* wrap = new StatWatcherWrap();
-  wrap->env = env;
+  UbiHandleWrapInit(&wrap->handle_wrap, env);
   wrap->async_id = g_next_stat_watcher_async_id++;
   if (argc >= 1 && argv[0] != nullptr) {
     napi_get_value_bool(env, argv[0], &wrap->use_bigint);
   }
-  if (napi_wrap(env, this_arg, wrap, StatWatcherFinalize, nullptr, &wrap->wrapper_ref) != napi_ok) {
+  if (napi_wrap(env, this_arg, wrap, StatWatcherFinalize, nullptr, &wrap->handle_wrap.wrapper_ref) != napi_ok) {
     delete wrap;
     return nullptr;
   }
@@ -1353,7 +1344,10 @@ napi_value StatWatcherStart(napi_env env, napi_callback_info info) {
   napi_get_cb_info(env, info, &argc, argv, &this_arg, nullptr);
   StatWatcherWrap* wrap = UnwrapStatWatcher(env, this_arg);
   if (wrap == nullptr || argc < 2) return MakeInt32(env, UV_EINVAL);
-  if (wrap->initialized || wrap->closing || wrap->closed) return MakeInt32(env, 0);
+  if (wrap->handle_wrap.state == kUbiHandleInitialized) return MakeInt32(env, 0);
+  if (wrap->handle_wrap.state == kUbiHandleClosing || wrap->handle_wrap.state == kUbiHandleClosed) {
+    return MakeInt32(env, UV_EINVAL);
+  }
 
   std::string path;
   if (!ValueToUtf8(env, argv[0], &path)) return MakeInt32(env, UV_EINVAL);
@@ -1367,24 +1361,26 @@ napi_value StatWatcherStart(napi_env env, napi_callback_info info) {
   wrap->handle.data = wrap;
   rc = uv_fs_poll_start(&wrap->handle, OnStatWatcherChange, path.c_str(), interval);
   if (rc != 0) {
-    wrap->initialized = true;
-    wrap->closing = true;
+    wrap->handle_wrap.state = kUbiHandleClosing;
     uv_close(reinterpret_cast<uv_handle_t*>(&wrap->handle), OnStatWatcherClosed);
     return MakeInt32(env, rc);
   }
 
-  wrap->initialized = true;
-  wrap->closed = false;
-  wrap->closing = false;
+  wrap->handle_wrap.state = kUbiHandleInitialized;
+  UbiHandleWrapHoldWrapperRef(&wrap->handle_wrap);
   wrap->referenced = true;
   return MakeInt32(env, 0);
 }
 
 napi_value StatWatcherClose(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1] = {nullptr};
   napi_value this_arg = nullptr;
-  size_t argc = 0;
-  napi_get_cb_info(env, info, &argc, nullptr, &this_arg, nullptr);
+  napi_get_cb_info(env, info, &argc, argv, &this_arg, nullptr);
   StatWatcherWrap* wrap = UnwrapStatWatcher(env, this_arg);
+  if (wrap != nullptr && wrap->handle_wrap.state == kUbiHandleInitialized && argc >= 1 && argv[0] != nullptr) {
+    UbiHandleWrapSetOnCloseCallback(env, this_arg, argv[0]);
+  }
   if (wrap != nullptr) CloseStatWatcher(wrap);
   return Undefined(env);
 }
@@ -1394,7 +1390,7 @@ napi_value StatWatcherRef(napi_env env, napi_callback_info info) {
   size_t argc = 0;
   napi_get_cb_info(env, info, &argc, nullptr, &this_arg, nullptr);
   StatWatcherWrap* wrap = UnwrapStatWatcher(env, this_arg);
-  if (wrap != nullptr && wrap->initialized && !wrap->closing && !wrap->closed && !wrap->referenced) {
+  if (wrap != nullptr && wrap->handle_wrap.state == kUbiHandleInitialized && !wrap->referenced) {
     uv_ref(reinterpret_cast<uv_handle_t*>(&wrap->handle));
     wrap->referenced = true;
   }
@@ -1406,11 +1402,25 @@ napi_value StatWatcherUnref(napi_env env, napi_callback_info info) {
   size_t argc = 0;
   napi_get_cb_info(env, info, &argc, nullptr, &this_arg, nullptr);
   StatWatcherWrap* wrap = UnwrapStatWatcher(env, this_arg);
-  if (wrap != nullptr && wrap->initialized && !wrap->closing && !wrap->closed && wrap->referenced) {
+  if (wrap != nullptr && wrap->handle_wrap.state == kUbiHandleInitialized && wrap->referenced) {
     uv_unref(reinterpret_cast<uv_handle_t*>(&wrap->handle));
     wrap->referenced = false;
   }
   return Undefined(env);
+}
+
+napi_value StatWatcherHasRef(napi_env env, napi_callback_info info) {
+  napi_value this_arg = nullptr;
+  size_t argc = 0;
+  napi_get_cb_info(env, info, &argc, nullptr, &this_arg, nullptr);
+  StatWatcherWrap* wrap = UnwrapStatWatcher(env, this_arg);
+  napi_value out = nullptr;
+  napi_get_boolean(
+      env,
+      wrap != nullptr &&
+          UbiHandleWrapHasRef(&wrap->handle_wrap, reinterpret_cast<const uv_handle_t*>(&wrap->handle)),
+      &out);
+  return out != nullptr ? out : Undefined(env);
 }
 
 napi_value StatWatcherGetAsyncId(napi_env env, napi_callback_info info) {
@@ -2761,6 +2771,7 @@ napi_value ResolveFs(napi_env env, const ResolveOptions& options) {
                           {"close", nullptr, StatWatcherClose, nullptr, nullptr, nullptr, napi_default, nullptr},
                           {"ref", nullptr, StatWatcherRef, nullptr, nullptr, nullptr, napi_default, nullptr},
                           {"unref", nullptr, StatWatcherUnref, nullptr, nullptr, nullptr, napi_default, nullptr},
+                          {"hasRef", nullptr, StatWatcherHasRef, nullptr, nullptr, nullptr, napi_default, nullptr},
                           {"getAsyncId", nullptr, StatWatcherGetAsyncId, nullptr, nullptr, nullptr, napi_default,
                            nullptr},
                       },

@@ -965,6 +965,78 @@ TEST_F(Test1CliPhase01, FsWatchFileEmitsChangeAndUnwatchWorks) {
 #endif
 }
 
+TEST_F(Test1CliPhase01, FsHandleWrapCloseAndHasRefMatchNodeSemantics) {
+#if defined(_WIN32)
+  GTEST_SKIP() << "fs handle-wrap semantics check is POSIX-only";
+#else
+  namespace fs = std::filesystem;
+  const auto ubi_path = ResolveBuiltUbiBinary();
+  ASSERT_FALSE(ubi_path.empty()) << "Failed to resolve built ubi binary";
+
+  const fs::path file_path =
+      fs::temp_directory_path() / ("ubi_phase01_fs_handle_wrap_" + std::to_string(::getpid()) + ".txt");
+  {
+    std::ofstream out(file_path);
+    out << "start";
+  }
+
+  const std::string script_path = WriteTempScript(
+      "ubi_phase01_cli_fs_handle_wrap_semantics",
+      "const assert = require('assert');\n"
+      "const { internalBinding } = require('internal/test/binding');\n"
+      "const { FSEvent } = internalBinding('fs_event_wrap');\n"
+      "const { StatWatcher } = internalBinding('fs');\n"
+      "const file = " + JsSingleQuoted(file_path.string()) + ";\n"
+      "const fe = new FSEvent();\n"
+      "const feCalls = [];\n"
+      "fe.close(() => feCalls.push('nope'));\n"
+      "assert.strictEqual(fe.hasRef(), false);\n"
+      "assert.strictEqual(fe.start(file, true, false, 'utf8'), 0);\n"
+      "assert.strictEqual(fe.initialized, true);\n"
+      "assert.strictEqual(fe.hasRef(), true);\n"
+      "fe.unref();\n"
+      "assert.strictEqual(fe.hasRef(), false);\n"
+      "fe.ref();\n"
+      "assert.strictEqual(fe.hasRef(), true);\n"
+      "fe.close(() => feCalls.push('first'));\n"
+      "fe.close(() => feCalls.push('second'));\n"
+      "const sw = new StatWatcher(false);\n"
+      "const swCalls = [];\n"
+      "sw.close(() => swCalls.push('nope'));\n"
+      "assert.strictEqual(sw.hasRef(), false);\n"
+      "assert.strictEqual(sw.start(file, 25), 0);\n"
+      "assert.strictEqual(sw.hasRef(), true);\n"
+      "sw.unref();\n"
+      "assert.strictEqual(sw.hasRef(), false);\n"
+      "sw.ref();\n"
+      "assert.strictEqual(sw.hasRef(), true);\n"
+      "sw.close(() => swCalls.push('first'));\n"
+      "sw.close(() => swCalls.push('second'));\n"
+      "setTimeout(() => {\n"
+      "  assert.deepStrictEqual(feCalls, ['first']);\n"
+      "  assert.deepStrictEqual(swCalls, ['first']);\n"
+      "  console.log('fs-handle-wrap:ok');\n"
+      "}, 60);\n");
+
+  const CommandResult result = RunBuiltBinaryAndCapture(
+      ubi_path,
+      {"--expose-internals", script_path},
+      "ubi_phase01_cli_fs_handle_wrap_semantics_run");
+
+  RemoveTempScript(script_path);
+  std::error_code ec;
+  fs::remove(file_path, ec);
+
+  ASSERT_NE(result.status, -1);
+  ASSERT_TRUE(WIFEXITED(result.status)) << "status=" << result.status;
+  EXPECT_EQ(WEXITSTATUS(result.status), 0) << "stderr=" << result.stderr_output;
+  if (!result.stderr_output.empty()) {
+    EXPECT_NE(result.stderr_output.find("internal/test/binding"), std::string::npos) << result.stderr_output;
+  }
+  EXPECT_NE(result.stdout_output.find("fs-handle-wrap:ok"), std::string::npos) << result.stdout_output;
+#endif
+}
+
 TEST_F(Test1CliPhase01, FsPromisesMkdirRecursiveReturnsPromise) {
 #if defined(_WIN32)
   GTEST_SKIP() << "fs.promises.mkdir subprocess parity check is POSIX-only";
