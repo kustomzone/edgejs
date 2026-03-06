@@ -2,11 +2,11 @@
 
 #include <array>
 #include <cerrno>
+#include <climits>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <string>
-#include <unordered_map>
 
 #if !defined(_WIN32)
 #include <arpa/inet.h>
@@ -24,52 +24,17 @@
 #endif
 
 namespace {
-bool g_has_simulated_priority = false;
-int g_simulated_priority = 0;
-
-struct OsBindingState {
-  napi_ref get_home_directory_override_ref = nullptr;
-  napi_ref get_home_directory_trampoline_ref = nullptr;
-};
-
-std::unordered_map<napi_env, OsBindingState> g_os_binding_states;
-std::unordered_map<napi_env, bool> g_os_binding_cleanup_hooks;
-
-void ResetRef(napi_env env, napi_ref* ref_ptr) {
-  if (ref_ptr == nullptr || *ref_ptr == nullptr) return;
-  napi_delete_reference(env, *ref_ptr);
-  *ref_ptr = nullptr;
-}
-
-napi_value GetRefValue(napi_env env, napi_ref ref) {
-  if (ref == nullptr) return nullptr;
-  napi_value out = nullptr;
-  if (napi_get_reference_value(env, ref, &out) != napi_ok || out == nullptr) return nullptr;
-  return out;
-}
-
 bool IsFunctionValue(napi_env env, napi_value value) {
   if (value == nullptr) return false;
   napi_valuetype type = napi_undefined;
   return napi_typeof(env, value, &type) == napi_ok && type == napi_function;
 }
 
-void CleanupOsBindingState(void* arg) {
-  napi_env env = static_cast<napi_env>(arg);
-  auto it = g_os_binding_states.find(env);
-  if (it != g_os_binding_states.end()) {
-    ResetRef(env, &it->second.get_home_directory_override_ref);
-    ResetRef(env, &it->second.get_home_directory_trampoline_ref);
-    g_os_binding_states.erase(it);
-  }
-  g_os_binding_cleanup_hooks.erase(env);
-}
-
-void EnsureOsBindingCleanupHook(napi_env env) {
-  if (g_os_binding_cleanup_hooks.find(env) != g_os_binding_cleanup_hooks.end()) return;
-  if (napi_add_env_cleanup_hook(env, CleanupOsBindingState, env) == napi_ok) {
-    g_os_binding_cleanup_hooks[env] = true;
-  }
+void ClearPendingExceptionIfAny(napi_env env) {
+  bool pending = false;
+  if (napi_is_exception_pending(env, &pending) != napi_ok || !pending) return;
+  napi_value ignored = nullptr;
+  napi_get_and_clear_last_exception(env, &ignored);
 }
 
 int NormalizePriorityPid(int32_t pid) {
@@ -156,6 +121,80 @@ napi_value GetOptionalContextArg(napi_env env, napi_value arg) {
   return arg;
 }
 
+napi_value GetGlobal(napi_env env) {
+  napi_value global = nullptr;
+  if (napi_get_global(env, &global) != napi_ok || global == nullptr) return nullptr;
+  return global;
+}
+
+napi_value CreateNullPrototypeObject(napi_env env) {
+  napi_value global = GetGlobal(env);
+  if (global == nullptr) return nullptr;
+
+  napi_value object_ctor = nullptr;
+  if (napi_get_named_property(env, global, "Object", &object_ctor) != napi_ok ||
+      object_ctor == nullptr || !IsFunctionValue(env, object_ctor)) {
+    return nullptr;
+  }
+
+  napi_value create_fn = nullptr;
+  if (napi_get_named_property(env, object_ctor, "create", &create_fn) != napi_ok ||
+      create_fn == nullptr || !IsFunctionValue(env, create_fn)) {
+    return nullptr;
+  }
+
+  napi_value null_value = nullptr;
+  if (napi_get_null(env, &null_value) != napi_ok || null_value == nullptr) return nullptr;
+
+  napi_value out = nullptr;
+  napi_value argv[1] = {null_value};
+  if (napi_call_function(env, object_ctor, create_fn, 1, argv, &out) != napi_ok || out == nullptr) {
+    ClearPendingExceptionIfAny(env);
+    return nullptr;
+  }
+  return out;
+}
+
+napi_value CreateBestEffortNullPrototypeObject(napi_env env) {
+  napi_value out = CreateNullPrototypeObject(env);
+  if (out != nullptr) return out;
+  if (napi_create_object(env, &out) != napi_ok) return nullptr;
+  return out;
+}
+
+bool IsStringEqualTo(napi_env env, napi_value value, const char* expected) {
+  if (value == nullptr || expected == nullptr) return false;
+  napi_valuetype type = napi_undefined;
+  if (napi_typeof(env, value, &type) != napi_ok || type != napi_string) return false;
+
+  size_t value_len = 0;
+  if (napi_get_value_string_utf8(env, value, nullptr, 0, &value_len) != napi_ok) return false;
+  std::string str;
+  str.resize(value_len + 1);
+  size_t copied = 0;
+  if (napi_get_value_string_utf8(env, value, str.data(), value_len + 1, &copied) != napi_ok) return false;
+  str.resize(copied);
+  return str == expected;
+}
+
+bool ParseUserInfoBufferEncoding(napi_env env, napi_value options, bool* use_buffer) {
+  if (use_buffer == nullptr) return false;
+  *use_buffer = false;
+  if (options == nullptr) return true;
+
+  napi_valuetype type = napi_undefined;
+  if (napi_typeof(env, options, &type) != napi_ok || type != napi_object) return true;
+
+  bool has_encoding = false;
+  if (napi_has_named_property(env, options, "encoding", &has_encoding) != napi_ok) return false;
+  if (!has_encoding) return true;
+
+  napi_value encoding = nullptr;
+  if (napi_get_named_property(env, options, "encoding", &encoding) != napi_ok) return false;
+  *use_buffer = IsStringEqualTo(env, encoding, "buffer");
+  return true;
+}
+
 napi_value BindingGetAvailableParallelism(napi_env env, napi_callback_info info) {
   (void)info;
   const uint32_t value = uv_available_parallelism();
@@ -228,18 +267,10 @@ napi_value BindingGetUptime(napi_env env, napi_callback_info info) {
 #else
   const int err = uv_uptime(&uptime);
   if (err != 0) {
-    // Some restricted environments deny querying system uptime.
-    // Fallback to process-relative monotonic uptime to keep API usable.
-    if (err == UV_EPERM || err == UV_EACCES) {
-      static const uint64_t kStartHr = uv_hrtime();
-      const uint64_t now = uv_hrtime();
-      uptime = static_cast<double>(now - kStartHr) / 1e9;
-    } else {
-      SetContextError(env, ctx, "uv_uptime", err);
-      napi_value undefined = nullptr;
-      napi_get_undefined(env, &undefined);
-      return undefined;
-    }
+    SetContextError(env, ctx, "uv_uptime", err);
+    napi_value undefined = nullptr;
+    napi_get_undefined(env, &undefined);
+    return undefined;
   }
 #endif
 
@@ -255,7 +286,7 @@ napi_value BindingGetHostname(napi_env env, napi_callback_info info) {
     return nullptr;
   }
   napi_value ctx = argc > 0 ? GetOptionalContextArg(env, argv[0]) : nullptr;
-  std::array<char, 256> host{};
+  std::array<char, UV_MAXHOSTNAMESIZE> host{};
   size_t len = host.size();
   const int err = uv_os_gethostname(host.data(), &len);
   if (err != 0) {
@@ -276,7 +307,11 @@ napi_value BindingGetHomeDirectory(napi_env env, napi_callback_info info) {
     return nullptr;
   }
   napi_value ctx = argc > 0 ? GetOptionalContextArg(env, argv[0]) : nullptr;
+#if defined(PATH_MAX)
+  std::array<char, PATH_MAX> home{};
+#else
   std::array<char, 4096> home{};
+#endif
   size_t len = home.size();
   const int err = uv_os_homedir(home.data(), &len);
   if (err != 0) {
@@ -290,81 +325,23 @@ napi_value BindingGetHomeDirectory(napi_env env, napi_callback_info info) {
   return out;
 }
 
-napi_value BindingGetHomeDirectoryTrampoline(napi_env env, napi_callback_info info) {
-  EnsureOsBindingCleanupHook(env);
-  auto& state = g_os_binding_states[env];
-
-  napi_value override_fn = GetRefValue(env, state.get_home_directory_override_ref);
-  if (IsFunctionValue(env, override_fn)) {
-    size_t argc = 1;
-    napi_value argv[1] = {nullptr};
-    napi_value this_arg = nullptr;
-    if (napi_get_cb_info(env, info, &argc, argv, &this_arg, nullptr) != napi_ok) {
-      return nullptr;
-    }
-    if (this_arg == nullptr) {
-      napi_get_global(env, &this_arg);
-    }
-    napi_value out = nullptr;
-    if (napi_call_function(env, this_arg, override_fn, argc, argv, &out) != napi_ok) {
-      return nullptr;
-    }
-    return out;
-  }
-
-  return BindingGetHomeDirectory(env, info);
-}
-
-napi_value BindingGetHomeDirectoryGetter(napi_env env, napi_callback_info info) {
-  EnsureOsBindingCleanupHook(env);
-  auto& state = g_os_binding_states[env];
-  napi_value fn = GetRefValue(env, state.get_home_directory_trampoline_ref);
-  if (fn != nullptr) return fn;
-
-  if (napi_create_function(
-          env, "getHomeDirectory", NAPI_AUTO_LENGTH, BindingGetHomeDirectoryTrampoline, nullptr, &fn) != napi_ok ||
-      fn == nullptr) {
-    return nullptr;
-  }
-  if (napi_create_reference(env, fn, 1, &state.get_home_directory_trampoline_ref) != napi_ok) {
-    return nullptr;
-  }
-  return fn;
-}
-
-napi_value BindingGetHomeDirectorySetter(napi_env env, napi_callback_info info) {
-  EnsureOsBindingCleanupHook(env);
-  auto& state = g_os_binding_states[env];
-
+napi_value BindingGetOSInformation(napi_env env, napi_callback_info info) {
   size_t argc = 1;
   napi_value argv[1] = {nullptr};
   if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok) {
     return nullptr;
   }
-
-  ResetRef(env, &state.get_home_directory_override_ref);
-  if (argc >= 1 && IsFunctionValue(env, argv[0])) {
-    napi_create_reference(env, argv[0], 1, &state.get_home_directory_override_ref);
-  }
-
-  napi_value undefined = nullptr;
-  napi_get_undefined(env, &undefined);
-  return undefined;
-}
-
-napi_value BindingGetOSInformation(napi_env env, napi_callback_info info) {
-  (void)info;
+  napi_value ctx = argc > 0 ? GetOptionalContextArg(env, argv[0]) : nullptr;
   uv_utsname_t info_out;
   const int err = uv_os_uname(&info_out);
+  if (err != 0) {
+    SetContextError(env, ctx, "uv_os_uname", err);
+    napi_value undefined = nullptr;
+    napi_get_undefined(env, &undefined);
+    return undefined;
+  }
   napi_value out = nullptr;
   if (napi_create_array_with_length(env, 4, &out) != napi_ok || out == nullptr) return nullptr;
-  if (err != 0) {
-    SetElementString(env, out, 0, "");
-    SetElementString(env, out, 1, "");
-    SetElementString(env, out, 2, "");
-    SetElementString(env, out, 3, "");
-    return out;
-  }
   SetElementString(env, out, 0, info_out.sysname);
   SetElementString(env, out, 1, info_out.version);
   SetElementString(env, out, 2, info_out.release);
@@ -449,6 +426,11 @@ napi_value BindingGetInterfaceAddresses(napi_env env, napi_callback_info info) {
   }
 #else
   const int err = uv_interface_addresses(&interfaces, &count);
+  if (err == UV_ENOSYS) {
+    napi_value undefined = nullptr;
+    napi_get_undefined(env, &undefined);
+    return undefined;
+  }
   if (err != 0) {
     SetContextError(env, ctx, "uv_interface_addresses", err);
     napi_value undefined = nullptr;
@@ -468,22 +450,29 @@ napi_value BindingGetInterfaceAddresses(napi_env env, napi_callback_info info) {
 
     char addr[INET6_ADDRSTRLEN] = {0};
     char netmask[INET6_ADDRSTRLEN] = {0};
-    const char* family = "IPv4";
+    const char* family = "unknown";
     int32_t scope_id = -1;
-    if (iface.address.address4.sin_family == AF_INET6) {
+    if (iface.address.address4.sin_family == AF_INET) {
+      family = "IPv4";
+      uv_ip4_name(&iface.address.address4, addr, sizeof(addr));
+      uv_ip4_name(&iface.netmask.netmask4, netmask, sizeof(netmask));
+    } else if (iface.address.address4.sin_family == AF_INET6) {
       family = "IPv6";
       uv_ip6_name(&iface.address.address6, addr, sizeof(addr));
       uv_ip6_name(&iface.netmask.netmask6, netmask, sizeof(netmask));
       scope_id = static_cast<int32_t>(iface.address.address6.sin6_scope_id);
     } else {
-      uv_ip4_name(&iface.address.address4, addr, sizeof(addr));
-      uv_ip4_name(&iface.netmask.netmask4, netmask, sizeof(netmask));
+      std::snprintf(addr, sizeof(addr), "<unknown sa family>");
     }
 
     char mac[18] = {0};
     std::snprintf(mac, sizeof(mac), "%02x:%02x:%02x:%02x:%02x:%02x",
-                  iface.phys_addr[0], iface.phys_addr[1], iface.phys_addr[2],
-                  iface.phys_addr[3], iface.phys_addr[4], iface.phys_addr[5]);
+                  static_cast<unsigned char>(iface.phys_addr[0]),
+                  static_cast<unsigned char>(iface.phys_addr[1]),
+                  static_cast<unsigned char>(iface.phys_addr[2]),
+                  static_cast<unsigned char>(iface.phys_addr[3]),
+                  static_cast<unsigned char>(iface.phys_addr[4]),
+                  static_cast<unsigned char>(iface.phys_addr[5]));
 
     SetElementString(env, out, i++, iface.name ? iface.name : "");
     SetElementString(env, out, i++, addr);
@@ -518,25 +507,9 @@ napi_value BindingSetPriority(napi_env env, napi_callback_info info) {
   if (napi_get_value_int32(env, argv[1], &priority) != napi_ok) return nullptr;
   napi_value ctx = GetOptionalContextArg(env, argv[2]);
 
-  const int self_pid = static_cast<int>(uv_os_getpid());
   const int effective_pid = NormalizePriorityPid(pid);
   int err = uv_os_setpriority(effective_pid, priority);
-  if (err != 0) {
-    if (effective_pid == self_pid && (err == UV_EPERM || err == UV_EACCES)) {
-      g_has_simulated_priority = true;
-      g_simulated_priority = priority;
-      err = 0;
-    } else {
-      // Normalize EPERM to EACCES for Node test compatibility.
-      const int ctx_err = (err == UV_EPERM) ? UV_EACCES : err;
-      SetContextError(env, ctx, "uv_os_setpriority", ctx_err);
-    }
-  } else if (effective_pid == self_pid) {
-    // Some restricted environments report success without applying niceness.
-    // Preserve Node-observable behavior for the current process.
-    g_has_simulated_priority = true;
-    g_simulated_priority = priority;
-  }
+  if (err != 0) SetContextError(env, ctx, "uv_os_setpriority", err);
   napi_value out = nullptr;
   if (napi_create_int32(env, err, &out) != napi_ok) return nullptr;
   return out;
@@ -553,22 +526,10 @@ napi_value BindingGetPriority(napi_env env, napi_callback_info info) {
   if (napi_get_value_int32(env, argv[0], &pid) != napi_ok) return nullptr;
   napi_value ctx = GetOptionalContextArg(env, argv[1]);
 
-  const int self_pid = static_cast<int>(uv_os_getpid());
   const int effective_pid = NormalizePriorityPid(pid);
   int priority = 0;
   const int err = uv_os_getpriority(effective_pid, &priority);
-  if (effective_pid == self_pid && g_has_simulated_priority) {
-    priority = g_simulated_priority;
-    napi_value out = nullptr;
-    if (napi_create_int32(env, priority, &out) != napi_ok) return nullptr;
-    return out;
-  }
   if (err != 0) {
-    if (effective_pid == self_pid && g_has_simulated_priority) {
-      napi_value out = nullptr;
-      if (napi_create_int32(env, g_simulated_priority, &out) != napi_ok) return nullptr;
-      return out;
-    }
     SetContextError(env, ctx, "uv_os_getpriority", err);
     napi_value undefined = nullptr;
     napi_get_undefined(env, &undefined);
@@ -581,20 +542,10 @@ napi_value BindingGetPriority(napi_env env, napi_callback_info info) {
 
 napi_value ToStringOrBuffer(napi_env env, const char* value, bool as_buffer) {
   if (as_buffer) {
-    napi_value array_buffer = nullptr;
-    void* data = nullptr;
     const size_t len = value == nullptr ? 0 : std::strlen(value);
-    if (napi_create_arraybuffer(env, len, &data, &array_buffer) != napi_ok || array_buffer == nullptr) {
-      return nullptr;
-    }
-    if (len > 0 && data != nullptr && value != nullptr) {
-      std::memcpy(data, value, len);
-    }
-    napi_value typed_array = nullptr;
-    if (napi_create_typedarray(env, napi_uint8_array, len, array_buffer, 0, &typed_array) != napi_ok) {
-      return nullptr;
-    }
-    return typed_array;
+    napi_value buffer = nullptr;
+    if (napi_create_buffer_copy(env, len, value, nullptr, &buffer) != napi_ok || buffer == nullptr) return nullptr;
+    return buffer;
   }
   napi_value out = nullptr;
   if (napi_create_string_utf8(env, value == nullptr ? "" : value, NAPI_AUTO_LENGTH, &out) != napi_ok) return nullptr;
@@ -608,14 +559,8 @@ napi_value BindingGetUserInfo(napi_env env, napi_callback_info info) {
     return nullptr;
   }
 
-  if (argc >= 1 && argv[0] != nullptr) {
-    // Keep Node-like behavior where option access can throw synchronously.
-    napi_value ignored = nullptr;
-    bool has_encoding = false;
-    if (napi_has_named_property(env, argv[0], "encoding", &has_encoding) == napi_ok && has_encoding) {
-      napi_get_named_property(env, argv[0], "encoding", &ignored);
-    }
-  }
+  bool as_buffer = false;
+  if (argc >= 1 && !ParseUserInfoBufferEncoding(env, argv[0], &as_buffer)) return nullptr;
   napi_value ctx = argc >= 2 ? GetOptionalContextArg(env, argv[1]) : nullptr;
 
   uv_passwd_t pwd;
@@ -628,7 +573,8 @@ napi_value BindingGetUserInfo(napi_env env, napi_callback_info info) {
   }
 
   napi_value out = nullptr;
-  if (napi_create_object(env, &out) != napi_ok || out == nullptr) {
+  out = CreateBestEffortNullPrototypeObject(env);
+  if (out == nullptr) {
     uv_os_free_passwd(&pwd);
     return nullptr;
   }
@@ -641,13 +587,13 @@ napi_value BindingGetUserInfo(napi_env env, napi_callback_info info) {
   SetNamedUInt32(env, out, "gid", static_cast<uint32_t>(pwd.gid));
 #endif
 
-  napi_value username = ToStringOrBuffer(env, pwd.username, false);
-  napi_value homedir = ToStringOrBuffer(env, pwd.homedir, false);
+  napi_value username = ToStringOrBuffer(env, pwd.username, as_buffer);
+  napi_value homedir = ToStringOrBuffer(env, pwd.homedir, as_buffer);
   napi_value shell = nullptr;
   if (pwd.shell == nullptr) {
     napi_get_null(env, &shell);
   } else {
-    shell = ToStringOrBuffer(env, pwd.shell, false);
+    shell = ToStringOrBuffer(env, pwd.shell, as_buffer);
   }
   if (username != nullptr) napi_set_named_property(env, out, "username", username);
   if (homedir != nullptr) napi_set_named_property(env, out, "homedir", homedir);
@@ -665,8 +611,8 @@ void SetMethod(napi_env env, napi_value obj, const char* name, napi_callback cb)
 }
 
 napi_value CreateSignalsObject(napi_env env) {
-  napi_value obj = nullptr;
-  if (napi_create_object(env, &obj) != napi_ok || obj == nullptr) return nullptr;
+  napi_value obj = CreateBestEffortNullPrototypeObject(env);
+  if (obj == nullptr) return nullptr;
 #ifdef SIGHUP
   SetNamedInt32(env, obj, "SIGHUP", SIGHUP);
 #endif
@@ -685,8 +631,20 @@ napi_value CreateSignalsObject(napi_env env) {
 #ifdef SIGABRT
   SetNamedInt32(env, obj, "SIGABRT", SIGABRT);
 #endif
+#ifdef SIGIOT
+  SetNamedInt32(env, obj, "SIGIOT", SIGIOT);
+#endif
+#ifdef SIGBUS
+  SetNamedInt32(env, obj, "SIGBUS", SIGBUS);
+#endif
+#ifdef SIGFPE
+  SetNamedInt32(env, obj, "SIGFPE", SIGFPE);
+#endif
 #ifdef SIGKILL
   SetNamedInt32(env, obj, "SIGKILL", SIGKILL);
+#endif
+#ifdef SIGSEGV
+  SetNamedInt32(env, obj, "SIGSEGV", SIGSEGV);
 #endif
 #ifdef SIGALRM
   SetNamedInt32(env, obj, "SIGALRM", SIGALRM);
@@ -748,30 +706,54 @@ napi_value CreateSignalsObject(napi_env env) {
 #ifdef SIGIO
   SetNamedInt32(env, obj, "SIGIO", SIGIO);
 #endif
+#ifdef SIGPOLL
+  SetNamedInt32(env, obj, "SIGPOLL", SIGPOLL);
+#endif
+#ifdef SIGLOST
+  SetNamedInt32(env, obj, "SIGLOST", SIGLOST);
+#endif
+#ifdef SIGPWR
+  SetNamedInt32(env, obj, "SIGPWR", SIGPWR);
+#endif
 #ifdef SIGINFO
   SetNamedInt32(env, obj, "SIGINFO", SIGINFO);
 #endif
 #ifdef SIGSYS
   SetNamedInt32(env, obj, "SIGSYS", SIGSYS);
 #endif
+#ifdef SIGUNUSED
+  SetNamedInt32(env, obj, "SIGUNUSED", SIGUNUSED);
+#endif
   return obj;
 }
 
 napi_value CreatePriorityObject(napi_env env) {
-  napi_value obj = nullptr;
-  if (napi_create_object(env, &obj) != napi_ok || obj == nullptr) return nullptr;
-  SetNamedInt32(env, obj, "PRIORITY_LOW", 19);
-  SetNamedInt32(env, obj, "PRIORITY_BELOW_NORMAL", 10);
-  SetNamedInt32(env, obj, "PRIORITY_NORMAL", 0);
-  SetNamedInt32(env, obj, "PRIORITY_ABOVE_NORMAL", -7);
-  SetNamedInt32(env, obj, "PRIORITY_HIGH", -14);
-  SetNamedInt32(env, obj, "PRIORITY_HIGHEST", -20);
+  napi_value obj = CreateBestEffortNullPrototypeObject(env);
+  if (obj == nullptr) return nullptr;
+#ifdef UV_PRIORITY_LOW
+  SetNamedInt32(env, obj, "PRIORITY_LOW", UV_PRIORITY_LOW);
+#endif
+#ifdef UV_PRIORITY_BELOW_NORMAL
+  SetNamedInt32(env, obj, "PRIORITY_BELOW_NORMAL", UV_PRIORITY_BELOW_NORMAL);
+#endif
+#ifdef UV_PRIORITY_NORMAL
+  SetNamedInt32(env, obj, "PRIORITY_NORMAL", UV_PRIORITY_NORMAL);
+#endif
+#ifdef UV_PRIORITY_ABOVE_NORMAL
+  SetNamedInt32(env, obj, "PRIORITY_ABOVE_NORMAL", UV_PRIORITY_ABOVE_NORMAL);
+#endif
+#ifdef UV_PRIORITY_HIGH
+  SetNamedInt32(env, obj, "PRIORITY_HIGH", UV_PRIORITY_HIGH);
+#endif
+#ifdef UV_PRIORITY_HIGHEST
+  SetNamedInt32(env, obj, "PRIORITY_HIGHEST", UV_PRIORITY_HIGHEST);
+#endif
   return obj;
 }
 
 napi_value CreateErrnoObject(napi_env env) {
-  napi_value obj = nullptr;
-  if (napi_create_object(env, &obj) != napi_ok || obj == nullptr) return nullptr;
+  napi_value obj = CreateBestEffortNullPrototypeObject(env);
+  if (obj == nullptr) return nullptr;
 #ifdef E2BIG
   SetNamedInt32(env, obj, "E2BIG", E2BIG);
 #endif
@@ -790,11 +772,23 @@ napi_value CreateErrnoObject(napi_env env) {
 #ifdef EAGAIN
   SetNamedInt32(env, obj, "EAGAIN", EAGAIN);
 #endif
+#ifdef EALREADY
+  SetNamedInt32(env, obj, "EALREADY", EALREADY);
+#endif
 #ifdef EBADF
   SetNamedInt32(env, obj, "EBADF", EBADF);
 #endif
+#ifdef EBADMSG
+  SetNamedInt32(env, obj, "EBADMSG", EBADMSG);
+#endif
 #ifdef EBUSY
   SetNamedInt32(env, obj, "EBUSY", EBUSY);
+#endif
+#ifdef ECANCELED
+  SetNamedInt32(env, obj, "ECANCELED", ECANCELED);
+#endif
+#ifdef ECHILD
+  SetNamedInt32(env, obj, "ECHILD", ECHILD);
 #endif
 #ifdef ECONNABORTED
   SetNamedInt32(env, obj, "ECONNABORTED", ECONNABORTED);
@@ -805,14 +799,35 @@ napi_value CreateErrnoObject(napi_env env) {
 #ifdef ECONNRESET
   SetNamedInt32(env, obj, "ECONNRESET", ECONNRESET);
 #endif
+#ifdef EDEADLK
+  SetNamedInt32(env, obj, "EDEADLK", EDEADLK);
+#endif
+#ifdef EDESTADDRREQ
+  SetNamedInt32(env, obj, "EDESTADDRREQ", EDESTADDRREQ);
+#endif
+#ifdef EDOM
+  SetNamedInt32(env, obj, "EDOM", EDOM);
+#endif
+#ifdef EDQUOT
+  SetNamedInt32(env, obj, "EDQUOT", EDQUOT);
+#endif
 #ifdef EEXIST
   SetNamedInt32(env, obj, "EEXIST", EEXIST);
 #endif
 #ifdef EFAULT
   SetNamedInt32(env, obj, "EFAULT", EFAULT);
 #endif
+#ifdef EFBIG
+  SetNamedInt32(env, obj, "EFBIG", EFBIG);
+#endif
 #ifdef EHOSTUNREACH
   SetNamedInt32(env, obj, "EHOSTUNREACH", EHOSTUNREACH);
+#endif
+#ifdef EIDRM
+  SetNamedInt32(env, obj, "EIDRM", EIDRM);
+#endif
+#ifdef EILSEQ
+  SetNamedInt32(env, obj, "EILSEQ", EILSEQ);
 #endif
 #ifdef EINPROGRESS
   SetNamedInt32(env, obj, "EINPROGRESS", EINPROGRESS);
@@ -826,23 +841,68 @@ napi_value CreateErrnoObject(napi_env env) {
 #ifdef EIO
   SetNamedInt32(env, obj, "EIO", EIO);
 #endif
+#ifdef EISCONN
+  SetNamedInt32(env, obj, "EISCONN", EISCONN);
+#endif
 #ifdef EISDIR
   SetNamedInt32(env, obj, "EISDIR", EISDIR);
+#endif
+#ifdef ELOOP
+  SetNamedInt32(env, obj, "ELOOP", ELOOP);
 #endif
 #ifdef EMFILE
   SetNamedInt32(env, obj, "EMFILE", EMFILE);
 #endif
+#ifdef EMLINK
+  SetNamedInt32(env, obj, "EMLINK", EMLINK);
+#endif
 #ifdef EMSGSIZE
   SetNamedInt32(env, obj, "EMSGSIZE", EMSGSIZE);
+#endif
+#ifdef EMULTIHOP
+  SetNamedInt32(env, obj, "EMULTIHOP", EMULTIHOP);
 #endif
 #ifdef ENAMETOOLONG
   SetNamedInt32(env, obj, "ENAMETOOLONG", ENAMETOOLONG);
 #endif
+#ifdef ENETDOWN
+  SetNamedInt32(env, obj, "ENETDOWN", ENETDOWN);
+#endif
+#ifdef ENETRESET
+  SetNamedInt32(env, obj, "ENETRESET", ENETRESET);
+#endif
+#ifdef ENETUNREACH
+  SetNamedInt32(env, obj, "ENETUNREACH", ENETUNREACH);
+#endif
+#ifdef ENFILE
+  SetNamedInt32(env, obj, "ENFILE", ENFILE);
+#endif
+#ifdef ENOBUFS
+  SetNamedInt32(env, obj, "ENOBUFS", ENOBUFS);
+#endif
+#ifdef ENODATA
+  SetNamedInt32(env, obj, "ENODATA", ENODATA);
+#endif
+#ifdef ENODEV
+  SetNamedInt32(env, obj, "ENODEV", ENODEV);
+#endif
 #ifdef ENOENT
   SetNamedInt32(env, obj, "ENOENT", ENOENT);
 #endif
+#ifdef ENOEXEC
+  SetNamedInt32(env, obj, "ENOEXEC", ENOEXEC);
+#endif
+#ifdef ENOLCK
+  SetNamedInt32(env, obj, "ENOLCK", ENOLCK);
+#endif
+#ifdef ENOLINK
+  SetNamedInt32(env, obj, "ENOLINK", ENOLINK);
+#endif
 #ifdef ENOMEM
   SetNamedInt32(env, obj, "ENOMEM", ENOMEM);
+#endif
+#ifdef ENOMSG
+  SetNamedInt32(env, obj, "ENOMSG", ENOMSG);
 #endif
 #ifdef ENOPROTOOPT
   SetNamedInt32(env, obj, "ENOPROTOOPT", ENOPROTOOPT);
@@ -850,17 +910,41 @@ napi_value CreateErrnoObject(napi_env env) {
 #ifdef ENOSPC
   SetNamedInt32(env, obj, "ENOSPC", ENOSPC);
 #endif
+#ifdef ENOSR
+  SetNamedInt32(env, obj, "ENOSR", ENOSR);
+#endif
+#ifdef ENOSTR
+  SetNamedInt32(env, obj, "ENOSTR", ENOSTR);
+#endif
+#ifdef ENOSYS
+  SetNamedInt32(env, obj, "ENOSYS", ENOSYS);
+#endif
 #ifdef ENOTCONN
   SetNamedInt32(env, obj, "ENOTCONN", ENOTCONN);
 #endif
 #ifdef ENOTDIR
   SetNamedInt32(env, obj, "ENOTDIR", ENOTDIR);
 #endif
+#ifdef ENOTEMPTY
+  SetNamedInt32(env, obj, "ENOTEMPTY", ENOTEMPTY);
+#endif
 #ifdef ENOTSOCK
   SetNamedInt32(env, obj, "ENOTSOCK", ENOTSOCK);
 #endif
+#ifdef ENOTSUP
+  SetNamedInt32(env, obj, "ENOTSUP", ENOTSUP);
+#endif
 #ifdef ENOTTY
   SetNamedInt32(env, obj, "ENOTTY", ENOTTY);
+#endif
+#ifdef ENXIO
+  SetNamedInt32(env, obj, "ENXIO", ENXIO);
+#endif
+#ifdef EOPNOTSUPP
+  SetNamedInt32(env, obj, "EOPNOTSUPP", EOPNOTSUPP);
+#endif
+#ifdef EOVERFLOW
+  SetNamedInt32(env, obj, "EOVERFLOW", EOVERFLOW);
 #endif
 #ifdef EPROTONOSUPPORT
   SetNamedInt32(env, obj, "EPROTONOSUPPORT", EPROTONOSUPPORT);
@@ -868,24 +952,225 @@ napi_value CreateErrnoObject(napi_env env) {
 #ifdef EPERM
   SetNamedInt32(env, obj, "EPERM", EPERM);
 #endif
+#ifdef EPIPE
+  SetNamedInt32(env, obj, "EPIPE", EPIPE);
+#endif
+#ifdef EPROTO
+  SetNamedInt32(env, obj, "EPROTO", EPROTO);
+#endif
+#ifdef EPROTOTYPE
+  SetNamedInt32(env, obj, "EPROTOTYPE", EPROTOTYPE);
+#endif
+#ifdef ERANGE
+  SetNamedInt32(env, obj, "ERANGE", ERANGE);
+#endif
 #ifdef EROFS
   SetNamedInt32(env, obj, "EROFS", EROFS);
+#endif
+#ifdef ESPIPE
+  SetNamedInt32(env, obj, "ESPIPE", ESPIPE);
 #endif
 #ifdef ESRCH
   SetNamedInt32(env, obj, "ESRCH", ESRCH);
 #endif
+#ifdef ESTALE
+  SetNamedInt32(env, obj, "ESTALE", ESTALE);
+#endif
+#ifdef ETIME
+  SetNamedInt32(env, obj, "ETIME", ETIME);
+#endif
 #ifdef ETIMEDOUT
   SetNamedInt32(env, obj, "ETIMEDOUT", ETIMEDOUT);
 #endif
+#ifdef ETXTBSY
+  SetNamedInt32(env, obj, "ETXTBSY", ETXTBSY);
+#endif
+#ifdef EWOULDBLOCK
+  SetNamedInt32(env, obj, "EWOULDBLOCK", EWOULDBLOCK);
+#endif
 #ifdef EXDEV
   SetNamedInt32(env, obj, "EXDEV", EXDEV);
+#endif
+#ifdef WSAEINTR
+  SetNamedInt32(env, obj, "WSAEINTR", WSAEINTR);
+#endif
+#ifdef WSAEBADF
+  SetNamedInt32(env, obj, "WSAEBADF", WSAEBADF);
+#endif
+#ifdef WSAEACCES
+  SetNamedInt32(env, obj, "WSAEACCES", WSAEACCES);
+#endif
+#ifdef WSAEFAULT
+  SetNamedInt32(env, obj, "WSAEFAULT", WSAEFAULT);
+#endif
+#ifdef WSAEINVAL
+  SetNamedInt32(env, obj, "WSAEINVAL", WSAEINVAL);
+#endif
+#ifdef WSAEMFILE
+  SetNamedInt32(env, obj, "WSAEMFILE", WSAEMFILE);
+#endif
+#ifdef WSAEWOULDBLOCK
+  SetNamedInt32(env, obj, "WSAEWOULDBLOCK", WSAEWOULDBLOCK);
+#endif
+#ifdef WSAEINPROGRESS
+  SetNamedInt32(env, obj, "WSAEINPROGRESS", WSAEINPROGRESS);
+#endif
+#ifdef WSAEALREADY
+  SetNamedInt32(env, obj, "WSAEALREADY", WSAEALREADY);
+#endif
+#ifdef WSAENOTSOCK
+  SetNamedInt32(env, obj, "WSAENOTSOCK", WSAENOTSOCK);
+#endif
+#ifdef WSAEDESTADDRREQ
+  SetNamedInt32(env, obj, "WSAEDESTADDRREQ", WSAEDESTADDRREQ);
+#endif
+#ifdef WSAEMSGSIZE
+  SetNamedInt32(env, obj, "WSAEMSGSIZE", WSAEMSGSIZE);
+#endif
+#ifdef WSAEPROTOTYPE
+  SetNamedInt32(env, obj, "WSAEPROTOTYPE", WSAEPROTOTYPE);
+#endif
+#ifdef WSAENOPROTOOPT
+  SetNamedInt32(env, obj, "WSAENOPROTOOPT", WSAENOPROTOOPT);
+#endif
+#ifdef WSAEPROTONOSUPPORT
+  SetNamedInt32(env, obj, "WSAEPROTONOSUPPORT", WSAEPROTONOSUPPORT);
+#endif
+#ifdef WSAESOCKTNOSUPPORT
+  SetNamedInt32(env, obj, "WSAESOCKTNOSUPPORT", WSAESOCKTNOSUPPORT);
+#endif
+#ifdef WSAEOPNOTSUPP
+  SetNamedInt32(env, obj, "WSAEOPNOTSUPP", WSAEOPNOTSUPP);
+#endif
+#ifdef WSAEPFNOSUPPORT
+  SetNamedInt32(env, obj, "WSAEPFNOSUPPORT", WSAEPFNOSUPPORT);
+#endif
+#ifdef WSAEAFNOSUPPORT
+  SetNamedInt32(env, obj, "WSAEAFNOSUPPORT", WSAEAFNOSUPPORT);
+#endif
+#ifdef WSAEADDRINUSE
+  SetNamedInt32(env, obj, "WSAEADDRINUSE", WSAEADDRINUSE);
+#endif
+#ifdef WSAEADDRNOTAVAIL
+  SetNamedInt32(env, obj, "WSAEADDRNOTAVAIL", WSAEADDRNOTAVAIL);
+#endif
+#ifdef WSAENETDOWN
+  SetNamedInt32(env, obj, "WSAENETDOWN", WSAENETDOWN);
+#endif
+#ifdef WSAENETUNREACH
+  SetNamedInt32(env, obj, "WSAENETUNREACH", WSAENETUNREACH);
+#endif
+#ifdef WSAENETRESET
+  SetNamedInt32(env, obj, "WSAENETRESET", WSAENETRESET);
+#endif
+#ifdef WSAECONNABORTED
+  SetNamedInt32(env, obj, "WSAECONNABORTED", WSAECONNABORTED);
+#endif
+#ifdef WSAECONNRESET
+  SetNamedInt32(env, obj, "WSAECONNRESET", WSAECONNRESET);
+#endif
+#ifdef WSAENOBUFS
+  SetNamedInt32(env, obj, "WSAENOBUFS", WSAENOBUFS);
+#endif
+#ifdef WSAEISCONN
+  SetNamedInt32(env, obj, "WSAEISCONN", WSAEISCONN);
+#endif
+#ifdef WSAENOTCONN
+  SetNamedInt32(env, obj, "WSAENOTCONN", WSAENOTCONN);
+#endif
+#ifdef WSAESHUTDOWN
+  SetNamedInt32(env, obj, "WSAESHUTDOWN", WSAESHUTDOWN);
+#endif
+#ifdef WSAETOOMANYREFS
+  SetNamedInt32(env, obj, "WSAETOOMANYREFS", WSAETOOMANYREFS);
+#endif
+#ifdef WSAETIMEDOUT
+  SetNamedInt32(env, obj, "WSAETIMEDOUT", WSAETIMEDOUT);
+#endif
+#ifdef WSAECONNREFUSED
+  SetNamedInt32(env, obj, "WSAECONNREFUSED", WSAECONNREFUSED);
+#endif
+#ifdef WSAELOOP
+  SetNamedInt32(env, obj, "WSAELOOP", WSAELOOP);
+#endif
+#ifdef WSAENAMETOOLONG
+  SetNamedInt32(env, obj, "WSAENAMETOOLONG", WSAENAMETOOLONG);
+#endif
+#ifdef WSAEHOSTDOWN
+  SetNamedInt32(env, obj, "WSAEHOSTDOWN", WSAEHOSTDOWN);
+#endif
+#ifdef WSAEHOSTUNREACH
+  SetNamedInt32(env, obj, "WSAEHOSTUNREACH", WSAEHOSTUNREACH);
+#endif
+#ifdef WSAENOTEMPTY
+  SetNamedInt32(env, obj, "WSAENOTEMPTY", WSAENOTEMPTY);
+#endif
+#ifdef WSAEPROCLIM
+  SetNamedInt32(env, obj, "WSAEPROCLIM", WSAEPROCLIM);
+#endif
+#ifdef WSAEUSERS
+  SetNamedInt32(env, obj, "WSAEUSERS", WSAEUSERS);
+#endif
+#ifdef WSAEDQUOT
+  SetNamedInt32(env, obj, "WSAEDQUOT", WSAEDQUOT);
+#endif
+#ifdef WSAESTALE
+  SetNamedInt32(env, obj, "WSAESTALE", WSAESTALE);
+#endif
+#ifdef WSAEREMOTE
+  SetNamedInt32(env, obj, "WSAEREMOTE", WSAEREMOTE);
+#endif
+#ifdef WSASYSNOTREADY
+  SetNamedInt32(env, obj, "WSASYSNOTREADY", WSASYSNOTREADY);
+#endif
+#ifdef WSAVERNOTSUPPORTED
+  SetNamedInt32(env, obj, "WSAVERNOTSUPPORTED", WSAVERNOTSUPPORTED);
+#endif
+#ifdef WSANOTINITIALISED
+  SetNamedInt32(env, obj, "WSANOTINITIALISED", WSANOTINITIALISED);
+#endif
+#ifdef WSAEDISCON
+  SetNamedInt32(env, obj, "WSAEDISCON", WSAEDISCON);
+#endif
+#ifdef WSAENOMORE
+  SetNamedInt32(env, obj, "WSAENOMORE", WSAENOMORE);
+#endif
+#ifdef WSAECANCELLED
+  SetNamedInt32(env, obj, "WSAECANCELLED", WSAECANCELLED);
+#endif
+#ifdef WSAEINVALIDPROCTABLE
+  SetNamedInt32(env, obj, "WSAEINVALIDPROCTABLE", WSAEINVALIDPROCTABLE);
+#endif
+#ifdef WSAEINVALIDPROVIDER
+  SetNamedInt32(env, obj, "WSAEINVALIDPROVIDER", WSAEINVALIDPROVIDER);
+#endif
+#ifdef WSAEPROVIDERFAILEDINIT
+  SetNamedInt32(env, obj, "WSAEPROVIDERFAILEDINIT", WSAEPROVIDERFAILEDINIT);
+#endif
+#ifdef WSASYSCALLFAILURE
+  SetNamedInt32(env, obj, "WSASYSCALLFAILURE", WSASYSCALLFAILURE);
+#endif
+#ifdef WSASERVICE_NOT_FOUND
+  SetNamedInt32(env, obj, "WSASERVICE_NOT_FOUND", WSASERVICE_NOT_FOUND);
+#endif
+#ifdef WSATYPE_NOT_FOUND
+  SetNamedInt32(env, obj, "WSATYPE_NOT_FOUND", WSATYPE_NOT_FOUND);
+#endif
+#ifdef WSA_E_NO_MORE
+  SetNamedInt32(env, obj, "WSA_E_NO_MORE", WSA_E_NO_MORE);
+#endif
+#ifdef WSA_E_CANCELLED
+  SetNamedInt32(env, obj, "WSA_E_CANCELLED", WSA_E_CANCELLED);
+#endif
+#ifdef WSAEREFUSED
+  SetNamedInt32(env, obj, "WSAEREFUSED", WSAEREFUSED);
 #endif
   return obj;
 }
 
 napi_value CreateDlopenObject(napi_env env) {
-  napi_value obj = nullptr;
-  if (napi_create_object(env, &obj) != napi_ok || obj == nullptr) return nullptr;
+  napi_value obj = CreateBestEffortNullPrototypeObject(env);
+  if (obj == nullptr) return nullptr;
 #if !defined(_WIN32)
 #ifdef RTLD_LAZY
   SetNamedInt32(env, obj, "RTLD_LAZY", RTLD_LAZY);
@@ -909,8 +1194,8 @@ napi_value CreateDlopenObject(napi_env env) {
 }
 
 napi_value CreateOsConstants(napi_env env) {
-  napi_value out = nullptr;
-  if (napi_create_object(env, &out) != napi_ok || out == nullptr) return nullptr;
+  napi_value out = CreateBestEffortNullPrototypeObject(env);
+  if (out == nullptr) return nullptr;
   napi_value signals = CreateSignalsObject(env);
   napi_value priority = CreatePriorityObject(env);
   napi_value errno_obj = CreateErrnoObject(env);
@@ -919,7 +1204,7 @@ napi_value CreateOsConstants(napi_env env) {
   if (priority != nullptr) napi_set_named_property(env, out, "priority", priority);
   if (errno_obj != nullptr) napi_set_named_property(env, out, "errno", errno_obj);
   if (dlopen != nullptr) napi_set_named_property(env, out, "dlopen", dlopen);
-  SetNamedInt32(env, out, "UV_UDP_REUSEADDR", 4);
+  SetNamedInt32(env, out, "UV_UDP_REUSEADDR", UV_UDP_REUSEADDR);
   return out;
 }
 
@@ -931,11 +1216,10 @@ napi_value UbiInstallOsBinding(napi_env env) {
     return nullptr;
   }
 
-  EnsureOsBindingCleanupHook(env);
-
   SetMethod(env, binding, "getAvailableParallelism", BindingGetAvailableParallelism);
   SetMethod(env, binding, "getCPUs", BindingGetCPUs);
   SetMethod(env, binding, "getFreeMem", BindingGetFreeMem);
+  SetMethod(env, binding, "getHomeDirectory", BindingGetHomeDirectory);
   SetMethod(env, binding, "getHostname", BindingGetHostname);
   SetMethod(env, binding, "getInterfaceAddresses", BindingGetInterfaceAddresses);
   SetMethod(env, binding, "getLoadAvg", BindingGetLoadAvg);
@@ -946,19 +1230,6 @@ napi_value UbiInstallOsBinding(napi_env env) {
   SetMethod(env, binding, "getUserInfo", BindingGetUserInfo);
   SetMethod(env, binding, "setPriority", BindingSetPriority);
   SetNamedBool(env, binding, "isBigEndian", IsBigEndian());
-
-  napi_property_descriptor home_dir_prop = napi_property_descriptor{
-      "getHomeDirectory",
-      nullptr,
-      nullptr,
-      BindingGetHomeDirectoryGetter,
-      BindingGetHomeDirectorySetter,
-      nullptr,
-      napi_default,
-      nullptr};
-  if (napi_define_properties(env, binding, 1, &home_dir_prop) != napi_ok) {
-    return nullptr;
-  }
 
   return binding;
 }

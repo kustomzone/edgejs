@@ -1321,3 +1321,144 @@ TEST_F(Test1CliPhase01, InternalBufferBindingSentinelsAndSharedArrayBufferCopyMa
   EXPECT_NE(result.stdout_output.find("internal-buffer-binding:ok"), std::string::npos) << result.stdout_output;
 #endif
 }
+
+TEST_F(Test1CliPhase01, OsUserInfoBufferEncodingReturnsBuffersAndNullPrototype) {
+#if defined(_WIN32)
+  GTEST_SKIP() << "os.userInfo buffer parity check is POSIX-only";
+#else
+  const auto ubi_path = ResolveBuiltUbiBinary();
+  ASSERT_FALSE(ubi_path.empty()) << "Failed to resolve built ubi binary";
+
+  const std::string script_path = WriteTempScript(
+      "ubi_phase01_cli_os_userinfo_buffer",
+      "const assert = require('assert');\n"
+      "const os = require('os');\n"
+      "const user = os.userInfo();\n"
+      "const userBuf = os.userInfo({ encoding: 'buffer' });\n"
+      "assert.strictEqual(Object.getPrototypeOf(user), null);\n"
+      "assert.strictEqual(Object.getPrototypeOf(userBuf), null);\n"
+      "assert.ok(Buffer.isBuffer(userBuf.username));\n"
+      "assert.ok(Buffer.isBuffer(userBuf.homedir));\n"
+      "assert.strictEqual(user.username, userBuf.username.toString('utf8'));\n"
+      "assert.strictEqual(user.homedir, userBuf.homedir.toString('utf8'));\n"
+      "if (userBuf.shell === null) {\n"
+      "  assert.strictEqual(user.shell, null);\n"
+      "} else {\n"
+      "  assert.ok(Buffer.isBuffer(userBuf.shell));\n"
+      "  assert.strictEqual(user.shell, userBuf.shell.toString('utf8'));\n"
+      "}\n"
+      "console.log('os-userinfo-buffer:ok');\n");
+
+  const CommandResult result =
+      RunBuiltBinaryAndCapture(ubi_path, {script_path}, "ubi_phase01_cli_os_userinfo_buffer_run");
+
+  RemoveTempScript(script_path);
+
+  ASSERT_NE(result.status, -1);
+  ASSERT_TRUE(WIFEXITED(result.status)) << "status=" << result.status;
+  EXPECT_EQ(WEXITSTATUS(result.status), 0) << "stderr=" << result.stderr_output;
+  EXPECT_TRUE(result.stderr_output.empty()) << "stderr=" << result.stderr_output;
+  EXPECT_NE(result.stdout_output.find("os-userinfo-buffer:ok"), std::string::npos) << result.stdout_output;
+#endif
+}
+
+TEST_F(Test1CliPhase01, InternalOsBindingGetHomeDirectoryHasNodeDescriptorShape) {
+#if defined(_WIN32)
+  GTEST_SKIP() << "os internal binding descriptor parity check is POSIX-only";
+#else
+  const auto ubi_path = ResolveBuiltUbiBinary();
+  ASSERT_FALSE(ubi_path.empty()) << "Failed to resolve built ubi binary";
+
+  const std::string script_path = WriteTempScript(
+      "ubi_phase01_cli_os_binding_descriptor",
+      "const assert = require('assert');\n"
+      "const { internalBinding } = require('internal/test/binding');\n"
+      "const binding = internalBinding('os');\n"
+      "const desc = Object.getOwnPropertyDescriptor(binding, 'getHomeDirectory');\n"
+      "assert.ok(desc);\n"
+      "assert.strictEqual(typeof desc.value, 'function');\n"
+      "assert.strictEqual(desc.get, undefined);\n"
+      "assert.strictEqual(desc.set, undefined);\n"
+      "assert.strictEqual(desc.enumerable, true);\n"
+      "assert.strictEqual(desc.configurable, true);\n"
+      "binding.getHomeDirectory = function(ctx) {\n"
+      "  ctx.syscall = 'foo';\n"
+      "  ctx.code = 'bar';\n"
+      "  ctx.message = 'baz';\n"
+      "};\n"
+      "const os = require('os');\n"
+      "assert.throws(\n"
+      "  () => os.homedir(),\n"
+      "  (err) => err && err.code === 'ERR_SYSTEM_ERROR' &&\n"
+      "      err.message === 'A system error occurred: foo returned bar (baz)');\n"
+      "console.log('os-binding-descriptor:ok');\n");
+
+  const CommandResult result =
+      RunBuiltBinaryAndCapture(
+          ubi_path,
+          {"--expose-internals", script_path},
+          "ubi_phase01_cli_os_binding_descriptor_run");
+
+  RemoveTempScript(script_path);
+
+  ASSERT_NE(result.status, -1);
+  ASSERT_TRUE(WIFEXITED(result.status)) << "status=" << result.status;
+  EXPECT_EQ(WEXITSTATUS(result.status), 0) << "stderr=" << result.stderr_output;
+  if (!result.stderr_output.empty()) {
+    EXPECT_NE(result.stderr_output.find("internal/test/binding"), std::string::npos) << result.stderr_output;
+  }
+  EXPECT_NE(result.stdout_output.find("os-binding-descriptor:ok"), std::string::npos) << result.stdout_output;
+#endif
+}
+
+TEST_F(Test1CliPhase01, OsConstantsExposeNodeLikeShapeAndCoverage) {
+#if defined(_WIN32)
+  GTEST_SKIP() << "os constants parity check is POSIX-only";
+#else
+  const auto ubi_path = ResolveBuiltUbiBinary();
+  ASSERT_FALSE(ubi_path.empty()) << "Failed to resolve built ubi binary";
+
+  const std::string script_path = WriteTempScript(
+      "ubi_phase01_cli_os_constants_shape",
+      "const assert = require('assert');\n"
+      "const { internalBinding } = require('internal/test/binding');\n"
+      "const osConstants = internalBinding('constants').os;\n"
+      "assert.strictEqual(Object.getPrototypeOf(osConstants), null);\n"
+      "assert.strictEqual(Object.getPrototypeOf(osConstants.errno), null);\n"
+      "assert.strictEqual(Object.getPrototypeOf(osConstants.signals), null);\n"
+      "assert.strictEqual(Object.getPrototypeOf(osConstants.priority), null);\n"
+      "assert.strictEqual(Object.getPrototypeOf(osConstants.dlopen), null);\n"
+      "assert.ok(Object.keys(osConstants.errno).length >= 50);\n"
+      "assert.ok(Object.keys(osConstants.signals).length >= 25);\n"
+      "assert.ok('EALREADY' in osConstants.errno);\n"
+      "assert.ok('ECANCELED' in osConstants.errno);\n"
+      "assert.ok('ENOBUFS' in osConstants.errno);\n"
+      "assert.ok('ENOTEMPTY' in osConstants.errno);\n"
+      "assert.ok('PRIORITY_NORMAL' in osConstants.priority);\n"
+      "assert.ok('PRIORITY_HIGH' in osConstants.priority);\n"
+      "assert.ok('UV_UDP_REUSEADDR' in osConstants);\n"
+      "assert.ok(Object.isFrozen(osConstants.signals));\n"
+      "if (process.platform !== 'win32') {\n"
+      "  assert.ok('SIGBUS' in osConstants.signals);\n"
+      "  assert.ok('SIGFPE' in osConstants.signals);\n"
+      "  assert.ok('SIGSEGV' in osConstants.signals);\n"
+      "}\n"
+      "console.log('os-constants-shape:ok');\n");
+
+  const CommandResult result =
+      RunBuiltBinaryAndCapture(
+          ubi_path,
+          {"--expose-internals", script_path},
+          "ubi_phase01_cli_os_constants_shape_run");
+
+  RemoveTempScript(script_path);
+
+  ASSERT_NE(result.status, -1);
+  ASSERT_TRUE(WIFEXITED(result.status)) << "status=" << result.status;
+  EXPECT_EQ(WEXITSTATUS(result.status), 0) << "stderr=" << result.stderr_output;
+  if (!result.stderr_output.empty()) {
+    EXPECT_NE(result.stderr_output.find("internal/test/binding"), std::string::npos) << result.stderr_output;
+  }
+  EXPECT_NE(result.stdout_output.find("os-constants-shape:ok"), std::string::npos) << result.stdout_output;
+#endif
+}
