@@ -14,6 +14,11 @@ namespace {
 
 napi_ref g_encode_into_results_ref = nullptr;
 
+const char* ZeroLengthByteSentinel() {
+  static const char sentinel = 0;
+  return &sentinel;
+}
+
 bool IsBase64Char(char c, bool url_mode) {
   if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) {
     return true;
@@ -56,8 +61,9 @@ bool ExtractBytesFromValue(napi_env env, napi_value value, const char** data, si
   bool is_buffer = false;
   if (napi_is_buffer(env, value, &is_buffer) == napi_ok && is_buffer) {
     void* ptr = nullptr;
-    if (napi_get_buffer_info(env, value, &ptr, len) != napi_ok || ptr == nullptr) return false;
-    *data = static_cast<const char*>(ptr);
+    if (napi_get_buffer_info(env, value, &ptr, len) != napi_ok) return false;
+    if (ptr == nullptr && *len != 0) return false;
+    *data = ptr != nullptr ? static_cast<const char*>(ptr) : ZeroLengthByteSentinel();
     return true;
   }
 
@@ -65,8 +71,20 @@ bool ExtractBytesFromValue(napi_env env, napi_value value, const char** data, si
   if (napi_is_arraybuffer(env, value, &is_arraybuffer) == napi_ok && is_arraybuffer) {
     void* ptr = nullptr;
     if (napi_get_arraybuffer_info(env, value, &ptr, len) != napi_ok) return false;
-    *data = static_cast<const char*>(ptr);
+    if (ptr == nullptr && *len != 0) return false;
+    *data = ptr != nullptr ? static_cast<const char*>(ptr) : ZeroLengthByteSentinel();
     return true;
+  }
+
+  {
+    void* ptr = nullptr;
+    size_t byte_len = 0;
+    if (napi_get_arraybuffer_info(env, value, &ptr, &byte_len) == napi_ok) {
+      if (ptr == nullptr && byte_len != 0) return false;
+      *data = ptr != nullptr ? static_cast<const char*>(ptr) : ZeroLengthByteSentinel();
+      *len = byte_len;
+      return true;
+    }
   }
 
   bool is_typed = false;
@@ -77,8 +95,7 @@ bool ExtractBytesFromValue(napi_env env, napi_value value, const char** data, si
     napi_value arraybuffer = nullptr;
     size_t byte_offset = 0;
     if (napi_get_typedarray_info(
-            env, value, &type, &element_len, &ptr, &arraybuffer, &byte_offset) != napi_ok ||
-        ptr == nullptr) {
+            env, value, &type, &element_len, &ptr, &arraybuffer, &byte_offset) != napi_ok) {
       return false;
     }
 
@@ -94,14 +111,17 @@ bool ExtractBytesFromValue(napi_env env, napi_value value, const char** data, si
         bytes_per_element = 4;
         break;
       case napi_float64_array:
+      case napi_bigint64_array:
+      case napi_biguint64_array:
         bytes_per_element = 8;
         break;
       default:
         bytes_per_element = 1;
         break;
     }
-    *data = static_cast<const char*>(ptr);
     *len = element_len * bytes_per_element;
+    if (ptr == nullptr && *len != 0) return false;
+    *data = ptr != nullptr ? static_cast<const char*>(ptr) : ZeroLengthByteSentinel();
     return true;
   }
 
@@ -111,11 +131,11 @@ bool ExtractBytesFromValue(napi_env env, napi_value value, const char** data, si
     size_t byte_length = 0;
     napi_value arraybuffer = nullptr;
     size_t byte_offset = 0;
-    if (napi_get_dataview_info(env, value, &byte_length, &ptr, &arraybuffer, &byte_offset) != napi_ok ||
-        ptr == nullptr) {
+    if (napi_get_dataview_info(env, value, &byte_length, &ptr, &arraybuffer, &byte_offset) != napi_ok) {
       return false;
     }
-    *data = static_cast<const char*>(ptr);
+    if (ptr == nullptr && byte_length != 0) return false;
+    *data = ptr != nullptr ? static_cast<const char*>(ptr) : ZeroLengthByteSentinel();
     *len = byte_length;
     return true;
   }

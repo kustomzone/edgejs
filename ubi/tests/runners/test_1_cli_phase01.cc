@@ -575,6 +575,159 @@ TEST_F(Test1CliPhase01, FsPromisesReadFileInsideListenCallbackDoesNotHang) {
 #endif
 }
 
+TEST_F(Test1CliPhase01, AsyncLocalStoragePromiseContextSurvivesConcurrentAwaits) {
+#if defined(_WIN32)
+  GTEST_SKIP() << "AsyncLocalStorage subprocess parity check is POSIX-only";
+#else
+  const auto ubi_path = ResolveBuiltUbiBinary();
+  ASSERT_FALSE(ubi_path.empty()) << "Failed to resolve built ubi binary";
+
+  const std::string script_path = WriteTempScript(
+      "ubi_phase01_cli_async_local_storage_promises",
+      "const { AsyncLocalStorage } = require('async_hooks');\n"
+      "const als = new AsyncLocalStorage();\n"
+      "(async () => {\n"
+      "  const pa = als.run('A', async () => {\n"
+      "    await Promise.resolve();\n"
+      "    await Promise.resolve();\n"
+      "    return ['A', als.getStore()];\n"
+      "  });\n"
+      "  const pb = als.run('B', async () => {\n"
+      "    await Promise.resolve();\n"
+      "    await Promise.resolve();\n"
+      "    return ['B', als.getStore()];\n"
+      "  });\n"
+      "  console.log(JSON.stringify(await Promise.all([pa, pb])));\n"
+      "})().catch((err) => {\n"
+      "  console.error(err && err.stack || err);\n"
+      "  process.exitCode = 1;\n"
+      "});\n");
+
+  const CommandResult result =
+      RunBuiltBinaryAndCapture(ubi_path, {script_path}, "ubi_phase01_cli_async_local_storage_promises_run");
+
+  RemoveTempScript(script_path);
+
+  ASSERT_NE(result.status, -1);
+  ASSERT_TRUE(WIFEXITED(result.status)) << "status=" << result.status;
+  EXPECT_EQ(WEXITSTATUS(result.status), 0) << "stderr=" << result.stderr_output;
+  EXPECT_TRUE(result.stderr_output.empty()) << "stderr=" << result.stderr_output;
+  EXPECT_NE(result.stdout_output.find("[[\"A\",\"A\"],[\"B\",\"B\"]]"), std::string::npos)
+      << result.stdout_output;
+#endif
+}
+
+TEST_F(Test1CliPhase01, TextDecoderAcceptsSharedArrayBufferInput) {
+#if defined(_WIN32)
+  GTEST_SKIP() << "SharedArrayBuffer subprocess parity check is POSIX-only";
+#else
+  const auto ubi_path = ResolveBuiltUbiBinary();
+  ASSERT_FALSE(ubi_path.empty()) << "Failed to resolve built ubi binary";
+
+  const std::string script_path = WriteTempScript(
+      "ubi_phase01_cli_textdecoder_shared_arraybuffer",
+      "const sab = new SharedArrayBuffer(3);\n"
+      "new Uint8Array(sab).set([0x66, 0x6f, 0x6f]);\n"
+      "console.log(new TextDecoder().decode(sab));\n");
+
+  const CommandResult result =
+      RunBuiltBinaryAndCapture(ubi_path, {script_path}, "ubi_phase01_cli_textdecoder_shared_arraybuffer_run");
+
+  RemoveTempScript(script_path);
+
+  ASSERT_NE(result.status, -1);
+  ASSERT_TRUE(WIFEXITED(result.status)) << "status=" << result.status;
+  EXPECT_EQ(WEXITSTATUS(result.status), 0) << "stderr=" << result.stderr_output;
+  EXPECT_TRUE(result.stderr_output.empty()) << "stderr=" << result.stderr_output;
+  EXPECT_NE(result.stdout_output.find("foo"), std::string::npos) << result.stdout_output;
+#endif
+}
+
+TEST_F(Test1CliPhase01, FsPromisesMkdirRecursiveReturnsPromise) {
+#if defined(_WIN32)
+  GTEST_SKIP() << "fs.promises.mkdir subprocess parity check is POSIX-only";
+#else
+  const auto ubi_path = ResolveBuiltUbiBinary();
+  ASSERT_FALSE(ubi_path.empty()) << "Failed to resolve built ubi binary";
+
+  const std::string script_path = WriteTempScript(
+      "ubi_phase01_cli_fs_promises_mkdir",
+      "const fs = require('fs/promises');\n"
+      "const path = require('path');\n"
+      "const os = require('os');\n"
+      "process.on('unhandledRejection', (err) => {\n"
+      "  console.error('unhandledRejection', err && err.stack || err);\n"
+      "  process.exitCode = 1;\n"
+      "});\n"
+      "(async () => {\n"
+      "  const dir = path.join(os.tmpdir(), 'ubi-fs-promises-mkdir-' + process.pid, 'a', 'b');\n"
+      "  const firstCreated = await fs.mkdir(dir, { recursive: true });\n"
+      "  console.log('mkdir:' + firstCreated);\n"
+      "})().catch((err) => {\n"
+      "  console.error(err && err.stack || err);\n"
+      "  process.exitCode = 1;\n"
+      "});\n");
+
+  const CommandResult result =
+      RunBuiltBinaryAndCapture(ubi_path, {script_path}, "ubi_phase01_cli_fs_promises_mkdir_run");
+
+  RemoveTempScript(script_path);
+
+  ASSERT_NE(result.status, -1);
+  ASSERT_TRUE(WIFEXITED(result.status)) << "status=" << result.status;
+  EXPECT_EQ(WEXITSTATUS(result.status), 0) << "stderr=" << result.stderr_output;
+  EXPECT_TRUE(result.stderr_output.empty()) << "stderr=" << result.stderr_output;
+  EXPECT_EQ(result.stdout_output.find("mkdir:"), 0U) << result.stdout_output;
+#endif
+}
+
+TEST_F(Test1CliPhase01, FsPromisesCoreFileOpsReturnPromises) {
+#if defined(_WIN32)
+  GTEST_SKIP() << "fs.promises core file ops subprocess parity check is POSIX-only";
+#else
+  const auto ubi_path = ResolveBuiltUbiBinary();
+  ASSERT_FALSE(ubi_path.empty()) << "Failed to resolve built ubi binary";
+
+  const std::string script_path = WriteTempScript(
+      "ubi_phase01_cli_fs_promises_core_ops",
+      "const fs = require('fs/promises');\n"
+      "const path = require('path');\n"
+      "const os = require('os');\n"
+      "process.on('unhandledRejection', (err) => {\n"
+      "  console.error('unhandledRejection', err && err.stack || err);\n"
+      "  process.exitCode = 1;\n"
+      "});\n"
+      "(async () => {\n"
+      "  const root = path.join(os.tmpdir(), 'ubi-fs-promises-core-' + process.pid);\n"
+      "  await fs.mkdir(root, { recursive: true });\n"
+      "  const a = path.join(root, 'a.txt');\n"
+      "  const b = path.join(root, 'b.txt');\n"
+      "  const c = path.join(root, 'c.txt');\n"
+      "  const link = path.join(root, 'link.txt');\n"
+      "  await fs.writeFile(a, 'alpha');\n"
+      "  await fs.rename(a, b);\n"
+      "  await fs.copyFile(b, c);\n"
+      "  await fs.symlink(c, link);\n"
+      "  const linkTarget = await fs.readlink(link, 'utf8');\n"
+      "  console.log('ops:' + [path.basename(b), path.basename(c), path.basename(linkTarget)].join(','));\n"
+      "})().catch((err) => {\n"
+      "  console.error(err && err.stack || err);\n"
+      "  process.exitCode = 1;\n"
+      "});\n");
+
+  const CommandResult result =
+      RunBuiltBinaryAndCapture(ubi_path, {script_path}, "ubi_phase01_cli_fs_promises_core_ops_run");
+
+  RemoveTempScript(script_path);
+
+  ASSERT_NE(result.status, -1);
+  ASSERT_TRUE(WIFEXITED(result.status)) << "status=" << result.status;
+  EXPECT_EQ(WEXITSTATUS(result.status), 0) << "stderr=" << result.stderr_output;
+  EXPECT_TRUE(result.stderr_output.empty()) << "stderr=" << result.stderr_output;
+  EXPECT_NE(result.stdout_output.find("ops:b.txt,c.txt,c.txt"), std::string::npos) << result.stdout_output;
+#endif
+}
+
 TEST_F(Test1CliPhase01, BeforeExitCanScheduleMoreWork) {
   const std::string script_path = WriteTempScript(
       "ubi_phase01_cli_before_exit_loop",

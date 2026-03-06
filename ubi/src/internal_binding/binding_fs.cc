@@ -545,6 +545,34 @@ void CompleteReq(napi_env env, ReqKind kind, napi_value req, napi_value oncomple
   napi_call_function(env, req, oncomplete, 1, argv, &ignored);
 }
 
+napi_value CompleteVoidRawFsMethod(napi_env env,
+                                   const char* method,
+                                   ReqKind req_kind,
+                                   napi_value req,
+                                   napi_value oncomplete,
+                                   size_t argc,
+                                   napi_value* argv) {
+  napi_value out = nullptr;
+  napi_value err = nullptr;
+  if (!CallRaw(env, method, argc, argv, &out, &err)) {
+    if (req_kind == ReqKind::kPromise) return MakeRejectedPromise(env, err);
+    CompleteReq(env, req_kind, req, oncomplete, err, Undefined(env));
+    if (req_kind == ReqKind::kCallback) return Undefined(env);
+    if (err != nullptr) {
+      napi_throw(env, err);
+      return nullptr;
+    }
+    return Undefined(env);
+  }
+
+  if (req_kind == ReqKind::kPromise) return MakeResolvedPromise(env, Undefined(env));
+  if (req_kind == ReqKind::kCallback) {
+    CompleteReq(env, req_kind, req, oncomplete, nullptr, Undefined(env));
+    return Undefined(env);
+  }
+  return out != nullptr ? out : Undefined(env);
+}
+
 struct FileHandleWrap {
   napi_env env = nullptr;
   napi_ref wrapper_ref = nullptr;
@@ -1105,6 +1133,219 @@ napi_value FsMkdtemp(napi_env env, napi_callback_info info) {
   if (req_kind == ReqKind::kPromise) return MakeResolvedPromise(env, out);
   CompleteReq(env, req_kind, req, oncomplete, nullptr, out);
   return out;
+}
+
+napi_value FsMkdir(napi_env env, napi_callback_info info) {
+  size_t argc = 4;
+  napi_value argv[4] = {nullptr, nullptr, nullptr, nullptr};
+  napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+
+  napi_value req = argc >= 4 ? argv[3] : nullptr;
+  napi_value oncomplete = nullptr;
+  ReqKind req_kind = ParseReq(env, req, &oncomplete);
+
+  napi_value call_argv[3] = {argc >= 1 ? argv[0] : Undefined(env),
+                             argc >= 2 ? argv[1] : Undefined(env),
+                             argc >= 3 ? argv[2] : Undefined(env)};
+  napi_value out = nullptr;
+  napi_value err = nullptr;
+  if (!CallRaw(env, "mkdir", 3, call_argv, &out, &err)) {
+    if (req_kind == ReqKind::kPromise) return MakeRejectedPromise(env, err);
+    CompleteReq(env, req_kind, req, oncomplete, err, Undefined(env));
+    if (req_kind == ReqKind::kCallback) return Undefined(env);
+    if (err != nullptr) {
+      napi_throw(env, err);
+      return nullptr;
+    }
+    return Undefined(env);
+  }
+
+  if (req_kind == ReqKind::kPromise) return MakeResolvedPromise(env, out != nullptr ? out : Undefined(env));
+  if (req_kind == ReqKind::kCallback) {
+    CompleteReq(env, req_kind, req, oncomplete, nullptr, out != nullptr ? out : Undefined(env));
+    return Undefined(env);
+  }
+  return out != nullptr ? out : Undefined(env);
+}
+
+napi_value FsRename(napi_env env, napi_callback_info info) {
+  size_t argc = 3;
+  napi_value argv[3] = {nullptr, nullptr, nullptr};
+  napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+  napi_value req = argc >= 3 ? argv[2] : nullptr;
+  napi_value oncomplete = nullptr;
+  ReqKind req_kind = ParseReq(env, req, &oncomplete);
+  napi_value call_argv[2] = {argc >= 1 ? argv[0] : Undefined(env), argc >= 2 ? argv[1] : Undefined(env)};
+  return CompleteVoidRawFsMethod(env, "rename", req_kind, req, oncomplete, 2, call_argv);
+}
+
+napi_value FsCopyFile(napi_env env, napi_callback_info info) {
+  size_t argc = 4;
+  napi_value argv[4] = {nullptr, nullptr, nullptr, nullptr};
+  napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+  napi_value req = argc >= 4 ? argv[3] : nullptr;
+  napi_value oncomplete = nullptr;
+  ReqKind req_kind = ParseReq(env, req, &oncomplete);
+  napi_value call_argv[3] = {argc >= 1 ? argv[0] : Undefined(env),
+                             argc >= 2 ? argv[1] : Undefined(env),
+                             argc >= 3 ? argv[2] : Undefined(env)};
+  return CompleteVoidRawFsMethod(env, "copyFile", req_kind, req, oncomplete, 3, call_argv);
+}
+
+napi_value FsReadlink(napi_env env, napi_callback_info info) {
+  size_t argc = 3;
+  napi_value argv[3] = {nullptr, nullptr, nullptr};
+  napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+
+  napi_value req = argc >= 3 ? argv[2] : nullptr;
+  napi_value oncomplete = nullptr;
+  ReqKind req_kind = ParseReq(env, req, &oncomplete);
+
+  std::string encoding = "utf8";
+  if (argc >= 2 && argv[1] != nullptr) ValueToUtf8(env, argv[1], &encoding);
+
+  napi_value call_argv[1] = {argc >= 1 ? argv[0] : Undefined(env)};
+  napi_value raw_out = nullptr;
+  napi_value err = nullptr;
+  if (!CallRaw(env, "readlink", 1, call_argv, &raw_out, &err)) {
+    if (req_kind == ReqKind::kPromise) return MakeRejectedPromise(env, err);
+    CompleteReq(env, req_kind, req, oncomplete, err, Undefined(env));
+    if (req_kind == ReqKind::kCallback) return Undefined(env);
+    if (err != nullptr) {
+      napi_throw(env, err);
+      return nullptr;
+    }
+    return Undefined(env);
+  }
+
+  napi_value out = raw_out;
+  if (encoding == "buffer") out = BufferFromValue(env, raw_out, nullptr);
+  if (out == nullptr || IsUndefined(env, out)) out = raw_out;
+
+  if (req_kind == ReqKind::kPromise) return MakeResolvedPromise(env, out);
+  if (req_kind == ReqKind::kCallback) {
+    CompleteReq(env, req_kind, req, oncomplete, nullptr, out);
+    return Undefined(env);
+  }
+  return out != nullptr ? out : Undefined(env);
+}
+
+napi_value FsSymlink(napi_env env, napi_callback_info info) {
+  size_t argc = 4;
+  napi_value argv[4] = {nullptr, nullptr, nullptr, nullptr};
+  napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+  napi_value req = argc >= 4 ? argv[3] : nullptr;
+  napi_value oncomplete = nullptr;
+  ReqKind req_kind = ParseReq(env, req, &oncomplete);
+  napi_value call_argv[3] = {argc >= 1 ? argv[0] : Undefined(env),
+                             argc >= 2 ? argv[1] : Undefined(env),
+                             argc >= 3 ? argv[2] : Undefined(env)};
+  return CompleteVoidRawFsMethod(env, "symlink", req_kind, req, oncomplete, 3, call_argv);
+}
+
+napi_value FsUnlink(napi_env env, napi_callback_info info) {
+  size_t argc = 2;
+  napi_value argv[2] = {nullptr, nullptr};
+  napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+  napi_value req = argc >= 2 ? argv[1] : nullptr;
+  napi_value oncomplete = nullptr;
+  ReqKind req_kind = ParseReq(env, req, &oncomplete);
+  napi_value call_argv[1] = {argc >= 1 ? argv[0] : Undefined(env)};
+  return CompleteVoidRawFsMethod(env, "unlink", req_kind, req, oncomplete, 1, call_argv);
+}
+
+napi_value FsRmdir(napi_env env, napi_callback_info info) {
+  size_t argc = 2;
+  napi_value argv[2] = {nullptr, nullptr};
+  napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+  napi_value req = argc >= 2 ? argv[1] : nullptr;
+  napi_value oncomplete = nullptr;
+  ReqKind req_kind = ParseReq(env, req, &oncomplete);
+  napi_value call_argv[1] = {argc >= 1 ? argv[0] : Undefined(env)};
+  return CompleteVoidRawFsMethod(env, "rmdir", req_kind, req, oncomplete, 1, call_argv);
+}
+
+napi_value FsFtruncate(napi_env env, napi_callback_info info) {
+  size_t argc = 3;
+  napi_value argv[3] = {nullptr, nullptr, nullptr};
+  napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+  napi_value req = argc >= 3 ? argv[2] : nullptr;
+  napi_value oncomplete = nullptr;
+  ReqKind req_kind = ParseReq(env, req, &oncomplete);
+  napi_value call_argv[2] = {argc >= 1 ? argv[0] : Undefined(env), argc >= 2 ? argv[1] : Undefined(env)};
+  return CompleteVoidRawFsMethod(env, "ftruncate", req_kind, req, oncomplete, 2, call_argv);
+}
+
+napi_value FsFsync(napi_env env, napi_callback_info info) {
+  size_t argc = 2;
+  napi_value argv[2] = {nullptr, nullptr};
+  napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+  napi_value req = argc >= 2 ? argv[1] : nullptr;
+  napi_value oncomplete = nullptr;
+  ReqKind req_kind = ParseReq(env, req, &oncomplete);
+  napi_value call_argv[1] = {argc >= 1 ? argv[0] : Undefined(env)};
+  return CompleteVoidRawFsMethod(env, "fsync", req_kind, req, oncomplete, 1, call_argv);
+}
+
+napi_value FsChmod(napi_env env, napi_callback_info info) {
+  size_t argc = 3;
+  napi_value argv[3] = {nullptr, nullptr, nullptr};
+  napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+  napi_value req = argc >= 3 ? argv[2] : nullptr;
+  napi_value oncomplete = nullptr;
+  ReqKind req_kind = ParseReq(env, req, &oncomplete);
+  napi_value call_argv[2] = {argc >= 1 ? argv[0] : Undefined(env), argc >= 2 ? argv[1] : Undefined(env)};
+  return CompleteVoidRawFsMethod(env, "chmod", req_kind, req, oncomplete, 2, call_argv);
+}
+
+napi_value FsFchmod(napi_env env, napi_callback_info info) {
+  size_t argc = 3;
+  napi_value argv[3] = {nullptr, nullptr, nullptr};
+  napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+  napi_value req = argc >= 3 ? argv[2] : nullptr;
+  napi_value oncomplete = nullptr;
+  ReqKind req_kind = ParseReq(env, req, &oncomplete);
+  napi_value call_argv[2] = {argc >= 1 ? argv[0] : Undefined(env), argc >= 2 ? argv[1] : Undefined(env)};
+  return CompleteVoidRawFsMethod(env, "fchmod", req_kind, req, oncomplete, 2, call_argv);
+}
+
+napi_value FsUtimes(napi_env env, napi_callback_info info) {
+  size_t argc = 4;
+  napi_value argv[4] = {nullptr, nullptr, nullptr, nullptr};
+  napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+  napi_value req = argc >= 4 ? argv[3] : nullptr;
+  napi_value oncomplete = nullptr;
+  ReqKind req_kind = ParseReq(env, req, &oncomplete);
+  napi_value call_argv[3] = {argc >= 1 ? argv[0] : Undefined(env),
+                             argc >= 2 ? argv[1] : Undefined(env),
+                             argc >= 3 ? argv[2] : Undefined(env)};
+  return CompleteVoidRawFsMethod(env, "utimes", req_kind, req, oncomplete, 3, call_argv);
+}
+
+napi_value FsFutimes(napi_env env, napi_callback_info info) {
+  size_t argc = 4;
+  napi_value argv[4] = {nullptr, nullptr, nullptr, nullptr};
+  napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+  napi_value req = argc >= 4 ? argv[3] : nullptr;
+  napi_value oncomplete = nullptr;
+  ReqKind req_kind = ParseReq(env, req, &oncomplete);
+  napi_value call_argv[3] = {argc >= 1 ? argv[0] : Undefined(env),
+                             argc >= 2 ? argv[1] : Undefined(env),
+                             argc >= 3 ? argv[2] : Undefined(env)};
+  return CompleteVoidRawFsMethod(env, "futimes", req_kind, req, oncomplete, 3, call_argv);
+}
+
+napi_value FsLutimes(napi_env env, napi_callback_info info) {
+  size_t argc = 4;
+  napi_value argv[4] = {nullptr, nullptr, nullptr, nullptr};
+  napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+  napi_value req = argc >= 4 ? argv[3] : nullptr;
+  napi_value oncomplete = nullptr;
+  ReqKind req_kind = ParseReq(env, req, &oncomplete);
+  napi_value call_argv[3] = {argc >= 1 ? argv[0] : Undefined(env),
+                             argc >= 2 ? argv[1] : Undefined(env),
+                             argc >= 3 ? argv[2] : Undefined(env)};
+  return CompleteVoidRawFsMethod(env, "lutimes", req_kind, req, oncomplete, 3, call_argv);
 }
 
 napi_value FsRead(napi_env env, napi_callback_info info) {
@@ -1851,6 +2092,20 @@ napi_value ResolveFs(napi_env env, const ResolveOptions& options) {
   SetNamedMethod(env, binding, "cpSyncOverrideFile", FsCpSyncOverrideFile);
   SetNamedMethod(env, binding, "cpSyncCopyDir", FsCpSyncCopyDir);
   SetNamedMethod(env, binding, "mkdtemp", FsMkdtemp);
+  SetNamedMethod(env, binding, "mkdir", FsMkdir);
+  SetNamedMethod(env, binding, "rename", FsRename);
+  SetNamedMethod(env, binding, "copyFile", FsCopyFile);
+  SetNamedMethod(env, binding, "readlink", FsReadlink);
+  SetNamedMethod(env, binding, "symlink", FsSymlink);
+  SetNamedMethod(env, binding, "unlink", FsUnlink);
+  SetNamedMethod(env, binding, "rmdir", FsRmdir);
+  SetNamedMethod(env, binding, "ftruncate", FsFtruncate);
+  SetNamedMethod(env, binding, "fsync", FsFsync);
+  SetNamedMethod(env, binding, "chmod", FsChmod);
+  SetNamedMethod(env, binding, "fchmod", FsFchmod);
+  SetNamedMethod(env, binding, "utimes", FsUtimes);
+  SetNamedMethod(env, binding, "futimes", FsFutimes);
+  SetNamedMethod(env, binding, "lutimes", FsLutimes);
   SetNamedMethod(env, binding, "link", FsLink);
   SetNamedMethod(env, binding, "fdatasync", FsFdatasync);
   SetNamedMethod(env, binding, "chown", FsUnsupportedChown);

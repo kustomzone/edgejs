@@ -23,6 +23,11 @@ namespace internal_binding {
 
 namespace {
 
+const char* ZeroLengthByteSentinel() {
+  static const char sentinel = 0;
+  return &sentinel;
+}
+
 constexpr uint32_t kConverterFlagsFlush = 0x1;
 constexpr uint32_t kConverterFlagsFatal = 0x2;
 constexpr uint32_t kConverterFlagsIgnoreBom = 0x4;
@@ -146,8 +151,19 @@ bool ReadByteSpan(napi_env env, napi_value value, const char** data, size_t* len
     void* raw = nullptr;
     if (napi_get_arraybuffer_info(env, value, &raw, length) != napi_ok) return false;
     if (*length > 0 && raw == nullptr) return false;
-    *data = static_cast<const char*>(raw);
+    *data = raw != nullptr ? static_cast<const char*>(raw) : ZeroLengthByteSentinel();
     return true;
+  }
+
+  {
+    void* raw = nullptr;
+    size_t byte_length = 0;
+    if (napi_get_arraybuffer_info(env, value, &raw, &byte_length) == napi_ok) {
+      if (byte_length > 0 && raw == nullptr) return false;
+      *data = raw != nullptr ? static_cast<const char*>(raw) : ZeroLengthByteSentinel();
+      *length = byte_length;
+      return true;
+    }
   }
 
   return false;

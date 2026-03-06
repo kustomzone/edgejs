@@ -57,6 +57,16 @@ NAPI_EXTERN napi_status unofficial_napi_get_constructor_name(napi_env env,
                                                              napi_value value,
                                                              napi_value* name_out);
 
+// Unofficial helpers for Node's async_context_frame parity. These expose the
+// engine continuation-preserved embedder data used by AsyncContextFrame.
+NAPI_EXTERN napi_status unofficial_napi_get_continuation_preserved_embedder_data(
+    napi_env env,
+    napi_value* result_out);
+
+NAPI_EXTERN napi_status unofficial_napi_set_continuation_preserved_embedder_data(
+    napi_env env,
+    napi_value value);
+
 // Unofficial helper. Refreshes V8 date/timezone configuration after TZ changes.
 NAPI_EXTERN napi_status unofficial_napi_notify_datetime_configuration_change(napi_env env);
 

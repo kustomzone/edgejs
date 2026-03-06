@@ -1255,7 +1255,6 @@ static napi_value OptionsGetCLIOptionsValuesCallback(napi_env env, napi_callback
 
   const std::vector<const char*> bool_false = {
       "--abort-on-uncaught-exception",
-      "--async-context-frame",
       "--enable-source-maps",
       "--entry-url",
       "--experimental-addon-modules",
@@ -1329,7 +1328,11 @@ static napi_value OptionsGetCLIOptionsValuesCallback(napi_env env, napi_callback
       "--watch-preserve-output",
       "[has_eval_string]",
   };
-  const std::vector<const char*> bool_true = {"--network-family-autoselection", "--warnings"};
+  const std::vector<const char*> bool_true = {
+      "--async-context-frame",
+      "--network-family-autoselection",
+      "--warnings",
+  };
   const std::vector<std::pair<const char*, const char*>> string_defaults = {
       {"--diagnostic-dir", ""},
       {"--dns-result-order", "verbatim"},

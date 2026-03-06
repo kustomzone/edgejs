@@ -860,6 +860,27 @@ napi_status NAPI_CDECL unofficial_napi_get_constructor_name(napi_env env,
   return *name_out == nullptr ? napi_generic_failure : napi_ok;
 }
 
+napi_status NAPI_CDECL unofficial_napi_get_continuation_preserved_embedder_data(
+    napi_env env,
+    napi_value* result_out) {
+  if (env == nullptr || env->isolate == nullptr || result_out == nullptr) return napi_invalid_arg;
+  v8::Local<v8::Value> value = env->isolate->GetContinuationPreservedEmbedderData();
+  if (value.IsEmpty()) value = v8::Undefined(env->isolate);
+  *result_out = napi_v8_wrap_value(env, value);
+  return *result_out == nullptr ? napi_generic_failure : napi_ok;
+}
+
+napi_status NAPI_CDECL unofficial_napi_set_continuation_preserved_embedder_data(
+    napi_env env,
+    napi_value value) {
+  if (env == nullptr || env->isolate == nullptr) return napi_invalid_arg;
+  v8::Local<v8::Value> raw =
+      value != nullptr ? napi_v8_unwrap_value(value) : v8::Local<v8::Value>();
+  if (raw.IsEmpty()) raw = v8::Undefined(env->isolate);
+  env->isolate->SetContinuationPreservedEmbedderData(raw);
+  return napi_ok;
+}
+
 napi_status NAPI_CDECL unofficial_napi_notify_datetime_configuration_change(napi_env env) {
   if (env == nullptr || env->isolate == nullptr) return napi_invalid_arg;
 #if defined(__POSIX__)

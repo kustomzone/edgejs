@@ -11,14 +11,20 @@ namespace internal_binding {
 
 namespace {
 
+const uint8_t* ZeroLengthByteSentinel() {
+  static const uint8_t sentinel = 0;
+  return &sentinel;
+}
+
 bool ReadByteSpan(napi_env env, napi_value value, const uint8_t** data, size_t* length) {
   if (value == nullptr || data == nullptr || length == nullptr) return false;
 
   bool is_buffer = false;
   if (napi_is_buffer(env, value, &is_buffer) == napi_ok && is_buffer) {
     void* raw = nullptr;
-    if (napi_get_buffer_info(env, value, &raw, length) != napi_ok || raw == nullptr) return false;
-    *data = static_cast<const uint8_t*>(raw);
+    if (napi_get_buffer_info(env, value, &raw, length) != napi_ok) return false;
+    if (raw == nullptr && *length != 0) return false;
+    *data = raw != nullptr ? static_cast<const uint8_t*>(raw) : ZeroLengthByteSentinel();
     return true;
   }
 
@@ -35,20 +41,53 @@ bool ReadByteSpan(napi_env env, napi_value value, const uint8_t** data, size_t* 
                                  &ta_length,
                                  &ta_data,
                                  &arraybuffer,
-                                 &byte_offset) != napi_ok ||
-        ta_data == nullptr) {
+                                 &byte_offset) != napi_ok) {
       return false;
     }
-    *data = static_cast<const uint8_t*>(ta_data);
-    *length = ta_length;
+    size_t element_size = 1;
+    switch (ta_type) {
+      case napi_int16_array:
+      case napi_uint16_array:
+      case napi_float16_array:
+        element_size = 2;
+        break;
+      case napi_int32_array:
+      case napi_uint32_array:
+      case napi_float32_array:
+        element_size = 4;
+        break;
+      case napi_float64_array:
+      case napi_bigint64_array:
+      case napi_biguint64_array:
+        element_size = 8;
+        break;
+      default:
+        element_size = 1;
+        break;
+    }
+    *length = ta_length * element_size;
+    if (ta_data == nullptr && *length != 0) return false;
+    *data = ta_data != nullptr ? static_cast<const uint8_t*>(ta_data) : ZeroLengthByteSentinel();
     return true;
+  }
+
+  {
+    void* raw = nullptr;
+    size_t byte_length = 0;
+    if (napi_get_arraybuffer_info(env, value, &raw, &byte_length) == napi_ok) {
+      if (raw == nullptr && byte_length != 0) return false;
+      *data = raw != nullptr ? static_cast<const uint8_t*>(raw) : ZeroLengthByteSentinel();
+      *length = byte_length;
+      return true;
+    }
   }
 
   bool is_arraybuffer = false;
   if (napi_is_arraybuffer(env, value, &is_arraybuffer) == napi_ok && is_arraybuffer) {
     void* raw = nullptr;
-    if (napi_get_arraybuffer_info(env, value, &raw, length) != napi_ok || raw == nullptr) return false;
-    *data = static_cast<const uint8_t*>(raw);
+    if (napi_get_arraybuffer_info(env, value, &raw, length) != napi_ok) return false;
+    if (raw == nullptr && *length != 0) return false;
+    *data = raw != nullptr ? static_cast<const uint8_t*>(raw) : ZeroLengthByteSentinel();
     return true;
   }
 

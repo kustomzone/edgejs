@@ -3,33 +3,32 @@
 #include <unordered_map>
 
 #include "internal_binding/helpers.h"
+#include "unofficial_napi.h"
 
 namespace internal_binding {
 
 namespace {
 
-struct AsyncContextFrameState {
+struct AsyncContextFrameBindingState {
   napi_ref binding_ref = nullptr;
-  napi_ref continuation_frame_ref = nullptr;
 };
 
-std::unordered_map<napi_env, AsyncContextFrameState> g_async_context_frame_states;
+std::unordered_map<napi_env, AsyncContextFrameBindingState> g_async_context_frame_states;
+std::unordered_map<napi_env, bool> g_async_context_frame_cleanup_installed;
 
-AsyncContextFrameState& GetState(napi_env env) {
+AsyncContextFrameBindingState& GetState(napi_env env) {
   return g_async_context_frame_states[env];
-}
-
-void ReleaseFrameRef(napi_env env, AsyncContextFrameState* state) {
-  if (env == nullptr || state == nullptr || state->continuation_frame_ref == nullptr) return;
-  napi_delete_reference(env, state->continuation_frame_ref);
-  state->continuation_frame_ref = nullptr;
 }
 
 void OnAsyncContextFrameEnvCleanup(void* arg) {
   napi_env env = static_cast<napi_env>(arg);
+  auto installed_it = g_async_context_frame_cleanup_installed.find(env);
+  if (installed_it != g_async_context_frame_cleanup_installed.end()) {
+    g_async_context_frame_cleanup_installed.erase(installed_it);
+  }
+
   auto it = g_async_context_frame_states.find(env);
   if (it == g_async_context_frame_states.end()) return;
-  ReleaseFrameRef(env, &it->second);
   if (it->second.binding_ref != nullptr) {
     napi_delete_reference(env, it->second.binding_ref);
     it->second.binding_ref = nullptr;
@@ -38,19 +37,17 @@ void OnAsyncContextFrameEnvCleanup(void* arg) {
 }
 
 void EnsureAsyncContextFrameCleanupHook(napi_env env) {
-  static std::unordered_map<napi_env, bool> installed;
-  if (installed[env]) return;
+  if (g_async_context_frame_cleanup_installed[env]) return;
   if (napi_add_env_cleanup_hook(env, OnAsyncContextFrameEnvCleanup, env) == napi_ok) {
-    installed[env] = true;
+    g_async_context_frame_cleanup_installed[env] = true;
   }
 }
 
 napi_value GetContinuationPreservedEmbedderData(napi_env env, napi_callback_info info) {
   (void)info;
-  AsyncContextFrameState& state = GetState(env);
-  if (state.continuation_frame_ref == nullptr) return Undefined(env);
   napi_value value = nullptr;
-  if (napi_get_reference_value(env, state.continuation_frame_ref, &value) != napi_ok || value == nullptr) {
+  if (unofficial_napi_get_continuation_preserved_embedder_data(env, &value) != napi_ok ||
+      value == nullptr) {
     return Undefined(env);
   }
   return value;
@@ -61,12 +58,11 @@ napi_value SetContinuationPreservedEmbedderData(napi_env env, napi_callback_info
   napi_value argv[1] = {nullptr};
   napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
 
-  AsyncContextFrameState& state = GetState(env);
-  ReleaseFrameRef(env, &state);
-
-  if (argc >= 1 && argv[0] != nullptr && !IsUndefined(env, argv[0])) {
-    napi_create_reference(env, argv[0], 1, &state.continuation_frame_ref);
+  napi_value value = Undefined(env);
+  if (argc >= 1 && argv[0] != nullptr) {
+    value = argv[0];
   }
+  (void)unofficial_napi_set_continuation_preserved_embedder_data(env, value);
   return Undefined(env);
 }
 
@@ -75,7 +71,7 @@ napi_value SetContinuationPreservedEmbedderData(napi_env env, napi_callback_info
 napi_value ResolveAsyncContextFrame(napi_env env, const ResolveOptions& options) {
   (void)options;
   EnsureAsyncContextFrameCleanupHook(env);
-  AsyncContextFrameState& state = GetState(env);
+  AsyncContextFrameBindingState& state = GetState(env);
   if (state.binding_ref != nullptr) {
     napi_value cached = nullptr;
     if (napi_get_reference_value(env, state.binding_ref, &cached) == napi_ok && cached != nullptr) {
