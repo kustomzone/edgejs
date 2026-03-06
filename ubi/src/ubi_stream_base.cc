@@ -219,6 +219,13 @@ void SetPropertyIfPresent(napi_env env, napi_value obj, napi_value key, napi_val
   napi_set_property(env, obj, key, value);
 }
 
+napi_value GetNamedPropertyValue(napi_env env, napi_value obj, const char* key) {
+  if (env == nullptr || obj == nullptr || key == nullptr) return nullptr;
+  napi_value value = nullptr;
+  if (napi_get_named_property(env, obj, key, &value) != napi_ok) return nullptr;
+  return value;
+}
+
 bool UpdateUserReadBuffer(UbiStreamBase* base, napi_value value) {
   if (base == nullptr || base->env == nullptr || value == nullptr) return false;
 
@@ -291,7 +298,8 @@ bool CallJsOnRead(UbiStreamBase* base,
   napi_value argv[1] = {arraybuffer != nullptr ? arraybuffer : UbiStreamBaseUndefined(base->env)};
   napi_value ignored = nullptr;
   napi_value* out = result != nullptr ? result : &ignored;
-  if (UbiMakeCallback(base->env, self, callback, 1, argv, out) != napi_ok) {
+  if (UbiAsyncWrapMakeCallback(
+          base->env, base->async_id, self, self, callback, 1, argv, out, kUbiMakeCallbackNone) != napi_ok) {
     *out = nullptr;
   }
   (void)UbiHandlePendingExceptionNow(base->env, nullptr);
@@ -410,7 +418,8 @@ void MaybeCallHandleOnClose(UbiStreamBase* base) {
   }
 
   napi_value ignored = nullptr;
-  UbiMakeCallback(base->env, self, callback, 0, nullptr, &ignored);
+  UbiAsyncWrapMakeCallback(
+      base->env, base->async_id, self, self, callback, 0, nullptr, &ignored, kUbiMakeCallbackNone);
   napi_value undefined = UbiStreamBaseUndefined(base->env);
   SetPropertyIfPresent(base->env, self, symbol, undefined);
 }
@@ -447,8 +456,13 @@ void OnWriteDone(uv_write_t* req, int status) {
   auto* wr = static_cast<LibuvWriteReq*>(req->data);
   if (wr == nullptr) return;
   napi_value req_obj = GetRefValue(wr->env, wr->req_obj_ref);
-  napi_value argv[1] = {UbiStreamBaseMakeInt32(wr->env, status)};
-  UbiStreamBaseInvokeReqOnComplete(wr->env, req_obj, status, argv, 1);
+  napi_value stream_obj = wr->base != nullptr ? UbiStreamBaseGetWrapper(wr->base) : nullptr;
+  napi_value argv[3] = {
+      UbiStreamBaseMakeInt32(wr->env, status),
+      stream_obj != nullptr ? stream_obj : UbiStreamBaseUndefined(wr->env),
+      status < 0 ? GetNamedPropertyValue(wr->env, req_obj, "error") : UbiStreamBaseUndefined(wr->env),
+  };
+  UbiStreamBaseInvokeReqOnComplete(wr->env, req_obj, status, argv, 3);
   FreeWriteReq(wr);
 }
 
@@ -456,8 +470,13 @@ void OnShutdownDone(uv_shutdown_t* req, int status) {
   auto* sr = static_cast<LibuvShutdownReq*>(req->data);
   if (sr == nullptr) return;
   napi_value req_obj = GetRefValue(sr->env, sr->req_obj_ref);
-  napi_value argv[1] = {UbiStreamBaseMakeInt32(sr->env, status)};
-  UbiStreamBaseInvokeReqOnComplete(sr->env, req_obj, status, argv, 1);
+  napi_value stream_obj = sr->base != nullptr ? UbiStreamBaseGetWrapper(sr->base) : nullptr;
+  napi_value argv[3] = {
+      UbiStreamBaseMakeInt32(sr->env, status),
+      stream_obj != nullptr ? stream_obj : UbiStreamBaseUndefined(sr->env),
+      status < 0 ? GetNamedPropertyValue(sr->env, req_obj, "error") : UbiStreamBaseUndefined(sr->env),
+  };
+  UbiStreamBaseInvokeReqOnComplete(sr->env, req_obj, status, argv, 3);
   DeleteRefIfPresent(sr->env, &sr->req_obj_ref);
   delete sr;
 }
@@ -488,15 +507,22 @@ void UbiStreamBaseInit(UbiStreamBase* base,
 void UbiStreamBaseSetWrapperRef(UbiStreamBase* base, napi_ref wrapper_ref) {
   if (base == nullptr) return;
   base->wrapper_ref = wrapper_ref;
-  if (base->env == nullptr || wrapper_ref == nullptr || base->active_handle_token != nullptr) return;
+  if (base->env == nullptr || wrapper_ref == nullptr) return;
   napi_value owner = UbiStreamBaseGetWrapper(base);
   if (owner == nullptr) return;
-  base->active_handle_token = UbiRegisterActiveHandle(base->env,
-                                                      owner,
-                                                      ActiveResourceNameForProvider(base->provider_type),
-                                                      StreamBaseHasRefForTracking,
-                                                      StreamBaseGetActiveOwner,
-                                                      base);
+  if (base->active_handle_token == nullptr) {
+    base->active_handle_token = UbiRegisterActiveHandle(base->env,
+                                                        owner,
+                                                        ActiveResourceNameForProvider(base->provider_type),
+                                                        StreamBaseHasRefForTracking,
+                                                        StreamBaseGetActiveOwner,
+                                                        base);
+  }
+  if (!base->async_init_emitted && base->async_id > 0) {
+    UbiAsyncWrapEmitInit(
+        base->env, base->async_id, base->provider_type, UbiAsyncWrapExecutionAsyncId(base->env), owner);
+    base->async_init_emitted = true;
+  }
 }
 
 napi_value UbiStreamBaseGetWrapper(UbiStreamBase* base) {
@@ -758,6 +784,13 @@ napi_value UbiStreamBaseGetProviderType(UbiStreamBase* base) {
 napi_value UbiStreamBaseAsyncReset(UbiStreamBase* base) {
   if (base == nullptr || base->env == nullptr) return nullptr;
   UbiAsyncWrapReset(base->env, &base->async_id);
+  base->async_init_emitted = false;
+  napi_value self = UbiStreamBaseGetWrapper(base);
+  if (self != nullptr && base->async_id > 0) {
+    UbiAsyncWrapEmitInit(
+        base->env, base->async_id, base->provider_type, UbiAsyncWrapExecutionAsyncId(base->env), self);
+    base->async_init_emitted = true;
+  }
   return UbiStreamBaseUndefined(base->env);
 }
 
@@ -833,6 +866,7 @@ void UbiStreamBaseInvokeReqOnComplete(napi_env env,
   napi_value oncomplete = nullptr;
   if (napi_get_named_property(env, req_obj, "oncomplete", &oncomplete) != napi_ok ||
       !IsFunction(env, oncomplete)) {
+    UbiStreamReqMarkDone(env, req_obj);
     return;
   }
 
@@ -843,7 +877,16 @@ void UbiStreamBaseInvokeReqOnComplete(napi_env env,
   }
 
   napi_value ignored = nullptr;
-  UbiMakeCallback(env, req_obj, oncomplete, argc, argv, &ignored);
+  UbiAsyncWrapMakeCallback(env,
+                           UbiStreamReqGetAsyncId(env, req_obj),
+                           req_obj,
+                           req_obj,
+                           oncomplete,
+                           argc,
+                           argv,
+                           &ignored,
+                           kUbiMakeCallbackNone);
+  UbiStreamReqMarkDone(env, req_obj);
 }
 
 size_t UbiTypedArrayElementSize(napi_typedarray_type type) {
@@ -1010,6 +1053,8 @@ napi_value UbiLibuvStreamWriteBuffer(UbiStreamBase* base,
     return UbiStreamBaseMakeInt32(base->env, 0);
   }
 
+  UbiStreamReqActivate(base->env, req_obj, kUbiProviderWriteWrap, base->async_id);
+
   auto* wr = new LibuvWriteReq();
   wr->env = base->env;
   wr->base = base;
@@ -1060,6 +1105,7 @@ napi_value UbiLibuvStreamWriteBuffer(UbiStreamBase* base,
   if (rc != 0) {
     SetStreamState(kUbiLastWriteWasAsync, 0);
     UbiStreamBaseSetReqError(base->env, req_obj, rc);
+    UbiStreamReqMarkDone(base->env, req_obj);
     FreeWriteReq(wr);
   }
   return UbiStreamBaseMakeInt32(base->env, rc);
@@ -1204,6 +1250,8 @@ napi_value UbiLibuvStreamWriteV(UbiStreamBase* base,
     return UbiStreamBaseMakeInt32(base->env, 0);
   }
 
+  UbiStreamReqActivate(base->env, req_obj, kUbiProviderWriteWrap, base->async_id);
+
   if (send_handle != nullptr && send_handle_obj != nullptr) {
     napi_create_reference(base->env, send_handle_obj, 1, &wr->send_handle_ref);
   }
@@ -1221,6 +1269,7 @@ napi_value UbiLibuvStreamWriteV(UbiStreamBase* base,
   if (rc != 0) {
     SetStreamState(kUbiLastWriteWasAsync, 0);
     UbiStreamBaseSetReqError(base->env, req_obj, rc);
+    UbiStreamReqMarkDone(base->env, req_obj);
     FreeWriteReq(wr);
   }
   return UbiStreamBaseMakeInt32(base->env, rc);
@@ -1234,12 +1283,14 @@ napi_value UbiLibuvStreamShutdown(UbiStreamBase* base, napi_value req_obj) {
   auto* sr = new LibuvShutdownReq();
   sr->env = base->env;
   sr->base = base;
+  UbiStreamReqActivate(base->env, req_obj, kUbiProviderShutdownWrap, base->async_id);
   napi_create_reference(base->env, req_obj, 1, &sr->req_obj_ref);
   sr->req.data = sr;
 
   int rc = uv_shutdown(&sr->req, base->ops->get_stream(base), OnShutdownDone);
   if (rc != 0) {
     UbiStreamBaseSetReqError(base->env, req_obj, rc);
+    UbiStreamReqMarkDone(base->env, req_obj);
     DeleteRefIfPresent(base->env, &sr->req_obj_ref);
     delete sr;
   }

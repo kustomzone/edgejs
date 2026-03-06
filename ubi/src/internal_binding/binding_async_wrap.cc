@@ -1,4 +1,5 @@
 #include "internal_binding/dispatch.h"
+#include "internal_binding/binding_async_wrap.h"
 
 #include <array>
 #include <cstdint>
@@ -492,6 +493,18 @@ napi_value CreateProviders(napi_env env) {
 }
 
 }  // namespace
+
+napi_value AsyncWrapGetHooksObject(napi_env env) {
+  AsyncWrapState* state = GetState(env);
+  if (state == nullptr) return nullptr;
+  return GetRefValue(env, state->hooks_ref);
+}
+
+napi_value AsyncWrapGetCallbackTrampoline(napi_env env) {
+  AsyncWrapState* state = GetState(env);
+  if (state == nullptr) return nullptr;
+  return GetRefValue(env, state->callback_trampoline_ref);
+}
 
 napi_value ResolveAsyncWrap(napi_env env, const ResolveOptions& /*options*/) {
   auto& state = g_async_wrap_states[env];

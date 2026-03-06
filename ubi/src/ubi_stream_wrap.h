@@ -1,6 +1,8 @@
 #ifndef UBI_STREAM_WRAP_H_
 #define UBI_STREAM_WRAP_H_
 
+#include <cstdint>
+
 #include "node_api.h"
 
 enum UbiStreamStateIndex : int {
@@ -13,5 +15,13 @@ enum UbiStreamStateIndex : int {
 
 napi_value UbiInstallStreamWrapBinding(napi_env env);
 int32_t* UbiGetStreamBaseState();
+
+int64_t UbiStreamReqGetAsyncId(napi_env env, napi_value req_obj);
+int32_t UbiStreamReqGetProviderType(napi_env env, napi_value req_obj);
+void UbiStreamReqActivate(napi_env env,
+                          napi_value req_obj,
+                          int32_t provider_type,
+                          int64_t trigger_async_id);
+void UbiStreamReqMarkDone(napi_env env, napi_value req_obj);
 
 #endif  // UBI_STREAM_WRAP_H_

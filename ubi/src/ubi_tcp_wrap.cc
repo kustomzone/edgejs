@@ -319,7 +319,15 @@ void OnConnection(uv_stream_t* server, int status) {
   }
 
   napi_value ignored = nullptr;
-  UbiMakeCallback(env, server_obj, onconnection, 2, argv, &ignored);
+  UbiAsyncWrapMakeCallback(env,
+                           server_wrap->base.async_id,
+                           server_obj,
+                           server_obj,
+                           onconnection,
+                           2,
+                           argv,
+                           &ignored,
+                           kUbiMakeCallbackNone);
 }
 
 napi_value TcpListen(napi_env env, napi_callback_info info) {

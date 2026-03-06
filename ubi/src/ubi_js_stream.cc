@@ -77,6 +77,7 @@ std::string ValueToUtf8(napi_env env, napi_value value) {
 
 int32_t CallMethodReturningInt32(napi_env env,
                                  napi_value self,
+                                 int64_t async_id,
                                  const char* method_name,
                                  size_t argc,
                                  napi_value* argv,
@@ -87,7 +88,8 @@ int32_t CallMethodReturningInt32(napi_env env,
     return fallback;
   }
   napi_value result = nullptr;
-  if (UbiMakeCallback(env, self, fn, argc, argv, &result) != napi_ok || result == nullptr) {
+  if (UbiAsyncWrapMakeCallback(env, async_id, self, self, fn, argc, argv, &result, kUbiMakeCallbackNone) != napi_ok ||
+      result == nullptr) {
     return fallback;
   }
   int32_t out = fallback;
@@ -98,12 +100,31 @@ int32_t CallMethodReturningInt32(napi_env env,
 void FinishReq(napi_env env, napi_value req_obj, int32_t status) {
   if (env == nullptr || req_obj == nullptr) return;
   napi_value oncomplete = nullptr;
+  napi_value handle = nullptr;
+  napi_get_named_property(env, req_obj, "handle", &handle);
+  napi_value error = nullptr;
+  if (status < 0) napi_get_named_property(env, req_obj, "error", &error);
+  napi_value argv[3] = {
+      UbiStreamBaseMakeInt32(env, status),
+      handle != nullptr ? handle : UbiStreamBaseUndefined(env),
+      error != nullptr ? error : UbiStreamBaseUndefined(env),
+  };
   if (napi_get_named_property(env, req_obj, "oncomplete", &oncomplete) != napi_ok || !IsFunction(env, oncomplete)) {
+    UbiStreamReqMarkDone(env, req_obj);
     return;
   }
-  napi_value argv[1] = {UbiStreamBaseMakeInt32(env, status)};
   napi_value ignored = nullptr;
-  UbiMakeCallback(env, req_obj, oncomplete, 1, argv, &ignored);
+  UbiAsyncWrapMakeCallback(
+      env,
+      UbiStreamReqGetAsyncId(env, req_obj),
+      req_obj,
+      req_obj,
+      oncomplete,
+      3,
+      argv,
+      &ignored,
+      kUbiMakeCallbackNone);
+  UbiStreamReqMarkDone(env, req_obj);
 }
 
 napi_value BuildWriteArray(napi_env env, const std::vector<std::vector<uint8_t>>& chunks) {
@@ -138,13 +159,16 @@ napi_value CallOnWrite(napi_env env,
   }
 
   napi_value argv[2] = {req_obj != nullptr ? req_obj : UbiStreamBaseUndefined(env), array};
-  int32_t status = CallMethodReturningInt32(env, self, "onwrite", 2, argv, UV_EPROTO);
+  int32_t status = CallMethodReturningInt32(env, self, wrap->base.async_id, "onwrite", 2, argv, UV_EPROTO);
   int32_t* state = UbiGetStreamBaseState();
   if (state != nullptr) {
     state[kUbiBytesWritten] = static_cast<int32_t>(status == 0 ? total_bytes : 0);
     state[kUbiLastWriteWasAsync] = status == 0 ? 1 : 0;
   }
-  if (status == 0) wrap->base.bytes_written += total_bytes;
+  if (status == 0) {
+    wrap->base.bytes_written += total_bytes;
+    UbiStreamReqActivate(env, req_obj, kUbiProviderWriteWrap, wrap->base.async_id);
+  }
   return UbiStreamBaseMakeInt32(env, status);
 }
 
@@ -173,7 +197,7 @@ napi_value JsStreamReadStart(napi_env env, napi_callback_info info) {
   if (!GetThisAndWrap(env, info, nullptr, nullptr, &self, &wrap) || self == nullptr) {
     return UbiStreamBaseMakeInt32(env, UV_EBADF);
   }
-  int32_t status = CallMethodReturningInt32(env, self, "onreadstart", 0, nullptr, UV_EPROTO);
+  int32_t status = CallMethodReturningInt32(env, self, wrap->base.async_id, "onreadstart", 0, nullptr, UV_EPROTO);
   UbiStreamBaseSetReading(&wrap->base, status == 0);
   return UbiStreamBaseMakeInt32(env, status);
 }
@@ -184,7 +208,7 @@ napi_value JsStreamReadStop(napi_env env, napi_callback_info info) {
   if (!GetThisAndWrap(env, info, nullptr, nullptr, &self, &wrap) || self == nullptr) {
     return UbiStreamBaseMakeInt32(env, UV_EBADF);
   }
-  int32_t status = CallMethodReturningInt32(env, self, "onreadstop", 0, nullptr, UV_EPROTO);
+  int32_t status = CallMethodReturningInt32(env, self, wrap->base.async_id, "onreadstop", 0, nullptr, UV_EPROTO);
   UbiStreamBaseSetReading(&wrap->base, false);
   return UbiStreamBaseMakeInt32(env, status);
 }
@@ -198,7 +222,10 @@ napi_value JsStreamShutdown(napi_env env, napi_callback_info info) {
     return UbiStreamBaseMakeInt32(env, UV_EINVAL);
   }
   napi_value cb_argv[1] = {argv[0]};
-  int32_t status = CallMethodReturningInt32(env, self, "onshutdown", 1, cb_argv, UV_EPROTO);
+  int32_t status = CallMethodReturningInt32(env, self, wrap->base.async_id, "onshutdown", 1, cb_argv, UV_EPROTO);
+  if (status == 0) {
+    UbiStreamReqActivate(env, argv[0], kUbiProviderShutdownWrap, wrap->base.async_id);
+  }
   return UbiStreamBaseMakeInt32(env, status);
 }
 

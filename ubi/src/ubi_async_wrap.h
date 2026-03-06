@@ -25,5 +25,21 @@ enum UbiAsyncProviderType : int32_t {
 int64_t UbiAsyncWrapNextId(napi_env env);
 void UbiAsyncWrapQueueDestroyId(napi_env env, int64_t async_id);
 void UbiAsyncWrapReset(napi_env env, int64_t* async_id);
+int64_t UbiAsyncWrapExecutionAsyncId(napi_env env);
+const char* UbiAsyncWrapProviderName(int32_t provider_type);
+void UbiAsyncWrapEmitInit(napi_env env,
+                          int64_t async_id,
+                          int32_t provider_type,
+                          int64_t trigger_async_id,
+                          napi_value resource);
+napi_status UbiAsyncWrapMakeCallback(napi_env env,
+                                     int64_t async_id,
+                                     napi_value resource,
+                                     napi_value recv,
+                                     napi_value callback,
+                                     size_t argc,
+                                     napi_value* argv,
+                                     napi_value* result,
+                                     int flags);
 
 #endif  // UBI_ASYNC_WRAP_H_

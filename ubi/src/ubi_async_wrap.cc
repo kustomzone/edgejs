@@ -1,9 +1,13 @@
 #include "ubi_async_wrap.h"
 
+#include <vector>
+
+#include "internal_binding/binding_async_wrap.h"
 #include <unordered_map>
 
 #include "internal_binding/helpers.h"
 #include "ubi_module_loader.h"
+#include "ubi_runtime.h"
 
 namespace {
 
@@ -160,6 +164,132 @@ int64_t UbiAsyncWrapNextId(napi_env env) {
   constexpr size_t kAsyncIdCounter = 2;
   fields[kAsyncIdCounter] += 1;
   return static_cast<int64_t>(fields[kAsyncIdCounter]);
+}
+
+int64_t UbiAsyncWrapExecutionAsyncId(napi_env env) {
+  double* fields = GetAsyncIdFields(env);
+  if (fields == nullptr) return 0;
+
+  constexpr size_t kExecutionAsyncId = 0;
+  constexpr size_t kDefaultTriggerAsyncId = 3;
+  const int64_t execution_async_id = static_cast<int64_t>(fields[kExecutionAsyncId]);
+  if (execution_async_id > 0) return execution_async_id;
+  const int64_t default_trigger_async_id = static_cast<int64_t>(fields[kDefaultTriggerAsyncId]);
+  return default_trigger_async_id > 0 ? default_trigger_async_id : 0;
+}
+
+const char* UbiAsyncWrapProviderName(int32_t provider_type) {
+  switch (provider_type) {
+    case kUbiProviderJsStream:
+      return "JSSTREAM";
+    case kUbiProviderJsUdpWrap:
+      return "JSUDPWRAP";
+    case kUbiProviderPipeConnectWrap:
+      return "PIPECONNECTWRAP";
+    case kUbiProviderPipeServerWrap:
+      return "PIPESERVERWRAP";
+    case kUbiProviderPipeWrap:
+      return "PIPEWRAP";
+    case kUbiProviderShutdownWrap:
+      return "SHUTDOWNWRAP";
+    case kUbiProviderTcpConnectWrap:
+      return "TCPCONNECTWRAP";
+    case kUbiProviderTcpServerWrap:
+      return "TCPSERVERWRAP";
+    case kUbiProviderTcpWrap:
+      return "TCPWRAP";
+    case kUbiProviderTtyWrap:
+      return "TTYWRAP";
+    case kUbiProviderUdpSendWrap:
+      return "UDPSENDWRAP";
+    case kUbiProviderUdpWrap:
+      return "UDPWRAP";
+    case kUbiProviderWriteWrap:
+      return "WRITEWRAP";
+    default:
+      return "NONE";
+  }
+}
+
+void UbiAsyncWrapEmitInit(napi_env env,
+                          int64_t async_id,
+                          int32_t provider_type,
+                          int64_t trigger_async_id,
+                          napi_value resource) {
+  if (env == nullptr || async_id <= 0) return;
+
+  napi_value hooks = internal_binding::AsyncWrapGetHooksObject(env);
+  if (hooks == nullptr) return;
+
+  napi_value init_fn = nullptr;
+  if (napi_get_named_property(env, hooks, "init", &init_fn) != napi_ok || init_fn == nullptr) {
+    return;
+  }
+
+  napi_valuetype fn_type = napi_undefined;
+  if (napi_typeof(env, init_fn, &fn_type) != napi_ok || fn_type != napi_function) return;
+
+  napi_value async_id_v = nullptr;
+  napi_value type_v = nullptr;
+  napi_value trigger_async_id_v = nullptr;
+  napi_value promise_hook_v = nullptr;
+  napi_create_int64(env, async_id, &async_id_v);
+  napi_create_string_utf8(env, UbiAsyncWrapProviderName(provider_type), NAPI_AUTO_LENGTH, &type_v);
+  napi_create_int64(env, trigger_async_id, &trigger_async_id_v);
+  napi_get_boolean(env, false, &promise_hook_v);
+  napi_value argv[5] = {
+      async_id_v,
+      type_v,
+      trigger_async_id_v,
+      resource != nullptr ? resource : internal_binding::Undefined(env),
+      promise_hook_v,
+  };
+  napi_value ignored = nullptr;
+  if (napi_call_function(env, hooks, init_fn, 5, argv, &ignored) != napi_ok) {
+    bool pending = false;
+    if (napi_is_exception_pending(env, &pending) == napi_ok && pending) {
+      napi_value ignored_error = nullptr;
+      napi_get_and_clear_last_exception(env, &ignored_error);
+    }
+  }
+}
+
+napi_status UbiAsyncWrapMakeCallback(napi_env env,
+                                     int64_t async_id,
+                                     napi_value resource,
+                                     napi_value recv,
+                                     napi_value callback,
+                                     size_t argc,
+                                     napi_value* argv,
+                                     napi_value* result,
+                                     int flags) {
+  if (env == nullptr || recv == nullptr || callback == nullptr) return napi_invalid_arg;
+  if (async_id <= 0) {
+    return UbiMakeCallbackWithFlags(env, recv, callback, argc, argv, result, flags);
+  }
+
+  napi_value trampoline = internal_binding::AsyncWrapGetCallbackTrampoline(env);
+  if (trampoline == nullptr) {
+    return UbiMakeCallbackWithFlags(env, recv, callback, argc, argv, result, flags);
+  }
+
+  napi_valuetype trampoline_type = napi_undefined;
+  if (napi_typeof(env, trampoline, &trampoline_type) != napi_ok || trampoline_type != napi_function) {
+    return UbiMakeCallbackWithFlags(env, recv, callback, argc, argv, result, flags);
+  }
+
+  napi_value async_id_v = nullptr;
+  napi_create_int64(env, async_id, &async_id_v);
+  std::vector<napi_value> trampoline_argv;
+  trampoline_argv.reserve(argc + 3);
+  trampoline_argv.push_back(async_id_v);
+  trampoline_argv.push_back(resource != nullptr ? resource : recv);
+  trampoline_argv.push_back(callback);
+  for (size_t i = 0; i < argc; ++i) {
+    trampoline_argv.push_back(argv != nullptr ? argv[i] : internal_binding::Undefined(env));
+  }
+  return UbiMakeCallbackWithFlags(
+      env, recv, trampoline, trampoline_argv.size(), trampoline_argv.data(), result, flags);
 }
 
 void UbiAsyncWrapQueueDestroyId(napi_env env, int64_t async_id) {

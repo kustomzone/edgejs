@@ -36,6 +36,7 @@ struct UbiStreamBase {
   bool finalized = false;
   bool delete_on_close = false;
   bool destroy_notified = false;
+  bool async_init_emitted = false;
   uint64_t bytes_read = 0;
   uint64_t bytes_written = 0;
   int64_t async_id = -1;
