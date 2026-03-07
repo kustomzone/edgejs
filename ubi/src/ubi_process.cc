@@ -1,6 +1,8 @@
 #include "ubi_process.h"
 #include "ubi_active_resource.h"
+#include "ubi_env_loop.h"
 #include "ubi_module_loader.h"
+#include "ubi_worker_env.h"
 
 #include <chrono>
 #include <cerrno>
@@ -15,6 +17,7 @@
 #include <iostream>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -1158,6 +1161,42 @@ void CopyProcessEnvironmentToObject(napi_env env, napi_value env_obj) {
   }
 }
 
+std::optional<std::string> GetSharedProcessEnvironmentValue(const std::string& key) {
+  if (key.empty()) return std::nullopt;
+#if defined(_WIN32)
+  char* value = nullptr;
+  size_t length = 0;
+  if (_dupenv_s(&value, &length, key.c_str()) != 0 || value == nullptr) {
+    if (value != nullptr) free(value);
+    return std::nullopt;
+  }
+  std::string out(value);
+  free(value);
+  return out;
+#else
+  const char* value = std::getenv(key.c_str());
+  if (value == nullptr) return std::nullopt;
+  return std::string(value);
+#endif
+}
+
+std::vector<std::string> ListSharedProcessEnvironmentKeys() {
+  std::vector<std::string> out;
+#if defined(_WIN32)
+  char** e = _environ;
+#else
+  char** e = environ;
+#endif
+  if (e == nullptr) return out;
+  for (; *e != nullptr; ++e) {
+    const char* entry = *e;
+    const char* sep = std::strchr(entry, '=');
+    if (sep == nullptr) continue;
+    out.emplace_back(entry, static_cast<size_t>(sep - entry));
+  }
+  return out;
+}
+
 bool EnvKeyFromProperty(napi_env env, napi_value property, std::string* key_out, bool* is_symbol_out) {
   if (key_out == nullptr || is_symbol_out == nullptr) return false;
   *key_out = "";
@@ -1212,6 +1251,94 @@ void MaybeNotifyDateTimeConfigurationChange(napi_env env, const std::string& key
   (void)unofficial_napi_notify_datetime_configuration_change(env);
 }
 
+bool ProcessEnvUsesSharedStore(napi_env env) {
+  return UbiWorkerEnvSharesEnvironment(env);
+}
+
+bool GetProcessEnvValue(napi_env env, const std::string& key, std::string* out) {
+  if (out == nullptr || key.empty()) return false;
+  if (ProcessEnvUsesSharedStore(env)) {
+    std::optional<std::string> value = GetSharedProcessEnvironmentValue(key);
+    if (!value.has_value()) return false;
+    *out = std::move(*value);
+    return true;
+  }
+  const std::map<std::string, std::string> entries = UbiWorkerEnvSnapshotEnvVars(env);
+  auto it = entries.find(key);
+  if (it == entries.end()) return false;
+  *out = it->second;
+  return true;
+}
+
+std::vector<std::string> GetProcessEnvKeys(napi_env env) {
+  if (ProcessEnvUsesSharedStore(env)) return ListSharedProcessEnvironmentKeys();
+  const std::map<std::string, std::string> entries = UbiWorkerEnvSnapshotEnvVars(env);
+  std::vector<std::string> keys;
+  keys.reserve(entries.size());
+  for (const auto& [key, value] : entries) {
+    (void)value;
+    keys.push_back(key);
+  }
+  return keys;
+}
+
+bool CreateProcessEnvValueString(napi_env env, const std::string& value, napi_value* out) {
+  return out != nullptr &&
+         napi_create_string_utf8(env, value.c_str(), NAPI_AUTO_LENGTH, out) == napi_ok &&
+         *out != nullptr;
+}
+
+bool CreateProcessEnvDescriptor(napi_env env, napi_value value, napi_value* out) {
+  if (out == nullptr || value == nullptr) return false;
+  napi_value descriptor = nullptr;
+  if (napi_create_object(env, &descriptor) != napi_ok || descriptor == nullptr) return false;
+
+  napi_value true_value = nullptr;
+  if (napi_get_boolean(env, true, &true_value) != napi_ok || true_value == nullptr) return false;
+  if (napi_set_named_property(env, descriptor, "value", value) != napi_ok ||
+      napi_set_named_property(env, descriptor, "configurable", true_value) != napi_ok ||
+      napi_set_named_property(env, descriptor, "enumerable", true_value) != napi_ok ||
+      napi_set_named_property(env, descriptor, "writable", true_value) != napi_ok) {
+    return false;
+  }
+
+  *out = descriptor;
+  return true;
+}
+
+bool GetObjectOwnPropertyDescriptor(napi_env env,
+                                    napi_value target,
+                                    napi_value property,
+                                    napi_value* out) {
+  if (env == nullptr || target == nullptr || property == nullptr || out == nullptr) return false;
+  napi_value global = nullptr;
+  napi_value object_ctor = nullptr;
+  napi_value get_own_property_descriptor = nullptr;
+  if (napi_get_global(env, &global) != napi_ok || global == nullptr ||
+      napi_get_named_property(env, global, "Object", &object_ctor) != napi_ok ||
+      object_ctor == nullptr ||
+      napi_get_named_property(env, object_ctor, "getOwnPropertyDescriptor", &get_own_property_descriptor) != napi_ok ||
+      get_own_property_descriptor == nullptr) {
+    return false;
+  }
+
+  napi_value argv[2] = {target, property};
+  return napi_call_function(env, object_ctor, get_own_property_descriptor, 2, argv, out) == napi_ok &&
+         *out != nullptr;
+}
+
+void CopyEnvSnapshotToObject(napi_env env, napi_value target, const std::map<std::string, std::string>& entries) {
+  for (const auto& [key, value] : entries) {
+    napi_value key_v = nullptr;
+    napi_value value_v = nullptr;
+    if (napi_create_string_utf8(env, key.c_str(), NAPI_AUTO_LENGTH, &key_v) != napi_ok || key_v == nullptr ||
+        napi_create_string_utf8(env, value.c_str(), NAPI_AUTO_LENGTH, &value_v) != napi_ok || value_v == nullptr) {
+      continue;
+    }
+    napi_set_property(env, target, key_v, value_v);
+  }
+}
+
 bool GetDescriptorBool(napi_env env, napi_value descriptor, const char* name, bool* out) {
   if (out == nullptr) return false;
   *out = false;
@@ -1250,6 +1377,13 @@ napi_value ProcessEnvProxyGetTrap(napi_env env, napi_callback_info info) {
     napi_get_undefined(env, &undefined);
     return undefined;
   }
+  if (ProcessEnvUsesSharedStore(env)) {
+    std::string value;
+    if (GetProcessEnvValue(env, key, &value)) {
+      napi_value out = nullptr;
+      return CreateProcessEnvValueString(env, value, &out) ? out : nullptr;
+    }
+  }
   napi_value out = nullptr;
   if (napi_get_property(env, argv[0], argv[1], &out) != napi_ok) return nullptr;
   return out;
@@ -1283,8 +1417,12 @@ napi_value ProcessEnvProxySetTrap(napi_env env, napi_callback_info info) {
   }
   const std::string value = NapiValueToUtf8(env, coerced);
 
-  if (napi_set_property(env, argv[0], argv[1], coerced) != napi_ok) return nullptr;
-  ProcessEnvSetVariable(key, value);
+  if (ProcessEnvUsesSharedStore(env)) {
+    ProcessEnvSetVariable(key, value);
+  } else {
+    if (napi_set_property(env, argv[0], argv[1], coerced) != napi_ok) return nullptr;
+    UbiWorkerEnvSetLocalEnvVar(env, key, value);
+  }
   MaybeNotifyDateTimeConfigurationChange(env, key);
 
   napi_value true_value = nullptr;
@@ -1301,7 +1439,13 @@ napi_value ProcessEnvProxyHasTrap(napi_env env, napi_callback_info info) {
     std::string key;
     bool is_symbol = false;
     if (EnvKeyFromProperty(env, argv[1], &key, &is_symbol) && !is_symbol && !key.empty()) {
-      napi_has_property(env, argv[0], argv[1], &has);
+      if (ProcessEnvUsesSharedStore(env)) {
+        std::string value;
+        has = GetProcessEnvValue(env, key, &value);
+        if (!has) napi_has_property(env, argv[0], argv[1], &has);
+      } else {
+        napi_has_property(env, argv[0], argv[1], &has);
+      }
     }
   }
   napi_value out = nullptr;
@@ -1317,10 +1461,16 @@ napi_value ProcessEnvProxyDeletePropertyTrap(napi_env env, napi_callback_info in
     std::string key;
     bool is_symbol = false;
     if (EnvKeyFromProperty(env, argv[1], &key, &is_symbol) && !is_symbol) {
-      bool deleted = false;
-      napi_delete_property(env, argv[0], argv[1], &deleted);
+      if (!ProcessEnvUsesSharedStore(env)) {
+        bool deleted = false;
+        napi_delete_property(env, argv[0], argv[1], &deleted);
+      }
       if (!key.empty()) {
-        ProcessEnvUnsetVariable(key);
+        if (ProcessEnvUsesSharedStore(env)) {
+          ProcessEnvUnsetVariable(key);
+        } else {
+          UbiWorkerEnvUnsetLocalEnvVar(env, key);
+        }
         MaybeNotifyDateTimeConfigurationChange(env, key);
       }
     }
@@ -1378,14 +1528,22 @@ napi_value ProcessEnvProxyDefinePropertyTrap(napi_env env, napi_callback_info in
     napi_value coerced = nullptr;
     if (napi_coerce_to_string(env, value, &coerced) != napi_ok || coerced == nullptr) return nullptr;
     const std::string text = NapiValueToUtf8(env, coerced);
-    if (napi_set_property(env, argv[0], argv[1], coerced) != napi_ok) return nullptr;
-    ProcessEnvSetVariable(key, text);
+    if (ProcessEnvUsesSharedStore(env)) {
+      ProcessEnvSetVariable(key, text);
+    } else {
+      if (napi_set_property(env, argv[0], argv[1], coerced) != napi_ok) return nullptr;
+      UbiWorkerEnvSetLocalEnvVar(env, key, text);
+    }
     MaybeNotifyDateTimeConfigurationChange(env, key);
   } else {
     napi_value undefined = nullptr;
     napi_get_undefined(env, &undefined);
-    if (napi_set_property(env, argv[0], argv[1], undefined) != napi_ok) return nullptr;
-    ProcessEnvUnsetVariable(key);
+    if (ProcessEnvUsesSharedStore(env)) {
+      ProcessEnvUnsetVariable(key);
+    } else {
+      if (napi_set_property(env, argv[0], argv[1], undefined) != napi_ok) return nullptr;
+      UbiWorkerEnvUnsetLocalEnvVar(env, key);
+    }
     MaybeNotifyDateTimeConfigurationChange(env, key);
   }
 
@@ -1394,10 +1552,65 @@ napi_value ProcessEnvProxyDefinePropertyTrap(napi_env env, napi_callback_info in
   return true_value;
 }
 
+napi_value ProcessEnvProxyOwnKeysTrap(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1] = {nullptr};
+  napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+  if (argc < 1 || argv[0] == nullptr) return nullptr;
+
+  if (!ProcessEnvUsesSharedStore(env)) {
+    napi_value keys = nullptr;
+    return napi_get_property_names(env, argv[0], &keys) == napi_ok ? keys : nullptr;
+  }
+
+  const std::vector<std::string> keys = GetProcessEnvKeys(env);
+  napi_value out = nullptr;
+  if (napi_create_array_with_length(env, keys.size(), &out) != napi_ok || out == nullptr) return nullptr;
+  for (uint32_t i = 0; i < keys.size(); ++i) {
+    napi_value key = nullptr;
+    if (napi_create_string_utf8(env, keys[i].c_str(), NAPI_AUTO_LENGTH, &key) != napi_ok || key == nullptr) {
+      continue;
+    }
+    napi_set_element(env, out, i, key);
+  }
+  return out;
+}
+
+napi_value ProcessEnvProxyGetOwnPropertyDescriptorTrap(napi_env env, napi_callback_info info) {
+  size_t argc = 2;
+  napi_value argv[2] = {nullptr, nullptr};
+  napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+  if (argc < 2 || argv[0] == nullptr || argv[1] == nullptr) return nullptr;
+
+  std::string key;
+  bool is_symbol = false;
+  if (!EnvKeyFromProperty(env, argv[1], &key, &is_symbol)) return nullptr;
+  if (!is_symbol && !key.empty()) {
+    std::string value;
+    if (GetProcessEnvValue(env, key, &value)) {
+      napi_value text = nullptr;
+      napi_value descriptor = nullptr;
+      if (!CreateProcessEnvValueString(env, value, &text) ||
+          !CreateProcessEnvDescriptor(env, text, &descriptor)) {
+        return nullptr;
+      }
+      return descriptor;
+    }
+  }
+
+  napi_value descriptor = nullptr;
+  if (GetObjectOwnPropertyDescriptor(env, argv[0], argv[1], &descriptor)) return descriptor;
+  napi_value undefined = nullptr;
+  napi_get_undefined(env, &undefined);
+  return undefined;
+}
+
 napi_value CreateProcessEnvObject(napi_env env) {
   napi_value target = nullptr;
   if (napi_create_object(env, &target) != napi_ok || target == nullptr) return nullptr;
-  CopyProcessEnvironmentToObject(env, target);
+  if (!ProcessEnvUsesSharedStore(env)) {
+    CopyEnvSnapshotToObject(env, target, UbiWorkerEnvSnapshotEnvVars(env));
+  }
 
   napi_value handler = nullptr;
   if (napi_create_object(env, &handler) != napi_ok || handler == nullptr) return target;
@@ -1413,6 +1626,8 @@ napi_value CreateProcessEnvObject(napi_env env) {
   set_trap("has", ProcessEnvProxyHasTrap);
   set_trap("deleteProperty", ProcessEnvProxyDeletePropertyTrap);
   set_trap("defineProperty", ProcessEnvProxyDefinePropertyTrap);
+  set_trap("ownKeys", ProcessEnvProxyOwnKeysTrap);
+  set_trap("getOwnPropertyDescriptor", ProcessEnvProxyGetOwnPropertyDescriptorTrap);
 
   napi_value global = nullptr;
   napi_value proxy_ctor = nullptr;
@@ -1777,6 +1992,13 @@ napi_value ProcessExitCallback(napi_env env, napi_callback_info info) {
     napi_valuetype arg_type = napi_undefined;
     if (napi_typeof(env, args[0], &arg_type) == napi_ok && arg_type != napi_undefined) napi_get_value_int32(env, args[0], &exit_code);
   }
+  if (!UbiWorkerEnvOwnsProcessState(env)) {
+    UbiWorkerEnvRequestStop(env);
+    uv_loop_t* loop = UbiGetEnvLoop(env);
+    if (loop != nullptr) uv_stop(loop);
+    (void)unofficial_napi_terminate_execution(env);
+    return nullptr;
+  }
   std::exit(exit_code);
   return nullptr;
 }
@@ -1828,11 +2050,16 @@ napi_value ProcessMethodsSetEnvCallback(napi_env env, napi_callback_info info) {
     const std::string key = NapiValueToUtf8(env, argv[0]);
     const std::string value = NapiValueToUtf8(env, argv[1]);
     if (!key.empty()) {
+      if (ProcessEnvUsesSharedStore(env)) {
 #if defined(_WIN32)
-      rc = (_putenv_s(key.c_str(), value.c_str()) == 0) ? 0 : -1;
+        rc = (_putenv_s(key.c_str(), value.c_str()) == 0) ? 0 : -1;
 #else
-      rc = (setenv(key.c_str(), value.c_str(), 1) == 0) ? 0 : -1;
+        rc = (setenv(key.c_str(), value.c_str(), 1) == 0) ? 0 : -1;
 #endif
+      } else {
+        UbiWorkerEnvSetLocalEnvVar(env, key, value);
+        rc = 0;
+      }
       if (rc == 0 && key == "TZ") {
 #if defined(_WIN32)
         _tzset();
@@ -1858,11 +2085,16 @@ napi_value ProcessMethodsUnsetEnvCallback(napi_env env, napi_callback_info info)
   if (argc >= 1 && argv[0] != nullptr) {
     const std::string key = NapiValueToUtf8(env, argv[0]);
     if (!key.empty()) {
+      if (ProcessEnvUsesSharedStore(env)) {
 #if defined(_WIN32)
-      rc = (_putenv_s(key.c_str(), "") == 0) ? 0 : -1;
+        rc = (_putenv_s(key.c_str(), "") == 0) ? 0 : -1;
 #else
-      rc = (unsetenv(key.c_str()) == 0) ? 0 : -1;
+        rc = (unsetenv(key.c_str()) == 0) ? 0 : -1;
 #endif
+      } else {
+        UbiWorkerEnvUnsetLocalEnvVar(env, key);
+        rc = 0;
+      }
       if (rc == 0 && key == "TZ") {
 #if defined(_WIN32)
         _tzset();

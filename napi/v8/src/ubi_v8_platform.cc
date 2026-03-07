@@ -187,6 +187,12 @@ std::shared_ptr<UbiV8Platform::ForegroundTaskRunner> UbiV8Platform::EnsureRunner
 
 bool UbiV8Platform::RegisterIsolate(v8::Isolate* isolate) { return EnsureRunner(isolate) != nullptr; }
 
+void UbiV8Platform::UnregisterIsolate(v8::Isolate* isolate) {
+  if (isolate == nullptr) return;
+  std::lock_guard<std::mutex> lock(mutex_);
+  runners_.erase(isolate);
+}
+
 bool UbiV8Platform::BindForegroundTaskTarget(
     v8::Isolate* isolate,
     napi_env env,

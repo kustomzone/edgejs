@@ -513,6 +513,7 @@ napi_value CreateProviders(napi_env env) {
   SetNamedUint32(env, out, "NONE", 0);
   SetNamedUint32(env, out, "JSSTREAM", 20);
   SetNamedUint32(env, out, "JSUDPWRAP", 21);
+  SetNamedUint32(env, out, "MESSAGEPORT", 22);
   SetNamedUint32(env, out, "PIPECONNECTWRAP", 23);
   SetNamedUint32(env, out, "PIPESERVERWRAP", 24);
   SetNamedUint32(env, out, "PIPEWRAP", 25);

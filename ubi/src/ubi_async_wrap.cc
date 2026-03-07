@@ -251,6 +251,8 @@ const char* UbiAsyncWrapProviderName(int32_t provider_type) {
       return "JSSTREAM";
     case kUbiProviderJsUdpWrap:
       return "JSUDPWRAP";
+    case kUbiProviderMessagePort:
+      return "MESSAGEPORT";
     case kUbiProviderPipeConnectWrap:
       return "PIPECONNECTWRAP";
     case kUbiProviderPipeServerWrap:

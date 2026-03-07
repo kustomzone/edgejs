@@ -16,6 +16,7 @@ class UbiV8Platform final : public v8::Platform {
   ~UbiV8Platform() override;
 
   bool RegisterIsolate(v8::Isolate* isolate);
+  void UnregisterIsolate(v8::Isolate* isolate);
   bool BindForegroundTaskTarget(v8::Isolate* isolate,
                                 napi_env env,
                                 unofficial_napi_enqueue_foreground_task_callback callback,

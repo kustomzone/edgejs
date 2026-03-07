@@ -612,7 +612,6 @@ class UdpWrap final : public UbiUdpWrapBase, public UbiUdpListener {
   }
 
   UbiHandleWrap handle_wrap{};
-  void* active_handle_token = nullptr;
   uv_udp_t handle{};
   int32_t provider_type = kUbiProviderUdpWrap;
   int64_t async_id = -1;
@@ -695,9 +694,9 @@ void UdpFinalize(napi_env env, void* data, void* hint) {
     wrap->handle_wrap.delete_on_close = true;
     return;
   }
-  if (wrap->active_handle_token != nullptr) {
-    UbiUnregisterActiveHandle(env, wrap->active_handle_token);
-    wrap->active_handle_token = nullptr;
+  if (wrap->handle_wrap.active_handle_token != nullptr) {
+    UbiUnregisterActiveHandle(env, wrap->handle_wrap.active_handle_token);
+    wrap->handle_wrap.active_handle_token = nullptr;
   }
   QueueUdpWrapDestroyIfNeeded(wrap);
   delete wrap;
@@ -722,7 +721,7 @@ napi_value UdpCtor(napi_env env, napi_callback_info info) {
   if (wrap->handle_wrap.state == kUbiHandleInitialized) {
     UbiHandleWrapHoldWrapperRef(&wrap->handle_wrap);
   }
-  wrap->active_handle_token =
+  wrap->handle_wrap.active_handle_token =
       UbiRegisterActiveHandle(env, self, "UDPWRAP", UdpHandleHasRef, UdpGetActiveOwner, wrap);
 
   // Match Node's dgram handle aliasing for udp6 sockets.
@@ -750,9 +749,9 @@ void OnClosed(uv_handle_t* h) {
   wrap->handle_wrap.state = kUbiHandleClosed;
   UbiHandleWrapReleaseWrapperRef(&wrap->handle_wrap);
   UbiHandleWrapMaybeCallOnClose(&wrap->handle_wrap);
-  if (wrap->active_handle_token != nullptr) {
-    UbiUnregisterActiveHandle(wrap->handle_wrap.env, wrap->active_handle_token);
-    wrap->active_handle_token = nullptr;
+  if (wrap->handle_wrap.active_handle_token != nullptr) {
+    UbiUnregisterActiveHandle(wrap->handle_wrap.env, wrap->handle_wrap.active_handle_token);
+    wrap->handle_wrap.active_handle_token = nullptr;
   }
   QueueUdpWrapDestroyIfNeeded(wrap);
   if (wrap->handle_wrap.delete_on_close || wrap->handle_wrap.finalized) {

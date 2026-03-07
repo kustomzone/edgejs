@@ -20,6 +20,11 @@ NAPI_EXTERN napi_status unofficial_napi_request_gc_for_testing(napi_env env);
 // microtask queue.
 NAPI_EXTERN napi_status unofficial_napi_process_microtasks(napi_env env);
 
+// Unofficial helper. Terminates current JS execution in the env's engine.
+// This is used for worker-style shutdown semantics where the process must
+// survive but the current env must stop executing JS immediately.
+NAPI_EXTERN napi_status unofficial_napi_terminate_execution(napi_env env);
+
 using unofficial_napi_foreground_task_callback = void (*)(napi_env env, void* data);
 using unofficial_napi_foreground_task_cleanup = void (*)(napi_env env, void* data);
 using unofficial_napi_enqueue_foreground_task_callback =
@@ -103,6 +108,21 @@ NAPI_EXTERN napi_status unofficial_napi_structured_clone(
     napi_env env,
     napi_value value,
     napi_value* result_out);
+
+// Unofficial helpers for env-agnostic message payload queues.
+// The returned opaque payload must be released with
+// unofficial_napi_release_serialized_value().
+NAPI_EXTERN napi_status unofficial_napi_serialize_value(
+    napi_env env,
+    napi_value value,
+    void** payload_out);
+
+NAPI_EXTERN napi_status unofficial_napi_deserialize_value(
+    napi_env env,
+    void* payload,
+    napi_value* result_out);
+
+NAPI_EXTERN void unofficial_napi_release_serialized_value(void* payload);
 
 // Unofficial helper for Node-style process.memoryUsage() parity.
 // Returns V8 heap statistics plus allocator-tracked ArrayBuffer memory.

@@ -9,6 +9,7 @@ enum UbiAsyncProviderType : int32_t {
   kUbiProviderNone = 0,
   kUbiProviderJsStream = 20,
   kUbiProviderJsUdpWrap = 21,
+  kUbiProviderMessagePort = 22,
   kUbiProviderPipeConnectWrap = 23,
   kUbiProviderPipeServerWrap = 24,
   kUbiProviderPipeWrap = 25,

@@ -339,6 +339,7 @@ add_library(ubi_runtime STATIC
   src/ubi_udp_wrap.cc
   src/ubi_url.cc
   src/ubi_util.cc
+  src/ubi_worker_env.cc
   src/ubi_spawn_sync.cc
   src/ubi_timers_host.cc
   src/crypto/ubi_crypto_binding.cc

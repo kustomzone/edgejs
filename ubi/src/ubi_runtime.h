@@ -23,6 +23,9 @@ int UbiRunScriptFileWithLoop(napi_env env,
                                const char* script_path,
                                std::string* error_out,
                                bool keep_event_loop_alive);
+int UbiRunWorkerThreadMain(napi_env env,
+                           const std::vector<std::string>& exec_argv,
+                           std::string* error_out);
 void UbiSetScriptArgv(const std::vector<std::string>& script_argv);
 void UbiSetExecArgv(const std::vector<std::string>& exec_argv);
 bool UbiExecArgvHasFlag(const char* flag);

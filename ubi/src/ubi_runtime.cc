@@ -51,19 +51,25 @@
 #include "ubi_udp_wrap.h"
 #include "ubi_url.h"
 #include "ubi_util.h"
+#include "ubi_worker_env.h"
 #include "ubi_cares_wrap.h"
 #include "ubi_timers_host.h"
 #include "ubi_spawn_sync.h"
 
 namespace {
 
-std::string g_ubi_current_script_path;
-std::vector<std::string> g_ubi_exec_argv;
+thread_local std::string g_ubi_current_script_path;
+thread_local std::vector<std::string> g_ubi_exec_argv;
 std::vector<std::string> g_ubi_cli_exec_argv;
 std::string g_ubi_process_title;
-std::vector<std::string> g_ubi_script_argv;
+thread_local std::vector<std::string> g_ubi_script_argv;
 const auto g_process_start_time = std::chrono::steady_clock::now();
 std::once_flag g_process_stdio_init_once;
+
+enum class UbiBootstrapMode {
+  kMainThread,
+  kWorkerThread,
+};
 
 void InitializeProcessStdioInheritanceOnce() {
   std::call_once(g_process_stdio_init_once, []() {
@@ -486,6 +492,12 @@ bool DispatchUncaughtException(napi_env env, napi_value exception, bool* handled
 int HandlePendingExceptionAfterLoopStep(napi_env env, std::string* error_out) {
   bool has_pending = false;
   if (napi_is_exception_pending(env, &has_pending) != napi_ok || !has_pending) {
+    return -1;
+  }
+
+  if (!UbiWorkerEnvOwnsProcessState(env) && UbiWorkerEnvStopRequested(env)) {
+    napi_value ignored = nullptr;
+    (void)napi_get_and_clear_last_exception(env, &ignored);
     return -1;
   }
 
@@ -935,6 +947,10 @@ int RunEventLoopUntilQuiescent(napi_env env, std::string* error_out) {
     int async_status = HandlePendingExceptionAfterLoopStep(env, error_out);
     if (async_status >= 0) {
       return async_status;
+    }
+
+    if (!UbiWorkerEnvOwnsProcessState(env) && UbiWorkerEnvStopRequested(env)) {
+      break;
     }
 
     const bool pending_entry_point_promise = HasPendingEntryPointPromise(env);
@@ -1393,7 +1409,8 @@ int RunScriptWithGlobals(napi_env env,
                          const char* source_text,
                          const char* entry_script_path,
                          std::string* error_out,
-                         bool keep_event_loop_alive) {
+                         bool keep_event_loop_alive,
+                         UbiBootstrapMode mode) {
   InitializeProcessStdioInheritanceOnce();
 #if !defined(_WIN32)
   InstallDefaultSignalBehavior();
@@ -1721,84 +1738,26 @@ int RunScriptWithGlobals(napi_env env,
     UbiSetPrimordials(env, primordials_value);
   }
 
+  const char* thread_switch_module = mode == UbiBootstrapMode::kWorkerThread
+                                         ? "internal/bootstrap/switches/is_not_main_thread"
+                                         : "internal/bootstrap/switches/is_main_thread";
+  const char* process_state_switch_module = mode == UbiBootstrapMode::kWorkerThread
+                                                ? "internal/bootstrap/switches/does_not_own_process_state"
+                                                : "internal/bootstrap/switches/does_own_process_state";
   if (!require_bootstrap_module("internal/bootstrap/node") ||
-      !require_bootstrap_module("internal/bootstrap/switches/is_main_thread") ||
-      !require_bootstrap_module("internal/bootstrap/switches/does_own_process_state") ||
+      !require_bootstrap_module(thread_switch_module) ||
+      !require_bootstrap_module(process_state_switch_module) ||
       !require_bootstrap_module("internal/bootstrap/web/exposed-wildcard") ||
       !require_bootstrap_module("internal/bootstrap/web/exposed-window-or-worker")) {
     return 1;
   }
 
   napi_value pre_execution_exports = nullptr;
-  if (!require_bootstrap_module_exports("internal/process/pre_execution", &pre_execution_exports) ||
-      pre_execution_exports == nullptr) {
-    if (error_out != nullptr) {
-      std::string msg = "Failed to load internal/process/pre_execution";
-      bool is_exit = false;
-      int exit_code = 0;
-      const std::string exc = GetAndClearPendingException(env, &is_exit, &exit_code);
-      if (!exc.empty()) {
-        msg += ": ";
-        msg += exc;
-      }
-      *error_out = msg;
-    }
-    return 1;
-  }
-
-  napi_value prepare_main_thread_execution = nullptr;
-  if (!GetNamedProperty(env, pre_execution_exports, "prepareMainThreadExecution", &prepare_main_thread_execution) ||
-      !IsFunction(env, prepare_main_thread_execution)) {
-    if (error_out != nullptr) {
-      *error_out = "internal/process/pre_execution.prepareMainThreadExecution is not available";
-    }
-    return 1;
-  }
-
-  napi_value false_value = nullptr;
-  if (napi_get_boolean(env, false, &false_value) != napi_ok || false_value == nullptr) {
-    if (error_out != nullptr) {
-      *error_out = "Failed to create boolean argument for pre_execution";
-    }
-    return 1;
-  }
-  napi_value true_value = nullptr;
-  if (napi_get_boolean(env, true, &true_value) != napi_ok || true_value == nullptr) {
-    if (error_out != nullptr) {
-      *error_out = "Failed to create initializeModules argument for pre_execution";
-    }
-    return 1;
-  }
-  napi_value prepare_args[2] = {false_value, true_value};
-  if (!CallFunction(env,
-                    pre_execution_exports,
-                    prepare_main_thread_execution,
-                    2,
-                    prepare_args,
-                    nullptr)) {
-    if (error_out != nullptr) {
-      std::string msg = "prepareMainThreadExecution failed";
-      bool is_exit = false;
-      int exit_code = 0;
-      const std::string exc = GetAndClearPendingException(env, &is_exit, &exit_code);
-      if (!exc.empty()) {
-        msg += ": ";
-        msg += exc;
-      }
-      *error_out = msg;
-    }
-    return 1;
-  }
-
-  // Node sets module_wrap dynamic-import callbacks during module loader init.
-  // We keep pre_execution module init disabled for now, so initialize just the
-  // ESM callback bridge needed by dynamic import() in CJS.
-  {
-    napi_value esm_utils_exports = nullptr;
-    if (!require_bootstrap_module_exports("internal/modules/esm/utils", &esm_utils_exports) ||
-        esm_utils_exports == nullptr) {
+  if (mode != UbiBootstrapMode::kWorkerThread) {
+    if (!require_bootstrap_module_exports("internal/process/pre_execution", &pre_execution_exports) ||
+        pre_execution_exports == nullptr) {
       if (error_out != nullptr) {
-        std::string msg = "Failed to load internal/modules/esm/utils";
+        std::string msg = "Failed to load internal/process/pre_execution";
         bool is_exit = false;
         int exit_code = 0;
         const std::string exc = GetAndClearPendingException(env, &is_exit, &exit_code);
@@ -1810,44 +1769,39 @@ int RunScriptWithGlobals(napi_env env,
       }
       return 1;
     }
-    napi_value initialize_esm = nullptr;
-    if (!GetNamedProperty(env, esm_utils_exports, "initializeESM", &initialize_esm) ||
-        !IsFunction(env, initialize_esm)) {
-      if (error_out != nullptr) {
-        *error_out = "internal/modules/esm/utils.initializeESM is not available";
-      }
-      return 1;
-    }
-    napi_value false_arg = nullptr;
-    if (napi_get_boolean(env, false, &false_arg) != napi_ok || false_arg == nullptr) {
-      if (error_out != nullptr) {
-        *error_out = "Failed to create initializeESM argument";
-      }
-      return 1;
-    }
-    napi_value argv[1] = {false_arg};
-    if (!CallFunction(env, esm_utils_exports, initialize_esm, 1, argv, nullptr)) {
-      if (error_out != nullptr) {
-        std::string msg = "initializeESM(false) failed";
-        bool is_exit = false;
-        int exit_code = 0;
-        const std::string exc = GetAndClearPendingException(env, &is_exit, &exit_code);
-        if (!exc.empty()) {
-          msg += ": ";
-          msg += exc;
-        }
-        *error_out = msg;
-      }
-      return 1;
-    }
-  }
 
-  napi_value mark_bootstrap_complete = nullptr;
-  if (GetNamedProperty(env, pre_execution_exports, "markBootstrapComplete", &mark_bootstrap_complete) &&
-      IsFunction(env, mark_bootstrap_complete)) {
-    if (!CallFunction(env, pre_execution_exports, mark_bootstrap_complete, 0, nullptr, nullptr)) {
+    napi_value prepare_main_thread_execution = nullptr;
+    if (!GetNamedProperty(env, pre_execution_exports, "prepareMainThreadExecution", &prepare_main_thread_execution) ||
+        !IsFunction(env, prepare_main_thread_execution)) {
       if (error_out != nullptr) {
-        std::string msg = "markBootstrapComplete failed";
+        *error_out = "internal/process/pre_execution.prepareMainThreadExecution is not available";
+      }
+      return 1;
+    }
+
+    napi_value false_value = nullptr;
+    if (napi_get_boolean(env, false, &false_value) != napi_ok || false_value == nullptr) {
+      if (error_out != nullptr) {
+        *error_out = "Failed to create boolean argument for pre_execution";
+      }
+      return 1;
+    }
+    napi_value true_value = nullptr;
+    if (napi_get_boolean(env, true, &true_value) != napi_ok || true_value == nullptr) {
+      if (error_out != nullptr) {
+        *error_out = "Failed to create initializeModules argument for pre_execution";
+      }
+      return 1;
+    }
+    napi_value prepare_args[2] = {false_value, true_value};
+    if (!CallFunction(env,
+                      pre_execution_exports,
+                      prepare_main_thread_execution,
+                      2,
+                      prepare_args,
+                      nullptr)) {
+      if (error_out != nullptr) {
+        std::string msg = "prepareMainThreadExecution failed";
         bool is_exit = false;
         int exit_code = 0;
         const std::string exc = GetAndClearPendingException(env, &is_exit, &exit_code);
@@ -1858,6 +1812,77 @@ int RunScriptWithGlobals(napi_env env,
         *error_out = msg;
       }
       return 1;
+    }
+
+    // Node sets module_wrap dynamic-import callbacks during module loader init.
+    // We keep pre_execution module init disabled for now, so initialize just the
+    // ESM callback bridge needed by dynamic import() in CJS.
+    {
+      napi_value esm_utils_exports = nullptr;
+      if (!require_bootstrap_module_exports("internal/modules/esm/utils", &esm_utils_exports) ||
+          esm_utils_exports == nullptr) {
+        if (error_out != nullptr) {
+          std::string msg = "Failed to load internal/modules/esm/utils";
+          bool is_exit = false;
+          int exit_code = 0;
+          const std::string exc = GetAndClearPendingException(env, &is_exit, &exit_code);
+          if (!exc.empty()) {
+            msg += ": ";
+            msg += exc;
+          }
+          *error_out = msg;
+        }
+        return 1;
+      }
+      napi_value initialize_esm = nullptr;
+      if (!GetNamedProperty(env, esm_utils_exports, "initializeESM", &initialize_esm) ||
+          !IsFunction(env, initialize_esm)) {
+        if (error_out != nullptr) {
+          *error_out = "internal/modules/esm/utils.initializeESM is not available";
+        }
+        return 1;
+      }
+      napi_value false_arg = nullptr;
+      if (napi_get_boolean(env, false, &false_arg) != napi_ok || false_arg == nullptr) {
+        if (error_out != nullptr) {
+          *error_out = "Failed to create initializeESM argument";
+        }
+        return 1;
+      }
+      napi_value argv[1] = {false_arg};
+      if (!CallFunction(env, esm_utils_exports, initialize_esm, 1, argv, nullptr)) {
+        if (error_out != nullptr) {
+          std::string msg = "initializeESM(false) failed";
+          bool is_exit = false;
+          int exit_code = 0;
+          const std::string exc = GetAndClearPendingException(env, &is_exit, &exit_code);
+          if (!exc.empty()) {
+            msg += ": ";
+            msg += exc;
+          }
+          *error_out = msg;
+        }
+        return 1;
+      }
+    }
+
+    napi_value mark_bootstrap_complete = nullptr;
+    if (GetNamedProperty(env, pre_execution_exports, "markBootstrapComplete", &mark_bootstrap_complete) &&
+        IsFunction(env, mark_bootstrap_complete)) {
+      if (!CallFunction(env, pre_execution_exports, mark_bootstrap_complete, 0, nullptr, nullptr)) {
+        if (error_out != nullptr) {
+          std::string msg = "markBootstrapComplete failed";
+          bool is_exit = false;
+          int exit_code = 0;
+          const std::string exc = GetAndClearPendingException(env, &is_exit, &exit_code);
+          if (!exc.empty()) {
+            msg += ": ";
+            msg += exc;
+          }
+          *error_out = msg;
+        }
+        return 1;
+      }
     }
   }
 
@@ -1945,7 +1970,9 @@ int RunScriptWithGlobals(napi_env env,
   };
   // Hide `internalBinding` from user-script globals while keeping internal
   // test harness source-mode compatibility.
-  if (entry_script_path != nullptr && entry_script_path[0] != '\0') {
+  if (mode == UbiBootstrapMode::kMainThread &&
+      entry_script_path != nullptr &&
+      entry_script_path[0] != '\0') {
     delete_global_named("internalBinding");
   }
 
@@ -2266,7 +2293,8 @@ int UbiRunScriptSourceWithLoop(napi_env env,
   if (error_out != nullptr) {
     error_out->clear();
   }
-  return RunScriptWithGlobals(env, source_text, nullptr, error_out, keep_event_loop_alive);
+  return RunScriptWithGlobals(
+      env, source_text, nullptr, error_out, keep_event_loop_alive, UbiBootstrapMode::kMainThread);
 }
 
 int UbiRunScriptSource(napi_env env, const char* source_text, std::string* error_out) {
@@ -2315,7 +2343,8 @@ int UbiRunScriptFileWithLoop(napi_env env,
   }
 #endif
   const int rc =
-      RunScriptWithGlobals(env, source.c_str(), script_path, error_out, keep_event_loop_alive);
+      RunScriptWithGlobals(
+          env, source.c_str(), script_path, error_out, keep_event_loop_alive, UbiBootstrapMode::kMainThread);
 #if !defined(_WIN32)
   if (!restore_cwd.empty()) {
     chdir(restore_cwd.c_str());
@@ -2327,6 +2356,29 @@ int UbiRunScriptFileWithLoop(napi_env env,
 
 int UbiRunScriptFile(napi_env env, const char* script_path, std::string* error_out) {
   return UbiRunScriptFileWithLoop(env, script_path, error_out, false);
+}
+
+int UbiRunWorkerThreadMain(napi_env env,
+                           const std::vector<std::string>& exec_argv,
+                           std::string* error_out) {
+  if (error_out != nullptr) {
+    error_out->clear();
+  }
+
+  g_ubi_current_script_path.clear();
+  g_ubi_exec_argv = exec_argv;
+  g_ubi_script_argv.clear();
+
+  static constexpr char kWorkerBootstrapSource[] =
+      "(function(){"
+      "const __ubi_require = require;"
+      "try { delete globalThis.require; } catch {}"
+      "try { delete globalThis.__filename; } catch {}"
+      "try { delete globalThis.__dirname; } catch {}"
+      "return __ubi_require('internal/main/worker_thread');"
+      "})()";
+  return RunScriptWithGlobals(
+      env, kWorkerBootstrapSource, nullptr, error_out, true, UbiBootstrapMode::kWorkerThread);
 }
 
 void UbiSetScriptArgv(const std::vector<std::string>& script_argv) {
