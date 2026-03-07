@@ -29,6 +29,7 @@
 #include "builtin_catalog.h"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cstring>
 #include <cstdlib>
@@ -180,9 +181,10 @@ void ReplaceJsonBooleanOrNumber(std::string* text, const char* key, bool value) 
   text->replace(value_start, value_end - value_start, value ? "1" : "0");
 }
 
-std::string LoadBuiltinsConfigJson() {
-  static std::string cached;
-  if (!cached.empty()) return cached;
+std::string LoadBuiltinsConfigJson(bool has_intl) {
+  static std::array<std::string, 2> cached;
+  std::string& cached_value = cached[has_intl ? 1 : 0];
+  if (!cached_value.empty()) return cached_value;
 
   auto append_candidate = [](std::vector<fs::path>* out, const fs::path& p) {
     if (out == nullptr) return;
@@ -222,30 +224,29 @@ std::string LoadBuiltinsConfigJson() {
     ReplaceJsonBooleanOrNumber(&body, "node_use_amaro", false);
     // Ubi ships its own ICU-backed encoding support and should advertise that
     // in the serialized config consumed by bootstrap/node.
-    ReplaceJsonBooleanOrNumber(&body, "v8_enable_i18n_support", true);
+    ReplaceJsonBooleanOrNumber(&body, "v8_enable_i18n_support", has_intl);
     ReplaceJsonBooleanOrNumber(&body, "icu_small", false);
-    cached = body;
-    if (!cached.empty()) return cached;
+    cached_value = body;
+    if (!cached_value.empty()) return cached_value;
   }
 
   // Keep this fallback aligned with what Node's bootstrap expects from
   // config.gypi on modern releases.
-  cached =
-      "{"
-      "\"variables\":{"
-      "\"v8_enable_i18n_support\":1,"
-      "\"icu_small\":false,"
-      "\"node_use_amaro\":false,"
-      "\"node_builtin_shareable_builtins\":["
-      "\"deps/cjs-module-lexer/lexer.js\","
-      "\"deps/cjs-module-lexer/dist/lexer.js\","
-      "\"deps/undici/undici.js\","
-      "\"deps/amaro/dist/index.js\""
-      "],"
-      "\"napi_build_version\":\"10\""
-      "}"
-      "}";
-  return cached;
+  cached_value = std::string("{") +
+                 "\"variables\":{" +
+                 "\"v8_enable_i18n_support\":" + (has_intl ? "1" : "0") + "," +
+                 "\"icu_small\":false," +
+                 "\"node_use_amaro\":false," +
+                 "\"node_builtin_shareable_builtins\":[" +
+                 "\"deps/cjs-module-lexer/lexer.js\"," +
+                 "\"deps/cjs-module-lexer/dist/lexer.js\"," +
+                 "\"deps/undici/undici.js\"," +
+                 "\"deps/amaro/dist/index.js\"" +
+                 "]," +
+                 "\"napi_build_version\":\"10\"" +
+                 "}" +
+                 "}";
+  return cached_value;
 }
 
 std::string ValueToUtf8(napi_env env, napi_value value) {
@@ -2515,7 +2516,7 @@ static napi_value GetOrCreateNativeBuiltinsBinding(napi_env env, ModuleLoaderSta
   }
 
   napi_value config_json = nullptr;
-  std::string builtins_config_json = LoadBuiltinsConfigJson();
+  std::string builtins_config_json = LoadBuiltinsConfigJson(RuntimeHasIntl(env));
   if (napi_create_string_utf8(env, builtins_config_json.c_str(), NAPI_AUTO_LENGTH, &config_json) != napi_ok ||
       config_json == nullptr ||
       napi_set_named_property(env, binding, "config", config_json) != napi_ok) {

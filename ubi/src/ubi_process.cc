@@ -283,6 +283,17 @@ std::string ReadTextFileIfExists(const std::filesystem::path& path) {
   return buffer.str();
 }
 
+bool RuntimeHasIntl(napi_env env) {
+  napi_value global = nullptr;
+  if (env == nullptr || napi_get_global(env, &global) != napi_ok || global == nullptr) return false;
+
+  napi_value intl = nullptr;
+  if (napi_get_named_property(env, global, "Intl", &intl) != napi_ok || intl == nullptr) return false;
+
+  napi_valuetype type = napi_undefined;
+  return napi_typeof(env, intl, &type) == napi_ok && (type == napi_object || type == napi_function);
+}
+
 std::string FindNodeConfigGypiText() {
   namespace fs = std::filesystem;
   std::error_code ec;
@@ -325,7 +336,8 @@ bool EnsureProcessConfigVariablesForUbi(napi_env env, napi_value config_obj) {
     if (napi_set_named_property(env, config_obj, "variables", variables_obj) != napi_ok) return false;
   }
 
-  return SetProcessConfigVariableInt(env, variables_obj, "v8_enable_i18n_support", 1) &&
+  const int32_t has_intl = RuntimeHasIntl(env) ? 1 : 0;
+  return SetProcessConfigVariableInt(env, variables_obj, "v8_enable_i18n_support", has_intl) &&
          SetProcessConfigVariableInt(env, variables_obj, "icu_small", 0);
 }
 

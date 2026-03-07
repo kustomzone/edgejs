@@ -917,6 +917,43 @@ TEST_F(Test1CliPhase01, TextDecoderUsesIcuPathForFatalUtf8AndUtf16Be) {
 #endif
 }
 
+TEST_F(Test1CliPhase01, IntlSurfaceMatchesNodeBasics) {
+#if defined(_WIN32)
+  GTEST_SKIP() << "Intl subprocess parity check is POSIX-only";
+#else
+  const auto ubi_path = ResolveBuiltUbiBinary();
+  ASSERT_FALSE(ubi_path.empty()) << "Failed to resolve built ubi binary";
+
+  const std::string script_path = WriteTempScript(
+      "ubi_phase01_cli_intl_surface",
+      "const result = {\n"
+      "  intlType: typeof Intl,\n"
+      "  processHasIntl: !!process.config?.variables?.v8_enable_i18n_support,\n"
+      "  nfkdSlash: '\\u2100'.normalize('NFKD'),\n"
+      "  nfkdAt: '\\uFF20'.normalize('NFKD'),\n"
+      "  trLower: 'I'.toLocaleLowerCase('tr'),\n"
+      "  trUpper: 'i'.toLocaleUpperCase('tr'),\n"
+      "};\n"
+      "console.log(JSON.stringify(result));\n");
+
+  const CommandResult result =
+      RunBuiltBinaryAndCapture(ubi_path, {script_path}, "ubi_phase01_cli_intl_surface_run");
+
+  RemoveTempScript(script_path);
+
+  ASSERT_NE(result.status, -1);
+  ASSERT_TRUE(WIFEXITED(result.status)) << "status=" << result.status;
+  EXPECT_EQ(WEXITSTATUS(result.status), 0) << "stderr=" << result.stderr_output;
+  EXPECT_TRUE(result.stderr_output.empty()) << "stderr=" << result.stderr_output;
+  EXPECT_NE(result.stdout_output.find("\"intlType\":\"object\""), std::string::npos) << result.stdout_output;
+  EXPECT_NE(result.stdout_output.find("\"processHasIntl\":true"), std::string::npos) << result.stdout_output;
+  EXPECT_NE(result.stdout_output.find("\"nfkdSlash\":\"a/c\""), std::string::npos) << result.stdout_output;
+  EXPECT_NE(result.stdout_output.find("\"nfkdAt\":\"@\""), std::string::npos) << result.stdout_output;
+  EXPECT_NE(result.stdout_output.find("\"trLower\":\"ı\""), std::string::npos) << result.stdout_output;
+  EXPECT_NE(result.stdout_output.find("\"trUpper\":\"İ\""), std::string::npos) << result.stdout_output;
+#endif
+}
+
 TEST_F(Test1CliPhase01, FsWatchEmitsChangeAndClosesCleanly) {
 #if defined(_WIN32)
   GTEST_SKIP() << "fs.watch subprocess parity check is POSIX-only";

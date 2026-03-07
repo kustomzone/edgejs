@@ -29,6 +29,14 @@ option(UBI_ALLOW_UNDEFINED_IMPORTS
   "Allow undefined imports at link time (useful for external runtime deps in wasm/wasix)"
   OFF
 )
+option(UBI_PREFER_REPO_LOCAL_V8
+  "Prefer the repo-local V8 dist bundle when it exists"
+  ON
+)
+set(UBI_REPO_LOCAL_V8_DIST_ROOT
+  "${PROJECT_ROOT}/v8-custom-builds/v8/out/dist"
+  CACHE PATH "Path to the repo-local V8 dist bundle used when UBI_PREFER_REPO_LOCAL_V8 is ON"
+)
 
 set(UBI_IS_WASIX_TARGET OFF)
 if(CMAKE_SYSTEM_NAME MATCHES "WASI|WASIX" OR
@@ -80,6 +88,25 @@ foreach(UBI_CODE_FILE IN LISTS UBI_PURE_SRC_FILES)
 endforeach()
 
 if(UBI_NAPI_PROVIDER STREQUAL "bundled-v8")
+  if(UBI_PREFER_REPO_LOCAL_V8)
+    set(_ubi_repo_local_v8_include "${UBI_REPO_LOCAL_V8_DIST_ROOT}/include")
+    set(_ubi_repo_local_v8_library "${UBI_REPO_LOCAL_V8_DIST_ROOT}/lib/libv8.a")
+    if(EXISTS "${_ubi_repo_local_v8_include}" AND EXISTS "${_ubi_repo_local_v8_library}")
+      message(STATUS "UBI: preferring repo-local V8 bundle at ${UBI_REPO_LOCAL_V8_DIST_ROOT}")
+      set(NAPI_V8_BUILD_METHOD "local" CACHE STRING
+        "V8 resolution method: prebuilt|source|local" FORCE)
+      set(NAPI_V8_INCLUDE_DIR "${_ubi_repo_local_v8_include}" CACHE PATH
+        "Path to V8 headers" FORCE)
+      set(NAPI_V8_LIBRARY "${_ubi_repo_local_v8_library}" CACHE FILEPATH
+        "Path to V8 runtime library (monolith/static/dynamic)" FORCE)
+      set(NAPI_V8_DEFINES "V8_COMPRESS_POINTERS" CACHE STRING
+        "Semicolon-separated V8 embedder compile definitions" FORCE)
+      if(APPLE)
+        set(NAPI_V8_EXTRA_LIBS "/System/Library/Frameworks/CoreFoundation.framework" CACHE STRING
+          "Semicolon-separated extra V8 libraries (e.g. libplatform/libbase)" FORCE)
+      endif()
+    endif()
+  endif()
   set(NAPI_V8_BUILD_TESTS OFF CACHE BOOL "" FORCE)
   add_subdirectory("${NAPI_V8_ROOT}" "${CMAKE_CURRENT_BINARY_DIR}/napi-v8")
 elseif(UBI_NAPI_PROVIDER STREQUAL "imports")
