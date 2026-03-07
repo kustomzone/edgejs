@@ -96,6 +96,14 @@ NAPI_EXTERN napi_status unofficial_napi_create_private_symbol(napi_env env,
                                                               size_t length,
                                                               napi_value* result_out);
 
+// Unofficial helper for internalBinding('messaging').structuredClone().
+// This mirrors the engine's structured clone path closely enough to preserve
+// SharedArrayBuffer backing stores during clone/deserialization.
+NAPI_EXTERN napi_status unofficial_napi_structured_clone(
+    napi_env env,
+    napi_value value,
+    napi_value* result_out);
+
 // Unofficial helper for Node-style process.memoryUsage() parity.
 // Returns V8 heap statistics plus allocator-tracked ArrayBuffer memory.
 NAPI_EXTERN napi_status unofficial_napi_get_process_memory_info(

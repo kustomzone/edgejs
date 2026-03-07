@@ -21,6 +21,7 @@
 #include "ubi_active_resource.h"
 #include "ubi_async_wrap.h"
 #include "ubi_env_loop.h"
+#include "ubi_handle_wrap.h"
 #include "ubi_udp_listener.h"
 
 namespace {
@@ -361,29 +362,41 @@ void ThrowInvalidUdpReceiver(napi_env env) {
 
 class UdpWrap final : public UbiUdpWrapBase, public UbiUdpListener {
  public:
- explicit UdpWrap(napi_env env_in) : env(env_in), async_id(UbiAsyncWrapNextId(env_in)) {
+ explicit UdpWrap(napi_env env_in) : async_id(UbiAsyncWrapNextId(env_in)) {
+    UbiHandleWrapInit(&handle_wrap, env_in);
     uv_loop_t* loop = UbiGetEnvLoop(env_in);
     if (loop != nullptr) {
-      uv_udp_init(loop, &handle);
+      if (uv_udp_init(loop, &handle) == 0) {
+        handle_wrap.state = kUbiHandleInitialized;
+      }
     }
     handle.data = this;
     set_listener(this);
   }
 
   int RecvStart() override {
-    if (uv_is_closing(reinterpret_cast<uv_handle_t*>(&handle))) return UV_EBADF;
+    if (handle_wrap.state != kUbiHandleInitialized ||
+        uv_is_closing(reinterpret_cast<uv_handle_t*>(&handle))) {
+      return UV_EBADF;
+    }
     int rc = uv_udp_recv_start(&handle, OnAllocCallback, OnRecvCallback);
     if (rc == UV_EALREADY) rc = 0;
     return rc;
   }
 
   int RecvStop() override {
-    if (uv_is_closing(reinterpret_cast<uv_handle_t*>(&handle))) return UV_EBADF;
+    if (handle_wrap.state != kUbiHandleInitialized ||
+        uv_is_closing(reinterpret_cast<uv_handle_t*>(&handle))) {
+      return UV_EBADF;
+    }
     return uv_udp_recv_stop(&handle);
   }
 
   ssize_t Send(uv_buf_t* bufs_ptr, size_t count, const sockaddr* addr) override {
-    if (uv_is_closing(reinterpret_cast<uv_handle_t*>(&handle))) return UV_EBADF;
+    if (handle_wrap.state != kUbiHandleInitialized ||
+        uv_is_closing(reinterpret_cast<uv_handle_t*>(&handle))) {
+      return UV_EBADF;
+    }
 
     size_t msg_size = 0;
     for (size_t i = 0; i < count; i++) msg_size += bufs_ptr[i].len;
@@ -447,40 +460,40 @@ class UdpWrap final : public UbiUdpWrapBase, public UbiUdpListener {
       return;
     }
 
-    napi_value self = GetRefValue(env, wrapper_ref);
+    napi_value self = GetRefValue(handle_wrap.env, handle_wrap.wrapper_ref);
     if (self == nullptr) {
       free(buf.base);
       return;
     }
 
     napi_value onmessage = nullptr;
-    if (napi_get_named_property(env, self, "onmessage", &onmessage) != napi_ok ||
-        !IsFunction(env, onmessage)) {
+    if (napi_get_named_property(handle_wrap.env, self, "onmessage", &onmessage) != napi_ok ||
+        !IsFunction(handle_wrap.env, onmessage)) {
       free(buf.base);
       return;
     }
 
     napi_value argv[4] = {
-        MakeInt32(env, static_cast<int32_t>(nread)),
+        MakeInt32(handle_wrap.env, static_cast<int32_t>(nread)),
         self,
         nullptr,
         nullptr,
     };
-    napi_get_undefined(env, &argv[2]);
-    napi_get_undefined(env, &argv[3]);
+    napi_get_undefined(handle_wrap.env, &argv[2]);
+    napi_get_undefined(handle_wrap.env, &argv[3]);
 
     if (nread < 0) {
       napi_value ignored = nullptr;
-      UbiMakeCallback(env, self, onmessage, 4, argv, &ignored);
-      (void)UbiHandlePendingExceptionNow(env, nullptr);
+      UbiMakeCallback(handle_wrap.env, self, onmessage, 4, argv, &ignored);
+      (void)UbiHandlePendingExceptionNow(handle_wrap.env, nullptr);
       free(buf.base);
       return;
     }
 
-    napi_value rinfo = BuildRinfoObject(env, addr, nread);
+    napi_value rinfo = BuildRinfoObject(handle_wrap.env, addr, nread);
     if (rinfo == nullptr) {
-      napi_value error = CreateErrorValue(env, "Failed to build UDP remote info");
-      CallOnError(env, self, nread, error);
+      napi_value error = CreateErrorValue(handle_wrap.env, "Failed to build UDP remote info");
+      CallOnError(handle_wrap.env, self, nread, error);
       free(buf.base);
       return;
     }
@@ -490,8 +503,8 @@ class UdpWrap final : public UbiUdpWrapBase, public UbiUdpListener {
     if (nread > 0 && static_cast<size_t>(nread) != buf.len) {
       char* trimmed = static_cast<char*>(malloc(static_cast<size_t>(nread)));
       if (trimmed == nullptr) {
-        napi_value error = CreateErrorValue(env, "Failed to trim UDP receive buffer");
-        CallOnError(env, self, nread, error);
+        napi_value error = CreateErrorValue(handle_wrap.env, "Failed to trim UDP receive buffer");
+        CallOnError(handle_wrap.env, self, nread, error);
         free(owned);
         return;
       }
@@ -500,23 +513,23 @@ class UdpWrap final : public UbiUdpWrapBase, public UbiUdpListener {
       owned = trimmed;
     }
 
-    argv[2] = CreateExternalBuffer(env, owned, nread > 0 ? static_cast<size_t>(nread) : 0);
+    argv[2] = CreateExternalBuffer(handle_wrap.env, owned, nread > 0 ? static_cast<size_t>(nread) : 0);
     if (argv[2] == nullptr) {
-      napi_value error = CreateErrorValue(env, "Failed to create UDP buffer");
-      CallOnError(env, self, nread, error);
+      napi_value error = CreateErrorValue(handle_wrap.env, "Failed to create UDP buffer");
+      CallOnError(handle_wrap.env, self, nread, error);
       return;
     }
 
     napi_value ignored = nullptr;
-    UbiMakeCallback(env, self, onmessage, 4, argv, &ignored);
-    (void)UbiHandlePendingExceptionNow(env, nullptr);
+    UbiMakeCallback(handle_wrap.env, self, onmessage, 4, argv, &ignored);
+    (void)UbiHandlePendingExceptionNow(handle_wrap.env, nullptr);
   }
 
   UbiUdpSendWrap* CreateSendWrap(size_t msg_size) override {
     if (current_send_req_obj == nullptr) return nullptr;
 
     SendWrap* req_wrap = nullptr;
-    if (napi_unwrap(env, current_send_req_obj, reinterpret_cast<void**>(&req_wrap)) != napi_ok ||
+    if (napi_unwrap(handle_wrap.env, current_send_req_obj, reinterpret_cast<void**>(&req_wrap)) != napi_ok ||
         req_wrap == nullptr) {
       return nullptr;
     }
@@ -524,24 +537,24 @@ class UdpWrap final : public UbiUdpWrapBase, public UbiUdpListener {
     if (req_wrap->active) return nullptr;
 
     ReleaseSendWrapState(req_wrap);
-    req_wrap->env = env;
+    req_wrap->env = handle_wrap.env;
     req_wrap->msg_size = msg_size;
     req_wrap->have_callback = current_send_has_callback;
     req_wrap->provider_type = kUbiProviderUdpSendWrap;
     if (req_wrap->async_id <= 0 || req_wrap->destroy_queued) {
-      req_wrap->async_id = UbiAsyncWrapNextId(env);
+      req_wrap->async_id = UbiAsyncWrapNextId(handle_wrap.env);
     } else {
-      UbiAsyncWrapReset(env, &req_wrap->async_id);
+      UbiAsyncWrapReset(handle_wrap.env, &req_wrap->async_id);
     }
     req_wrap->destroy_queued = false;
     req_wrap->active = true;
     req_wrap->req.data = req_wrap;
-    if (!CreateStrongRef(env, current_send_req_obj, &req_wrap->active_ref)) {
+    if (!CreateStrongRef(handle_wrap.env, current_send_req_obj, &req_wrap->active_ref)) {
       ReleaseSendWrapState(req_wrap);
       return nullptr;
     }
     if (current_send_chunks_obj != nullptr &&
-        !CreateStrongRef(env, current_send_chunks_obj, &req_wrap->chunks_ref)) {
+        !CreateStrongRef(handle_wrap.env, current_send_chunks_obj, &req_wrap->chunks_ref)) {
       ReleaseSendWrapState(req_wrap);
       return nullptr;
     }
@@ -598,14 +611,9 @@ class UdpWrap final : public UbiUdpWrapBase, public UbiUdpListener {
     wrap->listener()->OnSendDone(req_wrap, status);
   }
 
-  napi_env env = nullptr;
-  napi_ref wrapper_ref = nullptr;
-  napi_ref close_cb_ref = nullptr;
+  UbiHandleWrap handle_wrap{};
   void* active_handle_token = nullptr;
   uv_udp_t handle{};
-  bool closed = false;
-  bool finalized = false;
-  bool delete_on_close = false;
   int32_t provider_type = kUbiProviderUdpWrap;
   int64_t async_id = -1;
   napi_value current_send_req_obj = nullptr;
@@ -615,13 +623,13 @@ class UdpWrap final : public UbiUdpWrapBase, public UbiUdpListener {
 
 bool UdpHandleHasRef(void* data) {
   auto* wrap = static_cast<UdpWrap*>(data);
-  if (wrap == nullptr || wrap->closed) return false;
-  return uv_has_ref(reinterpret_cast<const uv_handle_t*>(&wrap->handle)) != 0;
+  return wrap != nullptr &&
+         UbiHandleWrapHasRef(&wrap->handle_wrap, reinterpret_cast<const uv_handle_t*>(&wrap->handle));
 }
 
 napi_value UdpGetActiveOwner(napi_env env, void* data) {
   auto* wrap = static_cast<UdpWrap*>(data);
-  return wrap != nullptr ? GetRefValue(env, wrap->wrapper_ref) : nullptr;
+  return wrap != nullptr ? UbiHandleWrapGetActiveOwner(env, wrap->handle_wrap.wrapper_ref) : nullptr;
 }
 
 UdpWrap* UnwrapUdpWrap(napi_env env, napi_value value, bool throw_type_error) {
@@ -654,7 +662,7 @@ napi_value GetThis(napi_env env,
 
 void QueueUdpWrapDestroyIfNeeded(UdpWrap* wrap) {
   if (wrap == nullptr || wrap->async_id <= 0) return;
-  UbiAsyncWrapQueueDestroyId(wrap->env, wrap->async_id);
+  UbiAsyncWrapQueueDestroyId(wrap->handle_wrap.env, wrap->async_id);
   wrap->async_id = -1;
 }
 
@@ -673,19 +681,18 @@ void UdpFinalize(napi_env env, void* data, void* hint) {
   (void)hint;
   auto* wrap = static_cast<UdpWrap*>(data);
   if (wrap == nullptr) return;
-  wrap->finalized = true;
-  if (wrap->wrapper_ref != nullptr) {
-    napi_delete_reference(env, wrap->wrapper_ref);
-    wrap->wrapper_ref = nullptr;
-  }
-  if (wrap->close_cb_ref != nullptr) {
-    napi_delete_reference(env, wrap->close_cb_ref);
-    wrap->close_cb_ref = nullptr;
-  }
+  wrap->handle_wrap.finalized = true;
+  UbiHandleWrapDeleteRefIfPresent(env, &wrap->handle_wrap.wrapper_ref);
   uv_handle_t* h = reinterpret_cast<uv_handle_t*>(&wrap->handle);
-  if (!wrap->closed) {
-    wrap->delete_on_close = true;
+  if (wrap->handle_wrap.state == kUbiHandleInitialized) {
+    wrap->handle_wrap.delete_on_close = true;
+    wrap->handle_wrap.state = kUbiHandleClosing;
+    UbiHandleWrapReleaseWrapperRef(&wrap->handle_wrap);
     if (!uv_is_closing(h)) uv_close(h, OnClosed);
+    return;
+  }
+  if (wrap->handle_wrap.state == kUbiHandleClosing) {
+    wrap->handle_wrap.delete_on_close = true;
     return;
   }
   if (wrap->active_handle_token != nullptr) {
@@ -711,7 +718,10 @@ napi_value UdpCtor(napi_env env, napi_callback_info info) {
   size_t argc = 0;
   napi_get_cb_info(env, info, &argc, nullptr, &self, nullptr);
   auto* wrap = new UdpWrap(env);
-  napi_wrap(env, self, wrap, UdpFinalize, nullptr, &wrap->wrapper_ref);
+  napi_wrap(env, self, wrap, UdpFinalize, nullptr, &wrap->handle_wrap.wrapper_ref);
+  if (wrap->handle_wrap.state == kUbiHandleInitialized) {
+    UbiHandleWrapHoldWrapperRef(&wrap->handle_wrap);
+  }
   wrap->active_handle_token =
       UbiRegisterActiveHandle(env, self, "UDPWRAP", UdpHandleHasRef, UdpGetActiveOwner, wrap);
 
@@ -737,23 +747,18 @@ napi_value UdpCtor(napi_env env, napi_callback_info info) {
 void OnClosed(uv_handle_t* h) {
   auto* wrap = static_cast<UdpWrap*>(h->data);
   if (wrap == nullptr) return;
-  wrap->closed = true;
-  if (!wrap->finalized && wrap->close_cb_ref != nullptr) {
-    napi_value self = GetRefValue(wrap->env, wrap->wrapper_ref);
-    napi_value callback = GetRefValue(wrap->env, wrap->close_cb_ref);
-    if (callback != nullptr) {
-      napi_value ignored = nullptr;
-      UbiMakeCallback(wrap->env, self, callback, 0, nullptr, &ignored);
-    }
-    napi_delete_reference(wrap->env, wrap->close_cb_ref);
-    wrap->close_cb_ref = nullptr;
-  }
+  wrap->handle_wrap.state = kUbiHandleClosed;
+  UbiHandleWrapReleaseWrapperRef(&wrap->handle_wrap);
+  UbiHandleWrapMaybeCallOnClose(&wrap->handle_wrap);
   if (wrap->active_handle_token != nullptr) {
-    UbiUnregisterActiveHandle(wrap->env, wrap->active_handle_token);
+    UbiUnregisterActiveHandle(wrap->handle_wrap.env, wrap->active_handle_token);
     wrap->active_handle_token = nullptr;
   }
   QueueUdpWrapDestroyIfNeeded(wrap);
-  if (wrap->delete_on_close || wrap->finalized) delete wrap;
+  if (wrap->handle_wrap.delete_on_close || wrap->handle_wrap.finalized) {
+    UbiHandleWrapDeleteRefIfPresent(wrap->handle_wrap.env, &wrap->handle_wrap.wrapper_ref);
+    delete wrap;
+  }
 }
 
 napi_value UdpBindImpl(napi_env env,
@@ -763,7 +768,10 @@ napi_value UdpBindImpl(napi_env env,
                        bool ipv6,
                        uint32_t flags) {
   if (wrap == nullptr) return MakeInt32(env, UV_EBADF);
-  if (uv_is_closing(reinterpret_cast<uv_handle_t*>(&wrap->handle))) return MakeInt32(env, UV_EBADF);
+  if (wrap->handle_wrap.state != kUbiHandleInitialized ||
+      uv_is_closing(reinterpret_cast<uv_handle_t*>(&wrap->handle))) {
+    return MakeInt32(env, UV_EBADF);
+  }
 
   std::string ip = ValueToUtf8(env, ip_value);
   int rc = 0;
@@ -813,7 +821,10 @@ napi_value UdpOpen(napi_env env, napi_callback_info info) {
   UdpWrap* wrap = nullptr;
   GetThis(env, info, &argc, argv, &wrap);
   if (wrap == nullptr || argc < 1) return MakeInt32(env, wrap == nullptr ? UV_EBADF : UV_EINVAL);
-  if (uv_is_closing(reinterpret_cast<uv_handle_t*>(&wrap->handle))) return MakeInt32(env, UV_EBADF);
+  if (wrap->handle_wrap.state != kUbiHandleInitialized ||
+      uv_is_closing(reinterpret_cast<uv_handle_t*>(&wrap->handle))) {
+    return MakeInt32(env, UV_EBADF);
+  }
   int32_t fd = -1;
   napi_get_value_int32(env, argv[0], &fd);
   return MakeInt32(env, uv_udp_open(&wrap->handle, static_cast<uv_os_sock_t>(fd)));
@@ -837,25 +848,20 @@ napi_value UdpClose(napi_env env, napi_callback_info info) {
   size_t argc = 1;
   napi_value argv[1] = {nullptr};
   UdpWrap* wrap = nullptr;
-  GetThis(env, info, &argc, argv, &wrap);
+  napi_value self = GetThis(env, info, &argc, argv, &wrap);
   if (wrap == nullptr) {
     napi_value undefined = nullptr;
     napi_get_undefined(env, &undefined);
     return undefined;
   }
 
-  if (argc > 0 && argv[0] != nullptr) {
-    if (wrap->close_cb_ref != nullptr) {
-      napi_delete_reference(env, wrap->close_cb_ref);
-      wrap->close_cb_ref = nullptr;
-    }
-    napi_valuetype type = napi_undefined;
-    if (napi_typeof(env, argv[0], &type) == napi_ok && type == napi_function) {
-      napi_create_reference(env, argv[0], 1, &wrap->close_cb_ref);
-    }
+  if (wrap->handle_wrap.state == kUbiHandleInitialized && argc > 0 && argv[0] != nullptr) {
+    UbiHandleWrapSetOnCloseCallback(env, self, argv[0]);
   }
 
-  if (!wrap->closed && !uv_is_closing(reinterpret_cast<uv_handle_t*>(&wrap->handle))) {
+  if (wrap->handle_wrap.state == kUbiHandleInitialized &&
+      !uv_is_closing(reinterpret_cast<uv_handle_t*>(&wrap->handle))) {
+    wrap->handle_wrap.state = kUbiHandleClosing;
     uv_close(reinterpret_cast<uv_handle_t*>(&wrap->handle), OnClosed);
   }
   napi_value undefined = nullptr;
@@ -980,7 +986,9 @@ napi_value UdpGetSockName(napi_env env, napi_callback_info info) {
 napi_value UdpRef(napi_env env, napi_callback_info info) {
   UdpWrap* wrap = nullptr;
   GetThis(env, info, nullptr, nullptr, &wrap);
-  if (wrap != nullptr) uv_ref(reinterpret_cast<uv_handle_t*>(&wrap->handle));
+  if (wrap != nullptr && wrap->handle_wrap.state == kUbiHandleInitialized) {
+    uv_ref(reinterpret_cast<uv_handle_t*>(&wrap->handle));
+  }
   napi_value undefined = nullptr;
   napi_get_undefined(env, &undefined);
   return undefined;
@@ -989,7 +997,9 @@ napi_value UdpRef(napi_env env, napi_callback_info info) {
 napi_value UdpUnref(napi_env env, napi_callback_info info) {
   UdpWrap* wrap = nullptr;
   GetThis(env, info, nullptr, nullptr, &wrap);
-  if (wrap != nullptr) uv_unref(reinterpret_cast<uv_handle_t*>(&wrap->handle));
+  if (wrap != nullptr && wrap->handle_wrap.state == kUbiHandleInitialized) {
+    uv_unref(reinterpret_cast<uv_handle_t*>(&wrap->handle));
+  }
   napi_value undefined = nullptr;
   napi_get_undefined(env, &undefined);
   return undefined;
@@ -998,8 +1008,10 @@ napi_value UdpUnref(napi_env env, napi_callback_info info) {
 napi_value UdpHasRef(napi_env env, napi_callback_info info) {
   UdpWrap* wrap = nullptr;
   GetThis(env, info, nullptr, nullptr, &wrap);
-  return MakeBool(env, wrap != nullptr &&
-                           uv_has_ref(reinterpret_cast<const uv_handle_t*>(&wrap->handle)) != 0);
+  return MakeBool(
+      env,
+      wrap != nullptr &&
+          UbiHandleWrapHasRef(&wrap->handle_wrap, reinterpret_cast<const uv_handle_t*>(&wrap->handle)));
 }
 
 napi_value UdpGetAsyncId(napi_env env, napi_callback_info info) {
@@ -1202,7 +1214,10 @@ napi_value UdpConnectImpl(napi_env env, napi_callback_info info, bool ipv6) {
   UdpWrap* wrap = nullptr;
   GetThis(env, info, &argc, argv, &wrap);
   if (wrap == nullptr || argc < 2) return MakeInt32(env, wrap == nullptr ? UV_EBADF : UV_EINVAL);
-  if (uv_is_closing(reinterpret_cast<uv_handle_t*>(&wrap->handle))) return MakeInt32(env, UV_EBADF);
+  if (wrap->handle_wrap.state != kUbiHandleInitialized ||
+      uv_is_closing(reinterpret_cast<uv_handle_t*>(&wrap->handle))) {
+    return MakeInt32(env, UV_EBADF);
+  }
 
   std::string host = ValueToUtf8(env, argv[0]);
   uint32_t port = 0;
@@ -1230,7 +1245,7 @@ napi_value UdpConnect6(napi_env env, napi_callback_info info) {
 napi_value UdpDisconnect(napi_env env, napi_callback_info info) {
   UdpWrap* wrap = nullptr;
   GetThis(env, info, nullptr, nullptr, &wrap);
-  if (wrap == nullptr) return MakeInt32(env, UV_EBADF);
+  if (wrap == nullptr || wrap->handle_wrap.state != kUbiHandleInitialized) return MakeInt32(env, UV_EBADF);
   return MakeInt32(env, uv_udp_connect(&wrap->handle, nullptr));
 }
 

@@ -701,6 +701,58 @@ bool SetConstructorFunction(v8::Local<v8::Context> context,
   return target->Set(context, OneByteString(context->GetIsolate(), name), ctor).FromMaybe(false);
 }
 
+class StructuredCloneSerializerDelegate final : public v8::ValueSerializer::Delegate {
+ public:
+  explicit StructuredCloneSerializerDelegate(v8::Isolate* isolate)
+      : isolate_(isolate) {}
+
+  void ThrowDataCloneError(v8::Local<v8::String> message) override {
+    isolate_->ThrowException(v8::Exception::Error(message));
+  }
+
+  v8::Maybe<uint32_t> GetSharedArrayBufferId(
+      v8::Isolate* /*isolate*/,
+      v8::Local<v8::SharedArrayBuffer> shared_array_buffer) override {
+    std::shared_ptr<v8::BackingStore> backing_store =
+        shared_array_buffer->GetBackingStore();
+    for (uint32_t i = 0; i < shared_array_buffers_.size(); ++i) {
+      if (shared_array_buffers_[i] == backing_store) {
+        return v8::Just(i);
+      }
+    }
+    shared_array_buffers_.push_back(std::move(backing_store));
+    return v8::Just(static_cast<uint32_t>(shared_array_buffers_.size() - 1));
+  }
+
+  const std::vector<std::shared_ptr<v8::BackingStore>>& shared_array_buffers() const {
+    return shared_array_buffers_;
+  }
+
+ private:
+  v8::Isolate* isolate_ = nullptr;
+  std::vector<std::shared_ptr<v8::BackingStore>> shared_array_buffers_;
+};
+
+class StructuredCloneDeserializerDelegate final : public v8::ValueDeserializer::Delegate {
+ public:
+  StructuredCloneDeserializerDelegate(
+      v8::Isolate* isolate,
+      const std::vector<std::shared_ptr<v8::BackingStore>>& shared_array_buffers)
+      : isolate_(isolate),
+        shared_array_buffers_(shared_array_buffers) {}
+
+  v8::MaybeLocal<v8::SharedArrayBuffer> GetSharedArrayBufferFromId(
+      v8::Isolate* isolate,
+      uint32_t clone_id) override {
+    if (clone_id >= shared_array_buffers_.size()) return {};
+    return v8::SharedArrayBuffer::New(isolate, shared_array_buffers_[clone_id]);
+  }
+
+ private:
+  v8::Isolate* isolate_ = nullptr;
+  const std::vector<std::shared_ptr<v8::BackingStore>>& shared_array_buffers_;
+};
+
 }  // namespace
 
 extern "C" {
@@ -840,6 +892,54 @@ napi_status NAPI_CDECL unofficial_napi_process_microtasks(napi_env env) {
   // Foreground task pumping is owned by higher-level runtime loop policy.
   DrainMicrotasksForEnv(env);
   return napi_ok;
+}
+
+napi_status NAPI_CDECL unofficial_napi_structured_clone(
+    napi_env env,
+    napi_value value,
+    napi_value* result_out) {
+  if (env == nullptr || env->isolate == nullptr || value == nullptr || result_out == nullptr) {
+    return napi_invalid_arg;
+  }
+
+  v8::Isolate* isolate = env->isolate;
+  v8::HandleScope handle_scope(isolate);
+  v8::Local<v8::Context> context = env->context();
+  v8::Context::Scope context_scope(context);
+
+  v8::Local<v8::Value> input = napi_v8_unwrap_value(value);
+  StructuredCloneSerializerDelegate serializer_delegate(isolate);
+  v8::ValueSerializer serializer(isolate, &serializer_delegate);
+
+  serializer.WriteHeader();
+  if (serializer.WriteValue(context, input).IsNothing()) {
+    return isolate->IsExecutionTerminating() ? napi_pending_exception : napi_pending_exception;
+  }
+
+  std::pair<uint8_t*, size_t> released = serializer.Release();
+  if (released.first == nullptr) return napi_generic_failure;
+  std::unique_ptr<uint8_t, decltype(&std::free)> buffer(released.first, &std::free);
+
+  StructuredCloneDeserializerDelegate deserializer_delegate(
+      isolate, serializer_delegate.shared_array_buffers());
+  v8::ValueDeserializer deserializer(
+      isolate,
+      buffer.get(),
+      released.second,
+      &deserializer_delegate);
+
+  bool header_ok = false;
+  if (!deserializer.ReadHeader(context).To(&header_ok) || !header_ok) {
+    return isolate->IsExecutionTerminating() ? napi_pending_exception : napi_pending_exception;
+  }
+
+  v8::Local<v8::Value> output;
+  if (!deserializer.ReadValue(context).ToLocal(&output)) {
+    return isolate->IsExecutionTerminating() ? napi_pending_exception : napi_pending_exception;
+  }
+
+  *result_out = napi_v8_wrap_value(env, output);
+  return *result_out == nullptr ? napi_generic_failure : napi_ok;
 }
 
 napi_status NAPI_CDECL unofficial_napi_enqueue_microtask(napi_env env, napi_value callback) {

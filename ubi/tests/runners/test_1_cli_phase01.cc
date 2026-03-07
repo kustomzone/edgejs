@@ -1787,3 +1787,96 @@ TEST_F(Test1CliPhase01, CliResolvesEntryWithoutJsExtensionLikeNode) {
   EXPECT_NE(result.stdout_output.find("entry-noext-ok"), std::string::npos) << result.stdout_output;
 #endif
 }
+
+TEST_F(Test1CliPhase01, MessagePortMatchesNodeLocalTransferCloseAndRefSemantics) {
+  const auto ubi_path = ResolveBuiltUbiBinary();
+  ASSERT_FALSE(ubi_path.empty()) << "Failed to resolve built ubi binary";
+
+  const std::string script_path = WriteTempScript(
+      "ubi_phase01_cli_messageport_parity",
+      "const assert = require('assert');\n"
+      "const { MessageChannel, receiveMessageOnPort } = require('worker_threads');\n"
+      "(async () => {\n"
+      "  const channel = new MessageChannel();\n"
+      "  assert.strictEqual(channel.port1.hasRef(), false);\n"
+      "  channel.port1.ref();\n"
+      "  assert.strictEqual(channel.port1.hasRef(), true);\n"
+      "  channel.port1.unref();\n"
+      "  assert.strictEqual(channel.port1.hasRef(), false);\n"
+      "  const typedArray = new Uint8Array([0, 1, 2, 3, 4]);\n"
+      "  channel.port2.postMessage({ typedArray }, [typedArray.buffer]);\n"
+      "  assert.strictEqual(typedArray.buffer.byteLength, 0);\n"
+      "  const first = receiveMessageOnPort(channel.port1);\n"
+      "  assert.deepStrictEqual(Array.from(first.message.typedArray), [0, 1, 2, 3, 4]);\n"
+      "  for (const value of [null, 0, -1, {}, []]) {\n"
+      "    assert.throws(() => receiveMessageOnPort(value), {\n"
+      "      name: 'TypeError',\n"
+      "      code: 'ERR_INVALID_ARG_TYPE',\n"
+      "      message: 'The \"port\" argument must be a MessagePort instance'\n"
+      "    });\n"
+      "  }\n"
+      "  const late = new MessageChannel();\n"
+      "  const seen = [];\n"
+      "  late.port2.postMessage('firstMessage');\n"
+      "  late.port2.postMessage('lastMessage');\n"
+      "  late.port2.close();\n"
+      "  late.port1.on('message', (message) => seen.push(message));\n"
+      "  await new Promise((resolve) => setTimeout(resolve, 20));\n"
+      "  assert.deepStrictEqual(seen, ['firstMessage', 'lastMessage']);\n"
+      "  console.log('messageport-parity:ok');\n"
+      "})().catch((err) => {\n"
+      "  console.error(err && err.stack || err);\n"
+      "  process.exitCode = 1;\n"
+      "});\n");
+
+  const CommandResult result =
+      RunBuiltBinaryAndCapture(
+          ubi_path,
+          {script_path},
+          "ubi_phase01_cli_messageport_parity_run");
+
+  RemoveTempScript(script_path);
+
+  ASSERT_NE(result.status, -1);
+  ASSERT_TRUE(WIFEXITED(result.status)) << "status=" << result.status;
+  EXPECT_EQ(WEXITSTATUS(result.status), 0) << "stderr=" << result.stderr_output;
+  EXPECT_TRUE(result.stderr_output.empty()) << "stderr=" << result.stderr_output;
+  EXPECT_NE(result.stdout_output.find("messageport-parity:ok"), std::string::npos)
+      << result.stdout_output;
+}
+
+TEST_F(Test1CliPhase01, MessagingStructuredCloneSupportsSharedArrayBuffer) {
+  const auto ubi_path = ResolveBuiltUbiBinary();
+  ASSERT_FALSE(ubi_path.empty()) << "Failed to resolve built ubi binary";
+
+  const std::string script_path = WriteTempScript(
+      "ubi_phase01_cli_structured_clone_sab",
+      "const assert = require('assert');\n"
+      "const sab = new SharedArrayBuffer(8);\n"
+      "const original = new Uint8Array(sab);\n"
+      "original[0] = 7;\n"
+      "original[1] = 13;\n"
+      "const clone = structuredClone({ sab }).sab;\n"
+      "assert.notStrictEqual(clone, sab);\n"
+      "const cloned = new Uint8Array(clone);\n"
+      "assert.strictEqual(cloned[0], 7);\n"
+      "assert.strictEqual(cloned[1], 13);\n"
+      "original[2] = 29;\n"
+      "assert.strictEqual(cloned[2], 29);\n"
+      "console.log('structured-clone-sab:ok');\n");
+
+  const CommandResult result =
+      RunBuiltBinaryAndCapture(
+          ubi_path,
+          {script_path},
+          "ubi_phase01_cli_structured_clone_sab_run");
+
+  RemoveTempScript(script_path);
+
+  ASSERT_NE(result.status, -1);
+  ASSERT_TRUE(WIFEXITED(result.status)) << "status=" << result.status;
+  EXPECT_EQ(WEXITSTATUS(result.status), 0) << "stderr=" << result.stderr_output;
+  EXPECT_TRUE(result.stderr_output.empty()) << "stderr=" << result.stderr_output;
+  EXPECT_NE(result.stdout_output.find("structured-clone-sab:ok"), std::string::npos)
+      << result.stdout_output;
+}
