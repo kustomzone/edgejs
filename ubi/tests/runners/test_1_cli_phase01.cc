@@ -216,7 +216,8 @@ TEST_F(Test1CliPhase01, CompatWrappedCommandsBypassCliParsingAndPrefixPath) {
   compat_out
       << "#!/bin/sh\n"
       << "printf 'args=%s\\n' \"$*\"\n"
-      << "printf 'path0=%s\\n' \"${PATH%%:*}\"\n";
+      << "printf 'path0=%s\\n' \"${PATH%%:*}\"\n"
+      << "printf 'ubi_binary_path=%s\\n' \"$UBI_BINARY_PATH\"\n";
   compat_out.close();
   ASSERT_TRUE(compat_out.good()) << "Failed to write compat node shim";
   fs::permissions(
@@ -250,6 +251,9 @@ TEST_F(Test1CliPhase01, CompatWrappedCommandsBypassCliParsingAndPrefixPath) {
   EXPECT_TRUE(stderr_output.empty()) << "stderr=" << stderr_output;
   EXPECT_NE(stdout_output.find("args=-p 42"), std::string::npos) << stdout_output;
   EXPECT_NE(stdout_output.find("path0=" + compat_dir.string()), std::string::npos) << stdout_output;
+  EXPECT_NE(stdout_output.find("ubi_binary_path=" + (install_bin_dir / "ubi").string()),
+            std::string::npos)
+      << stdout_output;
 #endif
 }
 
@@ -278,7 +282,8 @@ TEST_F(Test1CliPhase01, CompatWrappedCommandsUseParentBinCompatFromBuildTreeExec
   compat_out
       << "#!/bin/sh\n"
       << "printf 'args=%s\\n' \"$*\"\n"
-      << "printf 'path0=%s\\n' \"${PATH%%:*}\"\n";
+      << "printf 'path0=%s\\n' \"${PATH%%:*}\"\n"
+      << "printf 'ubi_binary_path=%s\\n' \"$UBI_BINARY_PATH\"\n";
   compat_out.close();
   ASSERT_TRUE(compat_out.good()) << "Failed to write compat node shim";
   fs::permissions(
@@ -312,6 +317,9 @@ TEST_F(Test1CliPhase01, CompatWrappedCommandsUseParentBinCompatFromBuildTreeExec
   EXPECT_TRUE(stderr_output.empty()) << "stderr=" << stderr_output;
   EXPECT_NE(stdout_output.find("args=-p 42"), std::string::npos) << stdout_output;
   EXPECT_NE(stdout_output.find("path0=" + compat_dir.string()), std::string::npos) << stdout_output;
+  EXPECT_NE(stdout_output.find("ubi_binary_path=" + (build_dir / "ubi").string()),
+            std::string::npos)
+      << stdout_output;
 #endif
 }
 
@@ -340,7 +348,8 @@ TEST_F(Test1CliPhase01, UbienvAlwaysPrefixesPathAndBypassesCliParsing) {
   compat_out
       << "#!/bin/sh\n"
       << "printf 'args=%s\\n' \"$*\"\n"
-      << "printf 'path0=%s\\n' \"${PATH%%:*}\"\n";
+      << "printf 'path0=%s\\n' \"${PATH%%:*}\"\n"
+      << "printf 'ubi_binary_path=%s\\n' \"$UBI_BINARY_PATH\"\n";
   compat_out.close();
   ASSERT_TRUE(compat_out.good()) << "Failed to write compat tool shim";
   fs::permissions(
@@ -374,6 +383,9 @@ TEST_F(Test1CliPhase01, UbienvAlwaysPrefixesPathAndBypassesCliParsing) {
   EXPECT_TRUE(stderr_output.empty()) << "stderr=" << stderr_output;
   EXPECT_NE(stdout_output.find("args=-p 42"), std::string::npos) << stdout_output;
   EXPECT_NE(stdout_output.find("path0=" + compat_dir.string()), std::string::npos) << stdout_output;
+  EXPECT_NE(stdout_output.find("ubi_binary_path=" + (build_dir / "ubienv").string()),
+            std::string::npos)
+      << stdout_output;
 #endif
 }
 

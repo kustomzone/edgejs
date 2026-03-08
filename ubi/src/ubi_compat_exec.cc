@@ -19,20 +19,24 @@
 
 namespace {
 
+std::string BuildUbiBinaryPath() {
+  namespace fs = std::filesystem;
+  fs::path exec_path = UbiGetProcessExecPath();
+  if (exec_path.empty()) exec_path = "ubi";
+  return exec_path.lexically_normal().string();
+}
+
 std::string BuildCompatWrappedPathPrefix() {
   namespace fs = std::filesystem;
   fs::path exec_path = UbiGetProcessExecPath();
   if (exec_path.empty()) exec_path = "ubi";
   fs::path exec_dir = exec_path.parent_path();
-  const std::string exec_dir_name = exec_dir.filename().string();
   fs::path compat_dir;
 
-  std::vector<fs::path> candidate_dirs;
-  if (exec_dir_name == "bin") {
-    candidate_dirs.push_back(exec_dir.parent_path() / "bin-compat");
-  }
-  candidate_dirs.push_back(exec_dir / "bin-compat");
-  candidate_dirs.push_back(exec_dir.parent_path() / "bin-compat");
+  std::vector<fs::path> candidate_dirs = {
+      (exec_dir / ".." / "bin-compat").lexically_normal(),
+      (exec_dir / "bin-compat").lexically_normal(),
+  };
 
   std::error_code ec;
   for (const fs::path& candidate : candidate_dirs) {
@@ -47,11 +51,7 @@ std::string BuildCompatWrappedPathPrefix() {
   }
 
   if (compat_dir.empty()) {
-    if (exec_dir_name == "bin" || exec_dir_name.rfind("build", 0) == 0) {
-      compat_dir = exec_dir.parent_path() / "bin-compat";
-    } else {
-      compat_dir = exec_dir / "bin-compat";
-    }
+    compat_dir = candidate_dirs.front();
   }
 
 #if defined(_WIN32)
@@ -92,6 +92,7 @@ int UbiRunCompatCommand(int argc, const char* const* argv, std::string* error_ou
   }
 
   const std::string compat_path = BuildCompatWrappedPathPrefix();
+  const std::string ubi_binary_path = BuildUbiBinaryPath();
 
 #if defined(_WIN32)
   std::vector<const char*> child_argv;
@@ -103,14 +104,24 @@ int UbiRunCompatCommand(int argc, const char* const* argv, std::string* error_ou
 
   char* old_path = nullptr;
   size_t old_path_len = 0;
+  char* old_ubi_binary_path = nullptr;
+  size_t old_ubi_binary_path_len = 0;
   (void)_dupenv_s(&old_path, &old_path_len, "PATH");
+  (void)_dupenv_s(&old_ubi_binary_path, &old_ubi_binary_path_len, "UBI_BINARY_PATH");
   _putenv_s("PATH", compat_path.c_str());
+  _putenv_s("UBI_BINARY_PATH", ubi_binary_path.c_str());
   const intptr_t rc = _spawnvp(_P_WAIT, child_argv[0], child_argv.data());
   if (old_path != nullptr) {
     _putenv_s("PATH", old_path);
     free(old_path);
   } else {
     _putenv_s("PATH", "");
+  }
+  if (old_ubi_binary_path != nullptr) {
+    _putenv_s("UBI_BINARY_PATH", old_ubi_binary_path);
+    free(old_ubi_binary_path);
+  } else {
+    _putenv_s("UBI_BINARY_PATH", "");
   }
   if (rc == -1) {
     if (error_out != nullptr) {
@@ -145,6 +156,13 @@ int UbiRunCompatCommand(int argc, const char* const* argv, std::string* error_ou
     if (setenv("PATH", compat_path.c_str(), 1) != 0) {
       const std::string child_error =
           "setenv(PATH) failed for compat command: " + std::string(std::strerror(errno));
+      (void)write(error_pipe[1], child_error.c_str(), child_error.size());
+      _exit(127);
+    }
+    if (setenv("UBI_BINARY_PATH", ubi_binary_path.c_str(), 1) != 0) {
+      const std::string child_error =
+          "setenv(UBI_BINARY_PATH) failed for compat command: " +
+          std::string(std::strerror(errno));
       (void)write(error_pipe[1], child_error.c_str(), child_error.size());
       _exit(127);
     }
