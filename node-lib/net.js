@@ -34,7 +34,6 @@ const {
   NumberIsNaN,
   NumberParseInt,
   ObjectDefineProperty,
-  ObjectGetOwnPropertyDescriptor,
   ObjectSetPrototypeOf,
   Symbol,
   SymbolAsyncDispose,
@@ -2436,13 +2435,11 @@ Server.prototype[EventEmitter.captureRejectionSymbol] = function(
 
 // Legacy alias on the C++ wrapper object. This is not public API, so we may
 // want to runtime-deprecate it at some point. There's no hurry, though.
-if (ObjectGetOwnPropertyDescriptor(TCP.prototype, 'owner') === undefined) {
-  ObjectDefineProperty(TCP.prototype, 'owner', {
-    __proto__: null,
-    get() { return this[owner_symbol]; },
-    set(v) { return this[owner_symbol] = v; },
-  });
-}
+ObjectDefineProperty(TCP.prototype, 'owner', {
+  __proto__: null,
+  get() { return this[owner_symbol]; },
+  set(v) { return this[owner_symbol] = v; },
+});
 
 ObjectDefineProperty(Socket.prototype, '_handle', {
   __proto__: null,

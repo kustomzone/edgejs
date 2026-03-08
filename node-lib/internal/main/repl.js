@@ -35,7 +35,7 @@ if (process.env.NODE_REPL_EXTERNAL_MODULE) {
   }
 
   require('internal/modules/run_main').runEntryPointWithESMLoader(() => {
-    console.log(`Welcome to Node.js ${process.version}.\n` +
+    console.log(`Welcome to Ubi (node version ${process.version}).\n` +
       'Type ".help" for more information.');
 
     const cliRepl = require('internal/repl');

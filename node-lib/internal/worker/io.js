@@ -127,25 +127,23 @@ MessagePort.prototype.hasRef = function hasRef() {
 };
 
 const originalCreateEvent = EventTarget.prototype[kCreateEvent];
-if (ObjectGetOwnPropertyDescriptors(MessagePort.prototype)[kCreateEvent] === undefined) {
-  ObjectDefineProperty(
-    MessagePort.prototype,
-    kCreateEvent,
-    {
-      __proto__: null,
-      value: assignFunctionName(kCreateEvent, function(data, type) {
-        if (type !== 'message' && type !== 'messageerror') {
-          return ReflectApply(originalCreateEvent, this, arguments);
-        }
-        const ports = this[kCurrentlyReceivingPorts];
-        this[kCurrentlyReceivingPorts] = undefined;
-        return lazyMessageEvent(type, { data, ports });
-      }),
-      configurable: false,
-      writable: false,
-      enumerable: false,
-    });
-}
+ObjectDefineProperty(
+  MessagePort.prototype,
+  kCreateEvent,
+  {
+    __proto__: null,
+    value: assignFunctionName(kCreateEvent, function(data, type) {
+      if (type !== 'message' && type !== 'messageerror') {
+        return ReflectApply(originalCreateEvent, this, arguments);
+      }
+      const ports = this[kCurrentlyReceivingPorts];
+      this[kCurrentlyReceivingPorts] = undefined;
+      return lazyMessageEvent(type, { data, ports });
+    }),
+    configurable: false,
+    writable: false,
+    enumerable: false,
+  });
 
 // This is called from inside the `MessagePort` constructor.
 function oninit() {
@@ -157,14 +155,12 @@ function oninit() {
 defineEventHandler(MessagePort.prototype, 'message');
 defineEventHandler(MessagePort.prototype, 'messageerror');
 
-if (ObjectGetOwnPropertyDescriptors(MessagePort.prototype)[onInitSymbol] === undefined) {
-  ObjectDefineProperty(MessagePort.prototype, onInitSymbol, {
-    __proto__: null,
-    enumerable: true,
-    writable: false,
-    value: oninit,
-  });
-}
+ObjectDefineProperty(MessagePort.prototype, onInitSymbol, {
+  __proto__: null,
+  enumerable: true,
+  writable: false,
+  value: oninit,
+});
 
 class MessagePortCloseEvent extends Event {
   constructor() {
@@ -177,14 +173,12 @@ function onclose() {
   this.dispatchEvent(new MessagePortCloseEvent());
 }
 
-if (ObjectGetOwnPropertyDescriptors(MessagePort.prototype)[handleOnCloseSymbol] === undefined) {
-  ObjectDefineProperty(MessagePort.prototype, handleOnCloseSymbol, {
-    __proto__: null,
-    enumerable: false,
-    writable: false,
-    value: onclose,
-  });
-}
+ObjectDefineProperty(MessagePort.prototype, handleOnCloseSymbol, {
+  __proto__: null,
+  enumerable: false,
+  writable: false,
+  value: onclose,
+});
 
 MessagePort.prototype.close = function close(cb) {
   if (typeof cb === 'function')
@@ -192,29 +186,27 @@ MessagePort.prototype.close = function close(cb) {
   FunctionPrototypeCall(MessagePortPrototype.close, this);
 };
 
-if (ObjectGetOwnPropertyDescriptors(MessagePort.prototype)[inspect.custom] === undefined) {
-  ObjectDefineProperty(MessagePort.prototype, inspect.custom, {
-    __proto__: null,
-    enumerable: false,
-    writable: false,
-    value: function inspect() {  // eslint-disable-line func-name-matching
-      let ref;
-      try {
-        // This may throw when `this` does not refer to a native object,
-        // e.g. when accessing the prototype directly.
-        ref = FunctionPrototypeCall(MessagePortPrototype.hasRef, this);
-      } catch { return this; }
-      return ObjectAssign({ __proto__: MessagePort.prototype },
-                          ref === undefined ? {
-                            active: false,
-                          } : {
-                            active: true,
-                            refed: ref,
-                          },
-                          this);
-    },
-  });
-}
+ObjectDefineProperty(MessagePort.prototype, inspect.custom, {
+  __proto__: null,
+  enumerable: false,
+  writable: false,
+  value: function inspect() {  // eslint-disable-line func-name-matching
+    let ref;
+    try {
+      // This may throw when `this` does not refer to a native object,
+      // e.g. when accessing the prototype directly.
+      ref = FunctionPrototypeCall(MessagePortPrototype.hasRef, this);
+    } catch { return this; }
+    return ObjectAssign({ __proto__: MessagePort.prototype },
+                        ref === undefined ? {
+                          active: false,
+                        } : {
+                          active: true,
+                          refed: ref,
+                        },
+                        this);
+  },
+});
 
 function setupPortReferencing(port, eventEmitter, eventName) {
   // Keep track of whether there are any workerMessage listeners:
