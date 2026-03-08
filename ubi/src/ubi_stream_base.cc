@@ -4,6 +4,7 @@
 #include <cstring>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 
 #include "internal_binding/helpers.h"
 #include "ubi_active_resource.h"
@@ -83,6 +84,30 @@ struct LibuvShutdownReq {
 };
 
 std::unordered_map<napi_env, StreamSymbolCache> g_stream_symbols;
+std::unordered_set<napi_env> g_stream_symbol_cleanup_hook_registered;
+
+void OnStreamSymbolsEnvCleanup(void* data) {
+  napi_env env = static_cast<napi_env>(data);
+  g_stream_symbol_cleanup_hook_registered.erase(env);
+
+  auto it = g_stream_symbols.find(env);
+  if (it == g_stream_symbols.end()) return;
+  if (it->second.symbols_ref != nullptr) napi_delete_reference(env, it->second.symbols_ref);
+  if (it->second.owner_symbol_ref != nullptr) napi_delete_reference(env, it->second.owner_symbol_ref);
+  if (it->second.handle_onclose_symbol_ref != nullptr) {
+    napi_delete_reference(env, it->second.handle_onclose_symbol_ref);
+  }
+  g_stream_symbols.erase(it);
+}
+
+void EnsureStreamSymbolsCleanupHook(napi_env env) {
+  if (env == nullptr) return;
+  auto [it, inserted] = g_stream_symbol_cleanup_hook_registered.emplace(env);
+  if (!inserted) return;
+  if (napi_add_env_cleanup_hook(env, OnStreamSymbolsEnvCleanup, env) != napi_ok) {
+    g_stream_symbol_cleanup_hook_registered.erase(it);
+  }
+}
 
 napi_value GetRefValue(napi_env env, napi_ref ref) {
   if (env == nullptr || ref == nullptr) return nullptr;
@@ -133,6 +158,7 @@ napi_value ResolveInternalBinding(napi_env env, const char* name) {
 }
 
 StreamSymbolCache& GetSymbolCache(napi_env env) {
+  EnsureStreamSymbolsCleanupHook(env);
   return g_stream_symbols[env];
 }
 

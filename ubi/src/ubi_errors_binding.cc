@@ -4,6 +4,7 @@
 #include <fstream>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 namespace {
@@ -25,6 +26,37 @@ struct ErrorsStackLocation {
 };
 
 std::unordered_map<napi_env, ErrorsBindingState> g_errors_states;
+std::unordered_set<napi_env> g_errors_cleanup_hook_registered;
+
+void DeleteRefIfPresent(napi_env env, napi_ref* ref) {
+  if (env == nullptr || ref == nullptr || *ref == nullptr) return;
+  napi_delete_reference(env, *ref);
+  *ref = nullptr;
+}
+
+void OnErrorsEnvCleanup(void* data) {
+  napi_env env = static_cast<napi_env>(data);
+  g_errors_cleanup_hook_registered.erase(env);
+
+  auto it = g_errors_states.find(env);
+  if (it == g_errors_states.end()) return;
+  DeleteRefIfPresent(env, &it->second.binding_ref);
+  DeleteRefIfPresent(env, &it->second.prepare_stack_trace_callback_ref);
+  DeleteRefIfPresent(env, &it->second.get_source_map_error_source_ref);
+  DeleteRefIfPresent(env, &it->second.maybe_cache_generated_source_map_ref);
+  DeleteRefIfPresent(env, &it->second.enhance_fatal_stack_before_inspector_ref);
+  DeleteRefIfPresent(env, &it->second.enhance_fatal_stack_after_inspector_ref);
+  g_errors_states.erase(it);
+}
+
+void EnsureErrorsCleanupHook(napi_env env) {
+  if (env == nullptr) return;
+  auto [it, inserted] = g_errors_cleanup_hook_registered.emplace(env);
+  if (!inserted) return;
+  if (napi_add_env_cleanup_hook(env, OnErrorsEnvCleanup, env) != napi_ok) {
+    g_errors_cleanup_hook_registered.erase(it);
+  }
+}
 
 std::string ValueToUtf8(napi_env env, napi_value value) {
   napi_value string_value = nullptr;
@@ -138,10 +170,7 @@ napi_value ErrorsNoSideEffectsToString(napi_env env, napi_callback_info info) {
 
 void ErrorsSetRef(napi_env env, napi_ref* slot, napi_value value) {
   if (slot == nullptr) return;
-  if (*slot != nullptr) {
-    napi_delete_reference(env, *slot);
-    *slot = nullptr;
-  }
+  DeleteRefIfPresent(env, slot);
   napi_valuetype type = napi_undefined;
   if (value != nullptr && napi_typeof(env, value, &type) == napi_ok && type == napi_function) {
     napi_create_reference(env, value, 1, slot);
@@ -481,6 +510,7 @@ napi_value ErrorsTriggerUncaughtException(napi_env env, napi_callback_info info)
 }
 
 napi_value GetOrCreateErrorsBinding(napi_env env) {
+  EnsureErrorsCleanupHook(env);
   auto& st = g_errors_states[env];
   if (st.binding_ref != nullptr) {
     napi_value existing = nullptr;
@@ -533,10 +563,7 @@ napi_value GetOrCreateErrorsBinding(napi_env env) {
   }
   if (napi_set_named_property(env, binding, "exitCodes", exit_codes) != napi_ok) return nullptr;
 
-  if (st.binding_ref != nullptr) {
-    napi_delete_reference(env, st.binding_ref);
-    st.binding_ref = nullptr;
-  }
+  DeleteRefIfPresent(env, &st.binding_ref);
   if (napi_create_reference(env, binding, 1, &st.binding_ref) != napi_ok || st.binding_ref == nullptr) {
     return nullptr;
   }

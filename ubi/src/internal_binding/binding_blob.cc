@@ -7,6 +7,7 @@
 #include <limits>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -31,6 +32,36 @@ struct BlobBindingState {
 };
 
 std::unordered_map<napi_env, BlobBindingState> g_blob_state;
+std::unordered_set<napi_env> g_blob_cleanup_hook_registered;
+
+void DeleteRefIfPresent(napi_env env, napi_ref* ref) {
+  if (env == nullptr || ref == nullptr || *ref == nullptr) return;
+  napi_delete_reference(env, *ref);
+  *ref = nullptr;
+}
+
+void OnBlobEnvCleanup(void* data) {
+  napi_env env = static_cast<napi_env>(data);
+  g_blob_cleanup_hook_registered.erase(env);
+
+  auto it = g_blob_state.find(env);
+  if (it == g_blob_state.end()) return;
+  for (auto& entry : it->second.objects) {
+    DeleteRefIfPresent(env, &entry.second.handle_ref);
+  }
+  it->second.objects.clear();
+  DeleteRefIfPresent(env, &it->second.binding_ref);
+  g_blob_state.erase(it);
+}
+
+void EnsureBlobCleanupHook(napi_env env) {
+  if (env == nullptr) return;
+  auto [it, inserted] = g_blob_cleanup_hook_registered.emplace(env);
+  if (!inserted) return;
+  if (napi_add_env_cleanup_hook(env, OnBlobEnvCleanup, env) != napi_ok) {
+    g_blob_cleanup_hook_registered.erase(it);
+  }
+}
 
 bool GetNamedProperty(napi_env env, napi_value obj, const char* key, napi_value* out) {
   if (out == nullptr) return false;
@@ -455,7 +486,7 @@ napi_value BlobStoreDataObjectCallback(napi_env env, napi_callback_info info) {
   auto existing = state.objects.find(key);
   if (existing != state.objects.end()) {
     if (existing->second.handle_ref != nullptr) {
-      napi_delete_reference(env, existing->second.handle_ref);
+      DeleteRefIfPresent(env, &existing->second.handle_ref);
     }
     state.objects.erase(existing);
   }
@@ -517,9 +548,7 @@ napi_value BlobRevokeObjectURLCallback(napi_env env, napi_callback_info info) {
   if (state_it == g_blob_state.end()) return Undefined(env);
   auto item_it = state_it->second.objects.find(key);
   if (item_it == state_it->second.objects.end()) return Undefined(env);
-  if (item_it->second.handle_ref != nullptr) {
-    napi_delete_reference(env, item_it->second.handle_ref);
-  }
+  DeleteRefIfPresent(env, &item_it->second.handle_ref);
   state_it->second.objects.erase(item_it);
   return Undefined(env);
 }
@@ -535,6 +564,7 @@ bool DefineMethod(napi_env env, napi_value target, const char* name, napi_callba
 }  // namespace
 
 napi_value ResolveBlob(napi_env env, const ResolveOptions& /*options*/) {
+  EnsureBlobCleanupHook(env);
   auto state_it = g_blob_state.find(env);
   if (state_it != g_blob_state.end() && state_it->second.binding_ref != nullptr) {
     napi_value cached = nullptr;
@@ -556,10 +586,7 @@ napi_value ResolveBlob(napi_env env, const ResolveOptions& /*options*/) {
   }
 
   BlobBindingState& state = g_blob_state[env];
-  if (state.binding_ref != nullptr) {
-    napi_delete_reference(env, state.binding_ref);
-    state.binding_ref = nullptr;
-  }
+  DeleteRefIfPresent(env, &state.binding_ref);
   if (napi_create_reference(env, binding, 1, &state.binding_ref) != napi_ok) {
     state.binding_ref = nullptr;
   }

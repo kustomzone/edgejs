@@ -1,6 +1,7 @@
 #include "ubi_handle_wrap.h"
 
 #include <unordered_map>
+#include <unordered_set>
 
 #include "internal_binding/helpers.h"
 #include "ubi_module_loader.h"
@@ -15,6 +16,34 @@ struct HandleSymbolCache {
 };
 
 std::unordered_map<napi_env, HandleSymbolCache> g_handle_symbols;
+std::unordered_set<napi_env> g_handle_symbol_cleanup_hook_registered;
+
+void DeleteRefIfPresent(napi_env env, napi_ref* ref) {
+  if (env == nullptr || ref == nullptr || *ref == nullptr) return;
+  napi_delete_reference(env, *ref);
+  *ref = nullptr;
+}
+
+void OnHandleSymbolsEnvCleanup(void* data) {
+  napi_env env = static_cast<napi_env>(data);
+  g_handle_symbol_cleanup_hook_registered.erase(env);
+
+  auto it = g_handle_symbols.find(env);
+  if (it == g_handle_symbols.end()) return;
+  DeleteRefIfPresent(env, &it->second.symbols_ref);
+  DeleteRefIfPresent(env, &it->second.owner_symbol_ref);
+  DeleteRefIfPresent(env, &it->second.handle_onclose_symbol_ref);
+  g_handle_symbols.erase(it);
+}
+
+void EnsureHandleSymbolsCleanupHook(napi_env env) {
+  if (env == nullptr) return;
+  auto [it, inserted] = g_handle_symbol_cleanup_hook_registered.emplace(env);
+  if (!inserted) return;
+  if (napi_add_env_cleanup_hook(env, OnHandleSymbolsEnvCleanup, env) != napi_ok) {
+    g_handle_symbol_cleanup_hook_registered.erase(it);
+  }
+}
 
 napi_value ResolveInternalBinding(napi_env env, const char* name) {
   if (env == nullptr || name == nullptr) return nullptr;
@@ -56,6 +85,7 @@ napi_value ResolveInternalBinding(napi_env env, const char* name) {
 }
 
 HandleSymbolCache& GetHandleSymbolCache(napi_env env) {
+  EnsureHandleSymbolsCleanupHook(env);
   return g_handle_symbols[env];
 }
 

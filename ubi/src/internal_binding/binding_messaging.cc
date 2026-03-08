@@ -7,6 +7,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <uv.h>
@@ -75,6 +76,7 @@ struct MessagingState {
 };
 
 std::unordered_map<napi_env, MessagingState> g_messaging_states;
+std::unordered_set<napi_env> g_messaging_cleanup_hook_registered;
 std::mutex g_broadcast_groups_mutex;
 std::unordered_map<std::string, std::weak_ptr<BroadcastChannelGroup>> g_broadcast_groups;
 
@@ -150,6 +152,35 @@ void DeleteTransferredPortRefs(napi_env env,
   for (auto& entry : *transferred_ports) {
     DeleteRefIfPresent(env, &entry.source_port_ref);
   }
+}
+
+void OnMessagingEnvCleanup(void* data) {
+  napi_env env = static_cast<napi_env>(data);
+  g_messaging_cleanup_hook_registered.erase(env);
+
+  auto it = g_messaging_states.find(env);
+  if (it == g_messaging_states.end()) return;
+  DeleteRefIfPresent(env, &it->second.binding_ref);
+  DeleteRefIfPresent(env, &it->second.deserializer_create_object_ref);
+  DeleteRefIfPresent(env, &it->second.emit_message_ref);
+  DeleteRefIfPresent(env, &it->second.message_port_ctor_ref);
+  DeleteRefIfPresent(env, &it->second.no_message_symbol_ref);
+  DeleteRefIfPresent(env, &it->second.oninit_symbol_ref);
+  g_messaging_states.erase(it);
+}
+
+void EnsureMessagingCleanupHook(napi_env env) {
+  if (env == nullptr) return;
+  auto [it, inserted] = g_messaging_cleanup_hook_registered.emplace(env);
+  if (!inserted) return;
+  if (napi_add_env_cleanup_hook(env, OnMessagingEnvCleanup, env) != napi_ok) {
+    g_messaging_cleanup_hook_registered.erase(it);
+  }
+}
+
+MessagingState& EnsureMessagingState(napi_env env) {
+  EnsureMessagingCleanupHook(env);
+  return g_messaging_states[env];
 }
 
 void ThrowTypeErrorWithCode(napi_env env, const char* code, const char* message) {
@@ -1976,7 +2007,7 @@ void ConnectPorts(napi_env env, napi_value first, napi_value second) {
 }
 
 bool EnsureMessagingSymbols(napi_env env, const ResolveOptions& options) {
-  auto& state = g_messaging_states[env];
+  auto& state = EnsureMessagingState(env);
   if (state.no_message_symbol_ref != nullptr &&
       state.oninit_symbol_ref != nullptr) {
     return true;
@@ -2289,7 +2320,7 @@ napi_value SetDeserializerCreateObjectFunctionCallback(napi_env env, napi_callba
   napi_value argv[1] = {nullptr};
   if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok) return nullptr;
 
-  auto& state = g_messaging_states[env];
+  auto& state = EnsureMessagingState(env);
   DeleteRefIfPresent(env, &state.deserializer_create_object_ref);
   if (argc >= 1 && IsFunction(env, argv[0])) {
     napi_create_reference(env, argv[0], 1, &state.deserializer_create_object_ref);
@@ -2607,7 +2638,7 @@ napi_value ResolveDOMExceptionValue(napi_env env) {
 }
 
 napi_value ResolveEmitMessageValue(napi_env env) {
-  auto& state = g_messaging_states[env];
+  auto& state = EnsureMessagingState(env);
   napi_value cached = GetRefValue(env, state.emit_message_ref);
   if (IsFunction(env, cached)) return cached;
 
@@ -2685,7 +2716,7 @@ napi_value ResolveMessaging(napi_env env, const ResolveOptions& options) {
   napi_value cached = GetCachedMessaging(env);
   if (cached != nullptr) return cached;
 
-  auto& state = g_messaging_states[env];
+  auto& state = EnsureMessagingState(env);
   EnsureMessagingSymbols(env, options);
 
   napi_value out = nullptr;

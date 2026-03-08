@@ -818,11 +818,11 @@ struct CompressionHandle {
   napi_env env = nullptr;
   napi_ref wrapper_ref = nullptr;
   napi_ref process_callback_ref = nullptr;
+  napi_ref write_result_ref = nullptr;
   napi_async_work async_work = nullptr;
   std::unique_ptr<CompressionContextBase> context;
   HandleKind kind = HandleKind::kZlib;
   NodeZlibMode mode = NodeZlibMode::kNone;
-  uint32_t* write_result = nullptr;
   std::atomic<int64_t> pending_external_memory{0};
   int64_t reported_external_memory = 0;
   int64_t async_id = -1;
@@ -1028,6 +1028,31 @@ bool ExtractUint32ArrayData(napi_env env, napi_value value, uint32_t** data, siz
   return true;
 }
 
+bool StoreWriteResultRef(CompressionHandle* handle, napi_value value) {
+  if (handle == nullptr || handle->env == nullptr) return false;
+  uint32_t* write_result = nullptr;
+  size_t write_result_len = 0;
+  if (!ExtractUint32ArrayData(handle->env, value, &write_result, &write_result_len) || write_result_len < 2) {
+    return false;
+  }
+
+  DeleteRefIfPresent(handle->env, &handle->write_result_ref);
+  return napi_create_reference(handle->env, value, 1, &handle->write_result_ref) == napi_ok &&
+         handle->write_result_ref != nullptr;
+}
+
+bool GetWriteResultData(CompressionHandle* handle, uint32_t** data_out) {
+  if (data_out == nullptr) return false;
+  *data_out = nullptr;
+  if (handle == nullptr || handle->env == nullptr || handle->write_result_ref == nullptr) return false;
+
+  napi_value value = GetRefValue(handle->env, handle->write_result_ref);
+  if (value == nullptr) return false;
+
+  size_t length = 0;
+  return ExtractUint32ArrayData(handle->env, value, data_out, &length) && length >= 2;
+}
+
 CompressionHandle* UnwrapHandle(napi_env env,
                                 napi_callback_info info,
                                 napi_value* self = nullptr,
@@ -1148,16 +1173,18 @@ void CloseHandle(CompressionHandle* handle) {
   if (handle->context != nullptr) {
     handle->context->Close();
   }
+  DeleteRefIfPresent(handle->env, &handle->write_result_ref);
   ReportExternalMemory(handle);
 }
 
 void UpdateWriteResult(CompressionHandle* handle) {
-  if (handle == nullptr || handle->write_result == nullptr || handle->context == nullptr) return;
+  uint32_t* write_result = nullptr;
+  if (handle == nullptr || handle->context == nullptr || !GetWriteResultData(handle, &write_result)) return;
   uint32_t avail_in = 0;
   uint32_t avail_out = 0;
   handle->context->GetAfterWriteOffsets(&avail_in, &avail_out);
-  handle->write_result[0] = avail_out;
-  handle->write_result[1] = avail_in;
+  write_result[0] = avail_out;
+  write_result[1] = avail_in;
 }
 
 void EmitError(CompressionHandle* handle, const CompressionError& err) {
@@ -1304,6 +1331,7 @@ void CompressionFinalize(napi_env env, void* data, void* /*hint*/) {
   CloseHandle(handle);
   ReportExternalMemory(handle);
   QueueDestroyIfNeeded(handle);
+  DeleteRefIfPresent(env, &handle->write_result_ref);
   DeleteRefIfPresent(env, &handle->process_callback_ref);
   DeleteRefIfPresent(env, &handle->wrapper_ref);
   delete handle;
@@ -1417,7 +1445,7 @@ napi_value CompressionInit(napi_env env, napi_callback_info info) {
           write_result_len < 2) {
         return Undefined(env);
       }
-      handle->write_result = write_result;
+      if (!StoreWriteResultRef(handle, argv[4])) return Undefined(env);
       StoreProcessCallback(handle, argv[5]);
 
       std::vector<unsigned char> dictionary;
@@ -1447,14 +1475,10 @@ napi_value CompressionInit(napi_env env, napi_callback_info info) {
       if (argc < 3) return Undefined(env);
       uint32_t* init_params = nullptr;
       size_t init_params_len = 0;
-      uint32_t* write_result = nullptr;
-      size_t write_result_len = 0;
       if (!ExtractUint32ArrayData(env, argv[0], &init_params, &init_params_len) ||
-          !ExtractUint32ArrayData(env, argv[1], &write_result, &write_result_len) ||
-          write_result_len < 2) {
+          !StoreWriteResultRef(handle, argv[1])) {
         return Undefined(env);
       }
-      handle->write_result = write_result;
       StoreProcessCallback(handle, argv[2]);
 
       CompressionError init_error;
@@ -1488,14 +1512,10 @@ napi_value CompressionInit(napi_env env, napi_callback_info info) {
       if (argc < 4) return Undefined(env);
       uint32_t* init_params = nullptr;
       size_t init_params_len = 0;
-      uint32_t* write_result = nullptr;
-      size_t write_result_len = 0;
       if (!ExtractUint32ArrayData(env, argv[0], &init_params, &init_params_len) ||
-          !ExtractUint32ArrayData(env, argv[2], &write_result, &write_result_len) ||
-          write_result_len < 2) {
+          !StoreWriteResultRef(handle, argv[2])) {
         return Undefined(env);
       }
-      handle->write_result = write_result;
       StoreProcessCallback(handle, argv[3]);
 
       uint64_t pledged_src_size = ZSTD_CONTENTSIZE_UNKNOWN;

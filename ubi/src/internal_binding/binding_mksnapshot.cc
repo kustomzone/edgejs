@@ -1,6 +1,7 @@
 #include "internal_binding/dispatch.h"
 
 #include <unordered_map>
+#include <unordered_set>
 
 #include "internal_binding/helpers.h"
 
@@ -9,6 +10,32 @@ namespace internal_binding {
 namespace {
 
 std::unordered_map<napi_env, napi_ref> g_mksnapshot_refs;
+std::unordered_set<napi_env> g_mksnapshot_cleanup_hook_registered;
+
+void DeleteRefIfPresent(napi_env env, napi_ref* ref) {
+  if (env == nullptr || ref == nullptr || *ref == nullptr) return;
+  napi_delete_reference(env, *ref);
+  *ref = nullptr;
+}
+
+void OnMksnapshotEnvCleanup(void* data) {
+  napi_env env = static_cast<napi_env>(data);
+  g_mksnapshot_cleanup_hook_registered.erase(env);
+
+  auto it = g_mksnapshot_refs.find(env);
+  if (it == g_mksnapshot_refs.end()) return;
+  DeleteRefIfPresent(env, &it->second);
+  g_mksnapshot_refs.erase(it);
+}
+
+void EnsureMksnapshotCleanupHook(napi_env env) {
+  if (env == nullptr) return;
+  auto [it, inserted] = g_mksnapshot_cleanup_hook_registered.emplace(env);
+  if (!inserted) return;
+  if (napi_add_env_cleanup_hook(env, OnMksnapshotEnvCleanup, env) != napi_ok) {
+    g_mksnapshot_cleanup_hook_registered.erase(it);
+  }
+}
 
 napi_value ReturnUndefined(napi_env env, napi_callback_info /*info*/) {
   return Undefined(env);
@@ -25,6 +52,7 @@ napi_value GetCachedMksnapshot(napi_env env) {
 }  // namespace
 
 napi_value ResolveMksnapshot(napi_env env, const ResolveOptions& /*options*/) {
+  EnsureMksnapshotCleanupHook(env);
   const napi_value undefined = Undefined(env);
   napi_value cached = GetCachedMksnapshot(env);
   if (cached != nullptr) return cached;
@@ -59,10 +87,7 @@ napi_value ResolveMksnapshot(napi_env env, const ResolveOptions& /*options*/) {
   SetString(env, out, "anonymousMainPath", "<anonymous>");
 
   auto& ref = g_mksnapshot_refs[env];
-  if (ref != nullptr) {
-    napi_delete_reference(env, ref);
-    ref = nullptr;
-  }
+  DeleteRefIfPresent(env, &ref);
   napi_create_reference(env, out, 1, &ref);
   return out;
 }

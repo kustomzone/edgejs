@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 
 #include <uv.h>
 
@@ -43,6 +44,28 @@ struct TcpBindingState {
 };
 
 std::unordered_map<napi_env, TcpBindingState> g_tcp_states;
+std::unordered_set<napi_env> g_tcp_cleanup_hook_registered;
+
+void OnTcpEnvCleanup(void* data) {
+  napi_env env = static_cast<napi_env>(data);
+  g_tcp_cleanup_hook_registered.erase(env);
+
+  auto it = g_tcp_states.find(env);
+  if (it == g_tcp_states.end()) return;
+  if (it->second.tcp_ctor_ref != nullptr) napi_delete_reference(env, it->second.tcp_ctor_ref);
+  if (it->second.connect_wrap_ctor_ref != nullptr) napi_delete_reference(env, it->second.connect_wrap_ctor_ref);
+  if (it->second.tcp_binding_ref != nullptr) napi_delete_reference(env, it->second.tcp_binding_ref);
+  g_tcp_states.erase(it);
+}
+
+void EnsureTcpCleanupHook(napi_env env) {
+  if (env == nullptr) return;
+  auto [it, inserted] = g_tcp_cleanup_hook_registered.emplace(env);
+  if (!inserted) return;
+  if (napi_add_env_cleanup_hook(env, OnTcpEnvCleanup, env) != napi_ok) {
+    g_tcp_cleanup_hook_registered.erase(it);
+  }
+}
 
 TcpBindingState* GetBindingState(napi_env env) {
   auto it = g_tcp_states.find(env);
@@ -51,6 +74,7 @@ TcpBindingState* GetBindingState(napi_env env) {
 }
 
 TcpBindingState& EnsureBindingState(napi_env env) {
+  EnsureTcpCleanupHook(env);
   return g_tcp_states[env];
 }
 

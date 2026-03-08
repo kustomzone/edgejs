@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 
 #include <uv.h>
 
@@ -28,8 +29,32 @@ struct TtyBindingState {
 };
 
 std::unordered_map<napi_env, TtyBindingState> g_tty_states;
+std::unordered_set<napi_env> g_tty_cleanup_hook_registered;
 
-TtyBindingState& EnsureBindingState(napi_env env) { return g_tty_states[env]; }
+void OnTtyEnvCleanup(void* data) {
+  napi_env env = static_cast<napi_env>(data);
+  g_tty_cleanup_hook_registered.erase(env);
+
+  auto it = g_tty_states.find(env);
+  if (it == g_tty_states.end()) return;
+  if (it->second.tty_ctor_ref != nullptr) napi_delete_reference(env, it->second.tty_ctor_ref);
+  if (it->second.binding_ref != nullptr) napi_delete_reference(env, it->second.binding_ref);
+  g_tty_states.erase(it);
+}
+
+void EnsureTtyCleanupHook(napi_env env) {
+  if (env == nullptr) return;
+  auto [it, inserted] = g_tty_cleanup_hook_registered.emplace(env);
+  if (!inserted) return;
+  if (napi_add_env_cleanup_hook(env, OnTtyEnvCleanup, env) != napi_ok) {
+    g_tty_cleanup_hook_registered.erase(it);
+  }
+}
+
+TtyBindingState& EnsureBindingState(napi_env env) {
+  EnsureTtyCleanupHook(env);
+  return g_tty_states[env];
+}
 
 TtyWrap* FromBase(UbiStreamBase* base) {
   if (base == nullptr) return nullptr;

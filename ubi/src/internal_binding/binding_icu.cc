@@ -8,6 +8,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #define U_DISABLE_RENAMING 1
@@ -44,6 +45,32 @@ struct ConverterWrap {
 };
 
 std::unordered_map<napi_env, IcuBindingState> g_icu_states;
+std::unordered_set<napi_env> g_icu_cleanup_hook_registered;
+
+void DeleteRefIfPresent(napi_env env, napi_ref* ref) {
+  if (env == nullptr || ref == nullptr || *ref == nullptr) return;
+  napi_delete_reference(env, *ref);
+  *ref = nullptr;
+}
+
+void OnIcuEnvCleanup(void* data) {
+  napi_env env = static_cast<napi_env>(data);
+  g_icu_cleanup_hook_registered.erase(env);
+
+  auto it = g_icu_states.find(env);
+  if (it == g_icu_states.end()) return;
+  DeleteRefIfPresent(env, &it->second.binding_ref);
+  g_icu_states.erase(it);
+}
+
+void EnsureIcuCleanupHook(napi_env env) {
+  if (env == nullptr) return;
+  auto [it, inserted] = g_icu_cleanup_hook_registered.emplace(env);
+  if (!inserted) return;
+  if (napi_add_env_cleanup_hook(env, OnIcuEnvCleanup, env) != napi_ok) {
+    g_icu_cleanup_hook_registered.erase(it);
+  }
+}
 
 bool IsBigEndian() {
   const uint16_t marker = 0x0102;
@@ -629,6 +656,7 @@ bool SetFunction(napi_env env, napi_value object, const char* name, napi_callbac
 }  // namespace
 
 napi_value ResolveIcu(napi_env env, const ResolveOptions& /*options*/) {
+  EnsureIcuCleanupHook(env);
   auto cached_it = g_icu_states.find(env);
   if (cached_it != g_icu_states.end() && cached_it->second.binding_ref != nullptr) {
     napi_value cached = nullptr;
@@ -650,10 +678,7 @@ napi_value ResolveIcu(napi_env env, const ResolveOptions& /*options*/) {
   }
 
   auto& state = g_icu_states[env];
-  if (state.binding_ref != nullptr) {
-    napi_delete_reference(env, state.binding_ref);
-    state.binding_ref = nullptr;
-  }
+  DeleteRefIfPresent(env, &state.binding_ref);
   napi_create_reference(env, out, 1, &state.binding_ref);
   return out;
 }

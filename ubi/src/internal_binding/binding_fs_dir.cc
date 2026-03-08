@@ -3,6 +3,7 @@
 #include <cstring>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <uv.h>
@@ -48,6 +49,7 @@ struct DirReq {
 };
 
 std::unordered_map<napi_env, FsDirBindingState> g_fs_dir_states;
+std::unordered_set<napi_env> g_fs_dir_cleanup_hook_registered;
 
 FsDirBindingState* GetState(napi_env env) {
   auto it = g_fs_dir_states.find(env);
@@ -66,6 +68,26 @@ void ResetRef(napi_env env, napi_ref* ref_ptr) {
   if (ref_ptr == nullptr || *ref_ptr == nullptr) return;
   napi_delete_reference(env, *ref_ptr);
   *ref_ptr = nullptr;
+}
+
+void OnFsDirEnvCleanup(void* data) {
+  napi_env env = static_cast<napi_env>(data);
+  g_fs_dir_cleanup_hook_registered.erase(env);
+
+  auto it = g_fs_dir_states.find(env);
+  if (it == g_fs_dir_states.end()) return;
+  ResetRef(env, &it->second.binding_ref);
+  ResetRef(env, &it->second.dir_handle_ctor_ref);
+  g_fs_dir_states.erase(it);
+}
+
+void EnsureFsDirCleanupHook(napi_env env) {
+  if (env == nullptr) return;
+  auto [it, inserted] = g_fs_dir_cleanup_hook_registered.emplace(env);
+  if (!inserted) return;
+  if (napi_add_env_cleanup_hook(env, OnFsDirEnvCleanup, env) != napi_ok) {
+    g_fs_dir_cleanup_hook_registered.erase(it);
+  }
 }
 
 void SetNamedMethod(napi_env env, napi_value obj, const char* name, napi_callback cb) {
@@ -558,6 +580,7 @@ napi_value FsDirOpendirSync(napi_env env, napi_callback_info info) {
 }  // namespace
 
 napi_value ResolveFsDir(napi_env env, const ResolveOptions& options) {
+  EnsureFsDirCleanupHook(env);
   if (options.callbacks.resolve_binding == nullptr) return Undefined(env);
   napi_value binding = options.callbacks.resolve_binding(env, options.state, "fs_dir");
   if (binding == nullptr || IsUndefined(env, binding)) return Undefined(env);

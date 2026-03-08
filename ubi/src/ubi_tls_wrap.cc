@@ -5,6 +5,7 @@
 #include <deque>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -71,6 +72,7 @@ struct TlsBindingState {
 };
 
 std::unordered_map<napi_env, TlsBindingState> g_tls_states;
+std::unordered_set<napi_env> g_tls_cleanup_hook_registered;
 
 napi_value Undefined(napi_env env) {
   napi_value out = nullptr;
@@ -163,6 +165,38 @@ void SetState(napi_env env, int idx, int32_t value) {
 }
 
 TlsBindingState& EnsureState(napi_env env) {
+  if (env != nullptr) {
+    auto [it, inserted] = g_tls_cleanup_hook_registered.emplace(env);
+    if (inserted && napi_add_env_cleanup_hook(
+                        env,
+                        [](void* data) {
+                          napi_env cleanup_env = static_cast<napi_env>(data);
+                          g_tls_cleanup_hook_registered.erase(cleanup_env);
+
+                          auto state_it = g_tls_states.find(cleanup_env);
+                          if (state_it == g_tls_states.end()) return;
+                          for (TlsWrap* wrap : state_it->second.wraps) {
+                            if (wrap == nullptr) continue;
+                            DeleteRefIfPresent(cleanup_env, &wrap->wrapper_ref);
+                            DeleteRefIfPresent(cleanup_env, &wrap->parent_ref);
+                            DeleteRefIfPresent(cleanup_env, &wrap->context_ref);
+                            DeleteRefIfPresent(cleanup_env, &wrap->pending_shutdown_req_ref);
+                            for (auto& pending : wrap->pending_app_writes) {
+                              DeleteRefIfPresent(cleanup_env, &pending.req_ref);
+                            }
+                            for (auto& pending : wrap->pending_encrypted_writes) {
+                              DeleteRefIfPresent(cleanup_env, &pending.completion_req_ref);
+                            }
+                          }
+                          DeleteRefIfPresent(cleanup_env, &state_it->second.binding_ref);
+                          DeleteRefIfPresent(cleanup_env, &state_it->second.tls_wrap_ctor_ref);
+                          state_it->second.wraps.clear();
+                          g_tls_states.erase(state_it);
+                        },
+                        env) != napi_ok) {
+      g_tls_cleanup_hook_registered.erase(it);
+    }
+  }
   return g_tls_states[env];
 }
 

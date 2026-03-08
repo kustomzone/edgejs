@@ -1,6 +1,7 @@
 #include "internal_binding/dispatch.h"
 
 #include <unordered_map>
+#include <unordered_set>
 
 #include "internal_binding/helpers.h"
 #include "ubi_module_loader.h"
@@ -11,6 +12,32 @@ namespace internal_binding {
 namespace {
 
 std::unordered_map<napi_env, napi_ref> g_symbols_refs;
+std::unordered_set<napi_env> g_symbols_cleanup_hook_registered;
+
+void DeleteRefIfPresent(napi_env env, napi_ref* ref) {
+  if (env == nullptr || ref == nullptr || *ref == nullptr) return;
+  napi_delete_reference(env, *ref);
+  *ref = nullptr;
+}
+
+void OnSymbolsEnvCleanup(void* data) {
+  napi_env env = static_cast<napi_env>(data);
+  g_symbols_cleanup_hook_registered.erase(env);
+
+  auto it = g_symbols_refs.find(env);
+  if (it == g_symbols_refs.end()) return;
+  DeleteRefIfPresent(env, &it->second);
+  g_symbols_refs.erase(it);
+}
+
+void EnsureSymbolsCleanupHook(napi_env env) {
+  if (env == nullptr) return;
+  auto [it, inserted] = g_symbols_cleanup_hook_registered.emplace(env);
+  if (!inserted) return;
+  if (napi_add_env_cleanup_hook(env, OnSymbolsEnvCleanup, env) != napi_ok) {
+    g_symbols_cleanup_hook_registered.erase(it);
+  }
+}
 
 napi_value GetCachedSymbols(napi_env env) {
   auto it = g_symbols_refs.find(env);
@@ -34,6 +61,7 @@ napi_value GetPerIsolateSymbolSource(napi_env env) {
 }  // namespace
 
 napi_value ResolveSymbols(napi_env env, const ResolveOptions& /*options*/) {
+  EnsureSymbolsCleanupHook(env);
   const napi_value undefined = Undefined(env);
   napi_value existing = GetCachedSymbols(env);
   if (existing != nullptr) return existing;
@@ -74,10 +102,7 @@ napi_value ResolveSymbols(napi_env env, const ResolveOptions& /*options*/) {
   set_symbol("imported_cjs_symbol", "imported_cjs_symbol");
 
   auto& ref = g_symbols_refs[env];
-  if (ref != nullptr) {
-    napi_delete_reference(env, ref);
-    ref = nullptr;
-  }
+  DeleteRefIfPresent(env, &ref);
   napi_create_reference(env, out, 1, &ref);
   return out;
 }

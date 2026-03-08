@@ -753,6 +753,41 @@ assert.strictEqual(
 globalThis.__ubi_symbol_bootstrap_parity_ok = 1;
 )JS";
 
+constexpr const char* kBindingCleanupRecreateScript = R"JS(
+const assert = require('assert');
+
+for (const name of [
+  'blob',
+  'config',
+  'constants',
+  'fs',
+  'fs_dir',
+  'messaging',
+  'mksnapshot',
+  'module_wrap',
+  'performance',
+  'permission',
+  'pipe_wrap',
+  'stream_wrap',
+  'symbols',
+  'tcp_wrap',
+  'tty_wrap',
+  'util',
+  'wasm_web_api',
+]) {
+  const binding = internalBinding(name);
+  assert.ok(binding && (typeof binding === 'object' || typeof binding === 'function'), name);
+}
+
+require('fs');
+require('node:buffer');
+require('node:net');
+require('node:perf_hooks');
+require('node:tls');
+
+globalThis.__ubi_binding_cleanup_recreate_ok = 1;
+)JS";
+
 }  // namespace
 
 TEST_F(Test5InternalBindingParityPhase03, WaveOneAndTwoBindingsHaveCriticalParitySurface) {
@@ -772,6 +807,27 @@ TEST_F(Test5InternalBindingParityPhase03, WaveOneAndTwoBindingsHaveCriticalParit
   int32_t ok = 0;
   ASSERT_EQ(napi_get_value_int32(s.env, ok_value, &ok), napi_ok);
   EXPECT_EQ(ok, 1);
+}
+
+TEST_F(Test5InternalBindingParityPhase03, BindingCachesCanBeDestroyedAndRecreatedAcrossEnvs) {
+  for (int i = 0; i < 2; ++i) {
+    EnvScope s(runtime_.get());
+
+    std::string error;
+    const int exit_code = UbiRunScriptSource(s.env, kBindingCleanupRecreateScript, &error);
+    EXPECT_EQ(exit_code, 0) << "iteration=" << i << " error=" << error;
+    EXPECT_TRUE(error.empty()) << "iteration=" << i << " error=" << error;
+
+    napi_value global = nullptr;
+    ASSERT_EQ(napi_get_global(s.env, &global), napi_ok);
+
+    napi_value ok_value = nullptr;
+    ASSERT_EQ(napi_get_named_property(s.env, global, "__ubi_binding_cleanup_recreate_ok", &ok_value), napi_ok);
+
+    int32_t ok = 0;
+    ASSERT_EQ(napi_get_value_int32(s.env, ok_value, &ok), napi_ok);
+    EXPECT_EQ(ok, 1) << "iteration=" << i;
+  }
 }
 
 TEST_F(Test5InternalBindingParityPhase03, BootstrapSymbolsShareStateAcrossBindings) {

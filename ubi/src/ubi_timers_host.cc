@@ -24,8 +24,8 @@ struct TimersHostState {
   uv_timer_t timer_handle{};
   uv_check_t check_handle{};
   uv_idle_t idle_handle{};
-  int32_t* immediate_info_ptr = nullptr;
-  int32_t* timeout_info_ptr = nullptr;
+  napi_ref immediate_info_ref = nullptr;
+  napi_ref timeout_info_ref = nullptr;
   double timer_base_ms = -1;
   bool timer_initialized = false;
   bool check_initialized = false;
@@ -137,9 +137,9 @@ void OnTimersEnvCleanup(void* arg) {
   st->cleanup_started = true;
   DeleteRefIfAny(st->env, &st->timers_callback_ref);
   DeleteRefIfAny(st->env, &st->immediate_callback_ref);
+  DeleteRefIfAny(st->env, &st->immediate_info_ref);
+  DeleteRefIfAny(st->env, &st->timeout_info_ref);
   st->env = nullptr;
-  st->immediate_info_ptr = nullptr;
-  st->timeout_info_ptr = nullptr;
 
   if (st->timer_initialized) {
     uv_timer_stop(&st->timer_handle);
@@ -195,21 +195,57 @@ void SetFunctionRef(napi_env env, napi_value fn, napi_ref* ref_slot) {
 bool CallImmediateCallback(TimersHostState* st);
 void ApplyImmediateRefState(TimersHostState* st, bool ref);
 
+bool GetInt32ArrayDataFromRef(napi_env env,
+                              napi_ref ref,
+                              size_t min_length,
+                              int32_t** data_out,
+                              size_t* length_out = nullptr) {
+  if (data_out == nullptr) return false;
+  *data_out = nullptr;
+  if (length_out != nullptr) *length_out = 0;
+  if (env == nullptr || ref == nullptr) return false;
+
+  napi_value value = nullptr;
+  if (napi_get_reference_value(env, ref, &value) != napi_ok || value == nullptr) return false;
+
+  bool is_typedarray = false;
+  if (napi_is_typedarray(env, value, &is_typedarray) != napi_ok || !is_typedarray) return false;
+
+  napi_typedarray_type type = napi_uint8_array;
+  size_t length = 0;
+  void* data = nullptr;
+  napi_value arraybuffer = nullptr;
+  size_t offset = 0;
+  if (napi_get_typedarray_info(env, value, &type, &length, &data, &arraybuffer, &offset) != napi_ok ||
+      type != napi_int32_array || data == nullptr || length < min_length) {
+    return false;
+  }
+
+  *data_out = static_cast<int32_t*>(data);
+  if (length_out != nullptr) *length_out = length;
+  return true;
+}
+
 uint32_t ImmediateCount(const TimersHostState* st) {
-  if (st == nullptr || st->immediate_info_ptr == nullptr) return 0;
-  const int32_t count = st->immediate_info_ptr[kImmediateCount];
+  int32_t* immediate_info = nullptr;
+  if (st == nullptr || !GetInt32ArrayDataFromRef(st->env, st->immediate_info_ref, 3, &immediate_info)) return 0;
+  const int32_t count = immediate_info[kImmediateCount];
   return count > 0 ? static_cast<uint32_t>(count) : 0;
 }
 
 uint32_t ImmediateRefCount(const TimersHostState* st) {
-  if (st == nullptr || st->immediate_info_ptr == nullptr) return 0;
-  const int32_t count = st->immediate_info_ptr[kImmediateRefCount];
+  int32_t* immediate_info = nullptr;
+  if (st == nullptr || !GetInt32ArrayDataFromRef(st->env, st->immediate_info_ref, 3, &immediate_info)) return 0;
+  const int32_t count = immediate_info[kImmediateRefCount];
   return count > 0 ? static_cast<uint32_t>(count) : 0;
 }
 
 bool ImmediateHasOutstanding(const TimersHostState* st) {
-  if (st == nullptr || st->immediate_info_ptr == nullptr) return false;
-  return st->immediate_info_ptr[kImmediateHasOutstanding] != 0;
+  int32_t* immediate_info = nullptr;
+  if (st == nullptr || !GetInt32ArrayDataFromRef(st->env, st->immediate_info_ref, 3, &immediate_info)) {
+    return false;
+  }
+  return immediate_info[kImmediateHasOutstanding] != 0;
 }
 
 bool HasNativeImmediateTasks(const TimersHostState* st) {
@@ -501,11 +537,12 @@ void AttachInfoArrays(napi_env env, napi_value binding, TimersHostState* st) {
     ptr[0] = 0;
     ptr[1] = 0;
     ptr[2] = 0;
-    st->immediate_info_ptr = ptr;
     napi_value immediate_info = nullptr;
     if (napi_create_typedarray(env, napi_int32_array, 3, immediate_ab, 0, &immediate_info) == napi_ok &&
         immediate_info != nullptr) {
       napi_set_named_property(env, binding, "immediateInfo", immediate_info);
+      DeleteRefIfAny(env, &st->immediate_info_ref);
+      napi_create_reference(env, immediate_info, 1, &st->immediate_info_ref);
     }
   }
 
@@ -515,11 +552,12 @@ void AttachInfoArrays(napi_env env, napi_value binding, TimersHostState* st) {
       timeout_ab != nullptr && timeout_data != nullptr) {
     auto* ptr = static_cast<int32_t*>(timeout_data);
     ptr[0] = 0;
-    st->timeout_info_ptr = ptr;
     napi_value timeout_info = nullptr;
     if (napi_create_typedarray(env, napi_int32_array, 1, timeout_ab, 0, &timeout_info) == napi_ok &&
         timeout_info != nullptr) {
       napi_set_named_property(env, binding, "timeoutInfo", timeout_info);
+      DeleteRefIfAny(env, &st->timeout_info_ref);
+      napi_create_reference(env, timeout_info, 1, &st->timeout_info_ref);
     }
   }
 }
@@ -552,15 +590,17 @@ napi_value UbiInstallTimersHostBinding(napi_env env) {
 
 int32_t UbiGetActiveTimeoutCount(napi_env env) {
   const TimersHostState* st = GetState(env);
-  if (st == nullptr || st->timeout_info_ptr == nullptr) return 0;
-  const int32_t count = st->timeout_info_ptr[0];
+  int32_t* timeout_info = nullptr;
+  if (st == nullptr || !GetInt32ArrayDataFromRef(env, st->timeout_info_ref, 1, &timeout_info)) return 0;
+  const int32_t count = timeout_info[0];
   return count > 0 ? count : 0;
 }
 
 uint32_t UbiGetActiveImmediateRefCount(napi_env env) {
   const TimersHostState* st = GetState(env);
-  if (st == nullptr || st->immediate_info_ptr == nullptr) return 0;
-  const int32_t count = st->immediate_info_ptr[kImmediateRefCount];
+  int32_t* immediate_info = nullptr;
+  if (st == nullptr || !GetInt32ArrayDataFromRef(env, st->immediate_info_ref, 3, &immediate_info)) return 0;
+  const int32_t count = immediate_info[kImmediateRefCount];
   return count > 0 ? static_cast<uint32_t>(count) : 0;
 }
 

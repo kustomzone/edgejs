@@ -1,6 +1,7 @@
 #include "internal_binding/dispatch.h"
 
 #include <unordered_map>
+#include <unordered_set>
 
 #include "internal_binding/helpers.h"
 
@@ -14,8 +15,36 @@ struct WasmWebApiState {
 };
 
 std::unordered_map<napi_env, WasmWebApiState> g_wasm_web_api_states;
+std::unordered_set<napi_env> g_wasm_web_api_cleanup_hook_registered;
+
+void DeleteRefIfPresent(napi_env env, napi_ref* ref) {
+  if (env == nullptr || ref == nullptr || *ref == nullptr) return;
+  napi_delete_reference(env, *ref);
+  *ref = nullptr;
+}
+
+void OnWasmWebApiEnvCleanup(void* data) {
+  napi_env env = static_cast<napi_env>(data);
+  g_wasm_web_api_cleanup_hook_registered.erase(env);
+
+  auto it = g_wasm_web_api_states.find(env);
+  if (it == g_wasm_web_api_states.end()) return;
+  DeleteRefIfPresent(env, &it->second.binding_ref);
+  DeleteRefIfPresent(env, &it->second.implementation_ref);
+  g_wasm_web_api_states.erase(it);
+}
+
+void EnsureWasmWebApiCleanupHook(napi_env env) {
+  if (env == nullptr) return;
+  auto [it, inserted] = g_wasm_web_api_cleanup_hook_registered.emplace(env);
+  if (!inserted) return;
+  if (napi_add_env_cleanup_hook(env, OnWasmWebApiEnvCleanup, env) != napi_ok) {
+    g_wasm_web_api_cleanup_hook_registered.erase(it);
+  }
+}
 
 napi_value SetImplementationCallback(napi_env env, napi_callback_info info) {
+  EnsureWasmWebApiCleanupHook(env);
   size_t argc = 1;
   napi_value argv[1] = {nullptr};
   if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok) {
@@ -23,10 +52,7 @@ napi_value SetImplementationCallback(napi_env env, napi_callback_info info) {
   }
 
   auto& state = g_wasm_web_api_states[env];
-  if (state.implementation_ref != nullptr) {
-    napi_delete_reference(env, state.implementation_ref);
-    state.implementation_ref = nullptr;
-  }
+  DeleteRefIfPresent(env, &state.implementation_ref);
 
   if (argc >= 1 && argv[0] != nullptr) {
     napi_valuetype type = napi_undefined;
@@ -48,6 +74,7 @@ napi_value GetCachedWasmWebApi(napi_env env) {
 }  // namespace
 
 napi_value ResolveWasmWebApi(napi_env env, const ResolveOptions& /*options*/) {
+  EnsureWasmWebApiCleanupHook(env);
   const napi_value undefined = Undefined(env);
   napi_value cached = GetCachedWasmWebApi(env);
   if (cached != nullptr) return cached;
@@ -67,10 +94,7 @@ napi_value ResolveWasmWebApi(napi_env env, const ResolveOptions& /*options*/) {
   }
 
   auto& state = g_wasm_web_api_states[env];
-  if (state.binding_ref != nullptr) {
-    napi_delete_reference(env, state.binding_ref);
-    state.binding_ref = nullptr;
-  }
+  DeleteRefIfPresent(env, &state.binding_ref);
   napi_create_reference(env, out, 1, &state.binding_ref);
   return out;
 }

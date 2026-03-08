@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cstdint>
 #include <unordered_map>
+#include <unordered_set>
 
 #include "uv.h"
 #include "internal_binding/helpers.h"
@@ -40,6 +41,33 @@ struct PerformanceBindingState {
 };
 
 std::unordered_map<napi_env, PerformanceBindingState> g_performance_states;
+std::unordered_set<napi_env> g_performance_cleanup_hook_registered;
+
+void DeleteRefIfPresent(napi_env env, napi_ref* ref) {
+  if (env == nullptr || ref == nullptr || *ref == nullptr) return;
+  napi_delete_reference(env, *ref);
+  *ref = nullptr;
+}
+
+void OnPerformanceEnvCleanup(void* data) {
+  napi_env env = static_cast<napi_env>(data);
+  g_performance_cleanup_hook_registered.erase(env);
+
+  auto it = g_performance_states.find(env);
+  if (it == g_performance_states.end()) return;
+  DeleteRefIfPresent(env, &it->second.binding_ref);
+  DeleteRefIfPresent(env, &it->second.milestones_ref);
+  g_performance_states.erase(it);
+}
+
+void EnsurePerformanceCleanupHook(napi_env env) {
+  if (env == nullptr) return;
+  auto [it, inserted] = g_performance_cleanup_hook_registered.emplace(env);
+  if (!inserted) return;
+  if (napi_add_env_cleanup_hook(env, OnPerformanceEnvCleanup, env) != napi_ok) {
+    g_performance_cleanup_hook_registered.erase(it);
+  }
+}
 
 double NowMicrosSinceEpoch() {
   using clock = std::chrono::system_clock;
@@ -228,6 +256,7 @@ void SetMilestoneValue(napi_env env, napi_value milestones, uint32_t index, doub
 }  // namespace
 
 napi_value ResolvePerformance(napi_env env, const ResolveOptions& /*options*/) {
+  EnsurePerformanceCleanupHook(env);
   const napi_value undefined = Undefined(env);
   napi_value cached = GetCachedPerformance(env);
   if (cached != nullptr) return cached;
@@ -254,10 +283,7 @@ napi_value ResolvePerformance(napi_env env, const ResolveOptions& /*options*/) {
   SetMilestoneValue(env, milestones, kNodeStart, now_ns);
   SetMilestoneValue(env, milestones, kV8Start, now_ns);
 
-  if (state.milestones_ref != nullptr) {
-    napi_delete_reference(env, state.milestones_ref);
-    state.milestones_ref = nullptr;
-  }
+  DeleteRefIfPresent(env, &state.milestones_ref);
   napi_create_reference(env, milestones, 1, &state.milestones_ref);
   napi_set_named_property(env, out, "milestones", milestones);
 
@@ -320,10 +346,7 @@ napi_value ResolvePerformance(napi_env env, const ResolveOptions& /*options*/) {
     napi_set_named_property(env, out, "Histogram", histogram_ctor);
   }
 
-  if (state.binding_ref != nullptr) {
-    napi_delete_reference(env, state.binding_ref);
-    state.binding_ref = nullptr;
-  }
+  DeleteRefIfPresent(env, &state.binding_ref);
   napi_create_reference(env, out, 1, &state.binding_ref);
   return out;
 }

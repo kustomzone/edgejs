@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <unordered_map>
+#include <unordered_set>
 
 #include "internal_binding/helpers.h"
 
@@ -14,6 +15,32 @@ struct UtilBindingState {
 };
 
 std::unordered_map<napi_env, UtilBindingState> g_util_states;
+std::unordered_set<napi_env> g_util_cleanup_hook_registered;
+
+void DeleteRefIfPresent(napi_env env, napi_ref* ref) {
+  if (env == nullptr || ref == nullptr || *ref == nullptr) return;
+  napi_delete_reference(env, *ref);
+  *ref = nullptr;
+}
+
+void OnUtilEnvCleanup(void* data) {
+  napi_env env = static_cast<napi_env>(data);
+  g_util_cleanup_hook_registered.erase(env);
+
+  auto it = g_util_states.find(env);
+  if (it == g_util_states.end()) return;
+  DeleteRefIfPresent(env, &it->second.types_ref);
+  g_util_states.erase(it);
+}
+
+void EnsureUtilCleanupHook(napi_env env) {
+  if (env == nullptr) return;
+  auto [it, inserted] = g_util_cleanup_hook_registered.emplace(env);
+  if (!inserted) return;
+  if (napi_add_env_cleanup_hook(env, OnUtilEnvCleanup, env) != napi_ok) {
+    g_util_cleanup_hook_registered.erase(it);
+  }
+}
 
 napi_value GetTypesBinding(napi_env env) {
   auto it = g_util_states.find(env);
@@ -175,6 +202,7 @@ void EnsureMethod(napi_env env, napi_value binding, const char* name, napi_callb
 }  // namespace
 
 napi_value ResolveUtil(napi_env env, const ResolveOptions& options) {
+  EnsureUtilCleanupHook(env);
   if (options.callbacks.resolve_binding == nullptr) return Undefined(env);
   napi_value binding = options.callbacks.resolve_binding(env, options.state, "util");
   if (binding == nullptr || IsUndefined(env, binding)) return Undefined(env);
@@ -182,10 +210,7 @@ napi_value ResolveUtil(napi_env env, const ResolveOptions& options) {
   napi_value types = options.callbacks.resolve_binding(env, options.state, "types");
   if (types != nullptr && !IsUndefined(env, types)) {
     auto& st = g_util_states[env];
-    if (st.types_ref != nullptr) {
-      napi_delete_reference(env, st.types_ref);
-      st.types_ref = nullptr;
-    }
+    DeleteRefIfPresent(env, &st.types_ref);
     napi_create_reference(env, types, 1, &st.types_ref);
   }
 

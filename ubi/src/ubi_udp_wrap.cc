@@ -9,6 +9,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <uv.h>
@@ -41,7 +43,8 @@ struct SendWrap final : public UbiUdpSendWrap {
   napi_value object(napi_env env_in) const override;
 };
 
-napi_ref g_udp_ctor_ref = nullptr;
+std::unordered_map<napi_env, napi_ref> g_udp_ctor_refs;
+std::unordered_set<napi_env> g_udp_cleanup_hook_registered;
 
 void OnClosed(uv_handle_t* h);
 
@@ -132,6 +135,25 @@ void DeleteRef(napi_env env, napi_ref* ref) {
   if (env == nullptr || ref == nullptr || *ref == nullptr) return;
   napi_delete_reference(env, *ref);
   *ref = nullptr;
+}
+
+void OnUdpEnvCleanup(void* data) {
+  napi_env env = static_cast<napi_env>(data);
+  g_udp_cleanup_hook_registered.erase(env);
+
+  auto it = g_udp_ctor_refs.find(env);
+  if (it == g_udp_ctor_refs.end()) return;
+  DeleteRef(env, &it->second);
+  g_udp_ctor_refs.erase(it);
+}
+
+void EnsureUdpCleanupHook(napi_env env) {
+  if (env == nullptr) return;
+  auto [it, inserted] = g_udp_cleanup_hook_registered.emplace(env);
+  if (!inserted) return;
+  if (napi_add_env_cleanup_hook(env, OnUdpEnvCleanup, env) != napi_ok) {
+    g_udp_cleanup_hook_registered.erase(it);
+  }
 }
 
 napi_value SendWrap::object(napi_env env_in) const {
@@ -1429,8 +1451,10 @@ napi_value UbiInstallUdpWrapBinding(napi_env env) {
       udp_ctor == nullptr) {
     return nullptr;
   }
-  if (g_udp_ctor_ref != nullptr) napi_delete_reference(env, g_udp_ctor_ref);
-  napi_create_reference(env, udp_ctor, 1, &g_udp_ctor_ref);
+  EnsureUdpCleanupHook(env);
+  auto& ctor_ref = g_udp_ctor_refs[env];
+  DeleteRef(env, &ctor_ref);
+  napi_create_reference(env, udp_ctor, 1, &ctor_ref);
 
   napi_property_descriptor send_wrap_props[] = {
       {"getAsyncId", nullptr, SendWrapGetAsyncId, nullptr, nullptr, nullptr, napi_default_method, nullptr},
@@ -1472,8 +1496,10 @@ napi_value UbiInstallUdpWrapBinding(napi_env env) {
 }
 
 napi_value UbiGetUdpWrapConstructor(napi_env env) {
-  if (env == nullptr || g_udp_ctor_ref == nullptr) return nullptr;
-  return GetRefValue(env, g_udp_ctor_ref);
+  if (env == nullptr) return nullptr;
+  auto it = g_udp_ctor_refs.find(env);
+  if (it == g_udp_ctor_refs.end() || it->second == nullptr) return nullptr;
+  return GetRefValue(env, it->second);
 }
 
 uv_handle_t* UbiUdpWrapGetHandle(napi_env env, napi_value value) {

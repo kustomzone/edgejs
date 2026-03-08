@@ -64,6 +64,30 @@ int32_t* GetInt32TypedArrayData(napi_env env, napi_value value, size_t expected_
   return static_cast<int32_t*>(data);
 }
 
+std::string GetGlobalUtf8(napi_env env, const char* name) {
+  napi_value global = nullptr;
+  if (napi_get_global(env, &global) != napi_ok || global == nullptr) return "";
+
+  napi_value value = nullptr;
+  if (napi_get_named_property(env, global, name, &value) != napi_ok || value == nullptr) return "";
+  return ValueToUtf8(env, value);
+}
+
+constexpr const char* kZlibRoundTripScript = R"JS(
+const assert = require('assert');
+const zlib = require('zlib');
+
+const input = Buffer.from('ubi-zlib-roundtrip');
+const syncCompressed = zlib.gzipSync(input);
+assert.strictEqual(zlib.gunzipSync(syncCompressed).toString(), 'ubi-zlib-roundtrip');
+
+zlib.gzip(input, (err, compressed) => {
+  if (err) throw err;
+  const inflated = zlib.gunzipSync(compressed);
+  globalThis.__ubi_zlib_roundtrip = inflated.toString();
+});
+)JS";
+
 struct PlatformImmediateTask {
   std::vector<int>* order = nullptr;
   int value = 0;
@@ -201,6 +225,54 @@ TEST_F(Test0RuntimePhase01, TimersHostStateIsIsolatedPerEnv) {
   EXPECT_EQ(UbiGetActiveImmediateRefCount(second.env), 3u);
 }
 
+TEST_F(Test0RuntimePhase01, TimersHostStateCanBeDestroyedAndRecreatedAcrossEnvs) {
+  {
+    EnvScope first(runtime_.get());
+
+    napi_value binding = UbiInstallTimersHostBinding(first.env);
+    ASSERT_NE(binding, nullptr);
+
+    napi_value timeout_info = nullptr;
+    napi_value immediate_info = nullptr;
+    ASSERT_EQ(napi_get_named_property(first.env, binding, "timeoutInfo", &timeout_info), napi_ok);
+    ASSERT_EQ(napi_get_named_property(first.env, binding, "immediateInfo", &immediate_info), napi_ok);
+
+    int32_t* timeout_data = GetInt32TypedArrayData(first.env, timeout_info, 1);
+    int32_t* immediate_data = GetInt32TypedArrayData(first.env, immediate_info, 3);
+    ASSERT_NE(timeout_data, nullptr);
+    ASSERT_NE(immediate_data, nullptr);
+
+    timeout_data[0] = 4;
+    immediate_data[1] = 2;
+
+    EXPECT_EQ(UbiGetActiveTimeoutCount(first.env), 4);
+    EXPECT_EQ(UbiGetActiveImmediateRefCount(first.env), 2u);
+  }
+
+  {
+    EnvScope second(runtime_.get());
+
+    napi_value binding = UbiInstallTimersHostBinding(second.env);
+    ASSERT_NE(binding, nullptr);
+
+    napi_value timeout_info = nullptr;
+    napi_value immediate_info = nullptr;
+    ASSERT_EQ(napi_get_named_property(second.env, binding, "timeoutInfo", &timeout_info), napi_ok);
+    ASSERT_EQ(napi_get_named_property(second.env, binding, "immediateInfo", &immediate_info), napi_ok);
+
+    int32_t* timeout_data = GetInt32TypedArrayData(second.env, timeout_info, 1);
+    int32_t* immediate_data = GetInt32TypedArrayData(second.env, immediate_info, 3);
+    ASSERT_NE(timeout_data, nullptr);
+    ASSERT_NE(immediate_data, nullptr);
+
+    timeout_data[0] = 1;
+    immediate_data[1] = 5;
+
+    EXPECT_EQ(UbiGetActiveTimeoutCount(second.env), 1);
+    EXPECT_EQ(UbiGetActiveImmediateRefCount(second.env), 5u);
+  }
+}
+
 TEST_F(Test0RuntimePhase01, TaskQueueStateIsIsolatedPerEnv) {
   EnvScope first(runtime_.get());
   EnvScope second(runtime_.get());
@@ -260,4 +332,26 @@ TEST_F(Test0RuntimePhase01, NativeImmediateQueueRunsBeforeJsImmediatesAndDrainsN
   EXPECT_EQ(order[1], 2);
   EXPECT_FALSE(UbiRuntimePlatformHasImmediateTasks(s.env));
   EXPECT_FALSE(UbiRuntimePlatformHasRefedImmediateTasks(s.env));
+}
+
+TEST_F(Test0RuntimePhase01, ZlibWriteResultStateCanBeDestroyedAndRecreatedAcrossEnvs) {
+  {
+    EnvScope first(runtime_.get());
+
+    std::string error;
+    const int exit_code = UbiRunScriptSourceWithLoop(first.env, kZlibRoundTripScript, &error, true);
+    EXPECT_EQ(exit_code, 0) << "error=" << error;
+    EXPECT_TRUE(error.empty());
+    EXPECT_EQ(GetGlobalUtf8(first.env, "__ubi_zlib_roundtrip"), "ubi-zlib-roundtrip");
+  }
+
+  {
+    EnvScope second(runtime_.get());
+
+    std::string error;
+    const int exit_code = UbiRunScriptSourceWithLoop(second.env, kZlibRoundTripScript, &error, true);
+    EXPECT_EQ(exit_code, 0) << "error=" << error;
+    EXPECT_TRUE(error.empty());
+    EXPECT_EQ(GetGlobalUtf8(second.env, "__ubi_zlib_roundtrip"), "ubi-zlib-roundtrip");
+  }
 }

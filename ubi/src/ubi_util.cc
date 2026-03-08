@@ -16,6 +16,7 @@
 #include <cstdlib>
 #include <map>
 #include <memory>
+#include <unordered_set>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -87,6 +88,32 @@ struct LazyPropertyData {
 
 std::vector<std::unique_ptr<LazyPropertyData>> g_lazy_property_data;
 std::unordered_map<napi_env, napi_ref> g_types_binding_refs;
+std::unordered_set<napi_env> g_types_binding_cleanup_hook_registered;
+
+void DeleteRefIfPresent(napi_env env, napi_ref* ref) {
+  if (env == nullptr || ref == nullptr || *ref == nullptr) return;
+  napi_delete_reference(env, *ref);
+  *ref = nullptr;
+}
+
+void OnTypesBindingEnvCleanup(void* data) {
+  napi_env env = static_cast<napi_env>(data);
+  g_types_binding_cleanup_hook_registered.erase(env);
+
+  auto it = g_types_binding_refs.find(env);
+  if (it == g_types_binding_refs.end()) return;
+  DeleteRefIfPresent(env, &it->second);
+  g_types_binding_refs.erase(it);
+}
+
+void EnsureTypesBindingCleanupHook(napi_env env) {
+  if (env == nullptr) return;
+  auto [it, inserted] = g_types_binding_cleanup_hook_registered.emplace(env);
+  if (!inserted) return;
+  if (napi_add_env_cleanup_hook(env, OnTypesBindingEnvCleanup, env) != napi_ok) {
+    g_types_binding_cleanup_hook_registered.erase(it);
+  }
+}
 
 napi_value GetRefValue(napi_env env, napi_ref ref) {
   if (ref == nullptr) return nullptr;
@@ -1249,6 +1276,7 @@ bool DefineTypePredicate(napi_env env, napi_value target, const char* name, Type
 }
 
 bool InstallTypesBinding(napi_env env) {
+  EnsureTypesBindingCleanupHook(env);
   napi_value types = nullptr;
   if (napi_create_object(env, &types) != napi_ok || types == nullptr) return false;
 
@@ -1283,9 +1311,8 @@ bool InstallTypesBinding(napi_env env) {
   }
 
   auto it = g_types_binding_refs.find(env);
-  if (it != g_types_binding_refs.end() && it->second != nullptr) {
-    napi_delete_reference(env, it->second);
-    it->second = nullptr;
+  if (it != g_types_binding_refs.end()) {
+    DeleteRefIfPresent(env, &it->second);
   }
   napi_ref ref = nullptr;
   if (napi_create_reference(env, types, 1, &ref) != napi_ok || ref == nullptr) return false;

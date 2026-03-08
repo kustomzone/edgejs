@@ -13,6 +13,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <uv.h>
 
@@ -41,6 +42,7 @@ struct FsBindingState {
 };
 
 std::unordered_map<napi_env, FsBindingState> g_fs_states;
+std::unordered_set<napi_env> g_fs_cleanup_hook_registered;
 int64_t g_next_file_handle_async_id = 600000;
 int64_t g_next_stat_watcher_async_id = 700000;
 
@@ -66,6 +68,33 @@ void ResetRef(napi_env env, napi_ref* ref_ptr) {
   if (ref_ptr == nullptr || *ref_ptr == nullptr) return;
   napi_delete_reference(env, *ref_ptr);
   *ref_ptr = nullptr;
+}
+
+void OnFsEnvCleanup(void* data) {
+  napi_env env = static_cast<napi_env>(data);
+  g_fs_cleanup_hook_registered.erase(env);
+
+  auto it = g_fs_states.find(env);
+  if (it == g_fs_states.end()) return;
+  for (auto& entry : it->second.raw_methods) {
+    ResetRef(env, &entry.second);
+  }
+  it->second.raw_methods.clear();
+  ResetRef(env, &it->second.binding_ref);
+  ResetRef(env, &it->second.file_handle_ctor_ref);
+  ResetRef(env, &it->second.fs_req_ctor_ref);
+  ResetRef(env, &it->second.stat_watcher_ctor_ref);
+  ResetRef(env, &it->second.k_use_promises_symbol_ref);
+  g_fs_states.erase(it);
+}
+
+void EnsureFsCleanupHook(napi_env env) {
+  if (env == nullptr) return;
+  auto [it, inserted] = g_fs_cleanup_hook_registered.emplace(env);
+  if (!inserted) return;
+  if (napi_add_env_cleanup_hook(env, OnFsEnvCleanup, env) != napi_ok) {
+    g_fs_cleanup_hook_registered.erase(it);
+  }
 }
 
 void SetNamedMethod(napi_env env, napi_value obj, const char* name, napi_callback cb) {
@@ -3743,6 +3772,7 @@ void EnsureClassProperty(napi_env env,
 }  // namespace
 
 napi_value ResolveFs(napi_env env, const ResolveOptions& options) {
+  EnsureFsCleanupHook(env);
   if (options.callbacks.resolve_binding == nullptr) return Undefined(env);
   napi_value binding = options.callbacks.resolve_binding(env, options.state, "fs");
   if (binding == nullptr || IsUndefined(env, binding)) return Undefined(env);

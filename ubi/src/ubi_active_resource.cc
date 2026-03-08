@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace {
@@ -26,8 +27,12 @@ struct ActiveResourceState {
 };
 
 std::unordered_map<napi_env, ActiveResourceState> g_active_resource_states;
+std::unordered_set<napi_env> g_active_resource_cleanup_hook_registered;
+
+void EnsureActiveResourceCleanupHook(napi_env env);
 
 ActiveResourceState& GetState(napi_env env) {
+  EnsureActiveResourceCleanupHook(env);
   return g_active_resource_states[env];
 }
 
@@ -35,6 +40,36 @@ void DeleteRef(napi_env env, napi_ref* ref) {
   if (env == nullptr || ref == nullptr || *ref == nullptr) return;
   napi_delete_reference(env, *ref);
   *ref = nullptr;
+}
+
+void OnActiveResourceEnvCleanup(void* data) {
+  napi_env env = static_cast<napi_env>(data);
+  g_active_resource_cleanup_hook_registered.erase(env);
+
+  auto it = g_active_resource_states.find(env);
+  if (it == g_active_resource_states.end()) return;
+  for (ActiveHandleEntry* entry : it->second.handles) {
+    if (entry == nullptr) continue;
+    DeleteRef(env, &entry->keepalive_ref);
+    delete entry;
+  }
+  for (ActiveRequestEntry* entry : it->second.requests) {
+    if (entry == nullptr) continue;
+    DeleteRef(env, &entry->req_ref);
+    delete entry;
+  }
+  it->second.handles.clear();
+  it->second.requests.clear();
+  g_active_resource_states.erase(it);
+}
+
+void EnsureActiveResourceCleanupHook(napi_env env) {
+  if (env == nullptr) return;
+  auto [it, inserted] = g_active_resource_cleanup_hook_registered.emplace(env);
+  if (!inserted) return;
+  if (napi_add_env_cleanup_hook(env, OnActiveResourceEnvCleanup, env) != napi_ok) {
+    g_active_resource_cleanup_hook_registered.erase(it);
+  }
 }
 
 napi_value GetRefValue(napi_env env, napi_ref ref) {
