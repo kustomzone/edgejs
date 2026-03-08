@@ -35,6 +35,7 @@
 #endif
 
 #include "ubi_fs.h"
+#include "ubi_errors_binding.h"
 #include "ubi_buffer.h"
 #include "ubi_env_loop.h"
 #include "ubi_crypto.h"
@@ -316,6 +317,11 @@ std::string GetAndClearPendingException(napi_env env, bool* is_process_exit, int
     return "";
   }
 
+  const std::string enhanced_exception = UbiFormatFatalExceptionAfterInspector(env, exception);
+  if (!enhanced_exception.empty()) {
+    return FormatUncaughtExceptionForStderr(env, enhanced_exception);
+  }
+
   napi_value stack_value = nullptr;
   if (napi_get_named_property(env, exception, "stack", &stack_value) == napi_ok && stack_value != nullptr) {
     napi_value stack_string = nullptr;
@@ -404,6 +410,12 @@ bool EmitProcessLifecycleEvent(napi_env env, const char* event_name, int exit_co
   napi_value process_obj = nullptr;
   if (napi_get_named_property(env, global, "process", &process_obj) != napi_ok || process_obj == nullptr) {
     return false;
+  }
+  if (std::strcmp(event_name, "exit") == 0) {
+    napi_value exiting_value = nullptr;
+    if (napi_get_boolean(env, true, &exiting_value) == napi_ok && exiting_value != nullptr) {
+      (void)napi_set_named_property(env, process_obj, "_exiting", exiting_value);
+    }
   }
   bool has_emit = false;
   if (napi_has_named_property(env, process_obj, "emit", &has_emit) != napi_ok || !has_emit) {
@@ -525,8 +537,14 @@ int HandlePendingExceptionAfterLoopStep(napi_env env, std::string* error_out) {
   }
 
   std::string exception_message;
+  const std::string enhanced_exception = UbiFormatFatalExceptionAfterInspector(env, exception);
+  if (!enhanced_exception.empty()) {
+    exception_message = FormatUncaughtExceptionForStderr(env, enhanced_exception);
+  }
   napi_value stack_value = nullptr;
-  if (napi_get_named_property(env, exception, "stack", &stack_value) == napi_ok && stack_value != nullptr) {
+  if (exception_message.empty() &&
+      napi_get_named_property(env, exception, "stack", &stack_value) == napi_ok &&
+      stack_value != nullptr) {
     napi_value stack_string = nullptr;
     if (napi_coerce_to_string(env, stack_value, &stack_string) == napi_ok && stack_string != nullptr) {
       size_t stack_len = 0;
@@ -551,6 +569,8 @@ int HandlePendingExceptionAfterLoopStep(napi_env env, std::string* error_out) {
         }
       }
     }
+  } else if (!exception_message.empty()) {
+    // `afterInspector` already produced the full fatal exception rendering.
   } else {
     exception_message = FormatUncaughtExceptionForStderr(env, exception_message);
   }

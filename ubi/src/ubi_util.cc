@@ -143,6 +143,34 @@ napi_value CallFunction(napi_env env,
   return out;
 }
 
+void ClearPendingException(napi_env env) {
+  bool pending = false;
+  if (napi_is_exception_pending(env, &pending) != napi_ok || !pending) return;
+  napi_value ignored = nullptr;
+  (void)napi_get_and_clear_last_exception(env, &ignored);
+}
+
+bool TryCallFunction(napi_env env,
+                     napi_value this_arg,
+                     napi_value fn,
+                     size_t argc,
+                     napi_value* argv,
+                     napi_value* result_out) {
+  if (result_out != nullptr) *result_out = nullptr;
+  if (this_arg == nullptr) this_arg = Undefined(env);
+  if (!IsFunction(env, fn)) return false;
+
+  napi_value out = nullptr;
+  const napi_status status = napi_call_function(env, this_arg, fn, argc, argv, &out);
+  if (status != napi_ok) {
+    ClearPendingException(env);
+    return false;
+  }
+
+  if (result_out != nullptr) *result_out = out;
+  return true;
+}
+
 napi_value NewInstance(napi_env env, napi_value ctor, size_t argc, napi_value* argv) {
   if (!IsFunction(env, ctor)) return nullptr;
   napi_value out = nullptr;
@@ -173,13 +201,68 @@ bool ValueToTagEquals(napi_env env, napi_value value, const char* expected) {
   return ToUtf8(env, out) == expected;
 }
 
-bool ValueInstanceOfGlobalCtor(napi_env env, napi_value value, const char* ctor_name) {
+bool ValuePassesPrototypeMethodBrandCheck(napi_env env,
+                                          napi_value value,
+                                          const char* ctor_name,
+                                          const char* method_name,
+                                          napi_valuetype expected_type) {
   if (!IsObjectLike(env, value)) return false;
+
   napi_value ctor = GetGlobalNamed(env, ctor_name);
-  if (!IsFunction(env, ctor)) return false;
-  bool result = false;
-  if (napi_instanceof(env, value, ctor, &result) != napi_ok) return false;
-  return result;
+  napi_value prototype = GetNamedProperty(env, ctor, "prototype");
+  napi_value method = GetNamedProperty(env, prototype, method_name);
+  if (!IsFunction(env, method)) return false;
+
+  napi_value result = nullptr;
+  if (!TryCallFunction(env, value, method, 0, nullptr, &result) || result == nullptr) {
+    return false;
+  }
+
+  napi_valuetype type = napi_undefined;
+  return napi_typeof(env, result, &type) == napi_ok && type == expected_type;
+}
+
+bool ValuePassesPrototypeGetterBrandCheck(napi_env env,
+                                          napi_value value,
+                                          const char* ctor_name,
+                                          const char* property_name,
+                                          napi_valuetype expected_type) {
+  if (!IsObjectLike(env, value)) return false;
+
+  napi_value object_ctor = GetGlobalNamed(env, "Object");
+  napi_value get_own_property_descriptor = GetNamedProperty(env, object_ctor, "getOwnPropertyDescriptor");
+  napi_value ctor = GetGlobalNamed(env, ctor_name);
+  napi_value prototype = GetNamedProperty(env, ctor, "prototype");
+  if (!IsFunction(env, get_own_property_descriptor) || prototype == nullptr) return false;
+
+  napi_value property_name_value = nullptr;
+  if (napi_create_string_utf8(env, property_name, NAPI_AUTO_LENGTH, &property_name_value) != napi_ok ||
+      property_name_value == nullptr) {
+    return false;
+  }
+
+  napi_value descriptor_argv[2] = {prototype, property_name_value};
+  napi_value descriptor = nullptr;
+  if (!TryCallFunction(env,
+                       object_ctor,
+                       get_own_property_descriptor,
+                       2,
+                       descriptor_argv,
+                       &descriptor) ||
+      !IsObjectLike(env, descriptor)) {
+    return false;
+  }
+
+  napi_value getter = GetNamedProperty(env, descriptor, "get");
+  if (!IsFunction(env, getter)) return false;
+
+  napi_value result = nullptr;
+  if (!TryCallFunction(env, value, getter, 0, nullptr, &result) || result == nullptr) {
+    return false;
+  }
+
+  napi_valuetype type = napi_undefined;
+  return napi_typeof(env, result, &type) == napi_ok && type == expected_type;
 }
 
 bool IsInternalScriptName(std::string_view script_name) {
@@ -1008,21 +1091,21 @@ bool RunTypeCheck(napi_env env, TypeCheckKind kind, napi_value value) {
     case TypeCheckKind::kArgumentsObject:
       return ValueToTagEquals(env, value, "[object Arguments]");
     case TypeCheckKind::kBooleanObject:
-      return ValueToTagEquals(env, value, "[object Boolean]");
+      return ValuePassesPrototypeMethodBrandCheck(env, value, "Boolean", "valueOf", napi_boolean);
     case TypeCheckKind::kNumberObject:
-      return ValueToTagEquals(env, value, "[object Number]");
+      return ValuePassesPrototypeMethodBrandCheck(env, value, "Number", "valueOf", napi_number);
     case TypeCheckKind::kStringObject:
-      return ValueToTagEquals(env, value, "[object String]");
+      return ValuePassesPrototypeMethodBrandCheck(env, value, "String", "valueOf", napi_string);
     case TypeCheckKind::kSymbolObject:
-      return ValueToTagEquals(env, value, "[object Symbol]");
+      return ValuePassesPrototypeMethodBrandCheck(env, value, "Symbol", "valueOf", napi_symbol);
     case TypeCheckKind::kBigIntObject:
-      return ValueToTagEquals(env, value, "[object BigInt]");
+      return ValuePassesPrototypeMethodBrandCheck(env, value, "BigInt", "valueOf", napi_bigint);
     case TypeCheckKind::kNativeError: {
       bool out = false;
       return napi_is_error(env, value, &out) == napi_ok && out;
     }
     case TypeCheckKind::kRegExp:
-      return ValueToTagEquals(env, value, "[object RegExp]");
+      return ValuePassesPrototypeGetterBrandCheck(env, value, "RegExp", "source", napi_string);
     case TypeCheckKind::kAsyncFunction:
       return ValueToTagEquals(env, value, "[object AsyncFunction]");
     case TypeCheckKind::kGeneratorFunction:
@@ -1035,17 +1118,17 @@ bool RunTypeCheck(napi_env env, TypeCheckKind kind, napi_value value) {
       return napi_is_promise(env, value, &out) == napi_ok && out;
     }
     case TypeCheckKind::kMap:
-      return ValueInstanceOfGlobalCtor(env, value, "Map");
+      return ValueToTagEquals(env, value, "[object Map]");
     case TypeCheckKind::kSet:
-      return ValueInstanceOfGlobalCtor(env, value, "Set");
+      return ValueToTagEquals(env, value, "[object Set]");
     case TypeCheckKind::kMapIterator:
       return ValueToTagEquals(env, value, "[object Map Iterator]");
     case TypeCheckKind::kSetIterator:
       return ValueToTagEquals(env, value, "[object Set Iterator]");
     case TypeCheckKind::kWeakMap:
-      return ValueInstanceOfGlobalCtor(env, value, "WeakMap");
+      return ValueToTagEquals(env, value, "[object WeakMap]");
     case TypeCheckKind::kWeakSet:
-      return ValueInstanceOfGlobalCtor(env, value, "WeakSet");
+      return ValueToTagEquals(env, value, "[object WeakSet]");
     case TypeCheckKind::kArrayBuffer: {
       bool out = false;
       return napi_is_arraybuffer(env, value, &out) == napi_ok && out;

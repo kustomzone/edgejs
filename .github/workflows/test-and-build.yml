@@ -41,8 +41,7 @@ jobs:
 
       - name: Build ubi (Debug)
         run: |
-          cmake -S ubi -B build-ubi -DCMAKE_BUILD_TYPE=Debug
-          cmake --build build-ubi -j4
+          make build CMAKE_BUILD_TYPE=Debug JOBS=4
       - name: Test ubi
         run: ctest --test-dir build-ubi --output-on-failure -j4
       - name: Remove debug build
@@ -50,8 +49,7 @@ jobs:
 
       - name: Build ubi
         run: |
-          cmake -S ubi -B build-ubi -DCMAKE_BUILD_TYPE=Release
-          cmake --build build-ubi -j4
+          make build CMAKE_BUILD_TYPE=Release JOBS=4
 
       - name: Test ubi
         run: ctest --test-dir build-ubi --output-on-failure -j4
@@ -60,11 +58,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          rm -rf dist
-          mkdir -p dist/bin
-          cp build-ubi/ubi dist/bin/ubi
-          cp README.md dist/README.md
-          (cd dist && zip -r ../ubi-linux.zip bin README.md)
+          make dist JOBS=4 ZIP_NAME=ubi-linux.zip
 
       - name: Upload artifact ubi
         uses: actions/upload-artifact@v4
@@ -112,8 +106,7 @@ jobs:
 
       - name: Build ubi
         run: |
-          cmake -S ubi -B build-ubi -DCMAKE_BUILD_TYPE=Release
-          cmake --build build-ubi -j4
+          make build CMAKE_BUILD_TYPE=Release JOBS=4
 
       - name: Test ubi
         run: ctest --test-dir build-ubi --output-on-failure -j4
@@ -122,11 +115,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          rm -rf dist
-          mkdir -p dist/bin
-          cp build-ubi/ubi dist/bin/ubi
-          cp README.md dist/README.md
-          (cd dist && zip -r ../ubi-macos.zip bin README.md)
+          make dist JOBS=4 ZIP_NAME=ubi-macos.zip
 
       - name: Upload artifact ubi
         uses: actions/upload-artifact@v4
@@ -175,11 +164,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          rm -rf dist
-          mkdir -p dist/bin
-          cp build-wasix/ubi dist/bin/ubi
-          cp README.md dist/README.md
-          (cd dist && zip -r ../ubi-wasix.zip bin README.md)
+          make dist-only BUILD_DIR=build-wasix JOBS=4 ZIP_NAME=ubi-wasix.zip
 
       - name: Upload artifact ubi
         uses: actions/upload-artifact@v4

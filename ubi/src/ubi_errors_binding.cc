@@ -44,6 +44,37 @@ std::string ValueToUtf8(napi_env env, napi_value value) {
   return out;
 }
 
+std::string CallRefCallbackAsUtf8(napi_env env, napi_ref ref, napi_value arg) {
+  if (env == nullptr || ref == nullptr || arg == nullptr) return "";
+
+  napi_value cb = nullptr;
+  if (napi_get_reference_value(env, ref, &cb) != napi_ok || cb == nullptr) {
+    return "";
+  }
+  napi_valuetype cb_type = napi_undefined;
+  if (napi_typeof(env, cb, &cb_type) != napi_ok || cb_type != napi_function) {
+    return "";
+  }
+
+  napi_value global = nullptr;
+  if (napi_get_global(env, &global) != napi_ok || global == nullptr) {
+    return "";
+  }
+
+  napi_value argv[1] = {arg};
+  napi_value result = nullptr;
+  if (napi_call_function(env, global, cb, 1, argv, &result) != napi_ok || result == nullptr) {
+    return "";
+  }
+  return ValueToUtf8(env, result);
+}
+
+std::string FormatFatalExceptionAfterInspector(napi_env env, napi_value exception) {
+  const auto it = g_errors_states.find(env);
+  if (it == g_errors_states.end()) return "";
+  return CallRefCallbackAsUtf8(env, it->second.enhance_fatal_stack_after_inspector_ref, exception);
+}
+
 napi_value MakeUndefined(napi_env env) {
   napi_value undefined = nullptr;
   napi_get_undefined(env, &undefined);
@@ -316,7 +347,8 @@ napi_value ErrorsGetErrorSourcePositions(napi_env env, napi_callback_info info) 
       if (ParseErrorStackForLocation(stack, &location)) {
         script_resource_name = location.script_resource_name;
         line_number = location.line_number;
-        start_column = location.start_column;
+        // JS consumers expect 0-based source columns, while stack traces use 1-based columns.
+        start_column = location.start_column > 0 ? location.start_column - 1 : 0;
 
         auto it = g_errors_states.find(env);
         const bool source_maps_enabled =
@@ -515,4 +547,8 @@ napi_value GetOrCreateErrorsBinding(napi_env env) {
 
 napi_value UbiGetOrCreateErrorsBinding(napi_env env) {
   return GetOrCreateErrorsBinding(env);
+}
+
+std::string UbiFormatFatalExceptionAfterInspector(napi_env env, napi_value exception) {
+  return FormatFatalExceptionAfterInspector(env, exception);
 }

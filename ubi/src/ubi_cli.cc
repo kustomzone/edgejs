@@ -136,6 +136,11 @@ std::vector<std::string> NormalizeCliOptionVector(const std::vector<std::string>
   for (size_t i = 0; i < raw_args.size(); ++i) {
     const std::string& token = raw_args[i];
 
+    if (token == "--input-type" && i + 1 < raw_args.size()) {
+      out.push_back("--input-type=" + raw_args[++i]);
+      continue;
+    }
+
     if ((token == "-e" || token == "--eval") && i + 1 < raw_args.size()) {
       out.push_back("--eval=" + raw_args[++i]);
       continue;
