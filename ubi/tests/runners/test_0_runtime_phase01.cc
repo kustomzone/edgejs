@@ -153,6 +153,36 @@ TEST_F(Test0RuntimePhase01, SyntaxErrorReturnsNonZero) {
   RemoveTempScript(script_path);
 }
 
+TEST_F(Test0RuntimePhase01, EsmImportOfThrowingCjsReturnsJsErrorInsteadOfCrashing) {
+  EnvScope s(runtime_.get());
+
+  const auto temp_dir = std::filesystem::temp_directory_path() / "ubi_phase01_esm_import_cjs_throw";
+  std::error_code mkdir_ec;
+  std::filesystem::create_directories(temp_dir, mkdir_ec);
+  ASSERT_FALSE(mkdir_ec) << mkdir_ec.message();
+
+  const auto cjs_path = temp_dir / "bad.cjs";
+  const auto esm_path = temp_dir / "main.mjs";
+
+  {
+    std::ofstream out(cjs_path);
+    out << "throw new Error('boom from cjs');\n";
+  }
+  {
+    std::ofstream out(esm_path);
+    out << "import './bad.cjs';\n";
+    out << "globalThis.__should_not_run = true;\n";
+  }
+
+  std::string error;
+  const int exit_code = UbiRunScriptFile(s.env, esm_path.c_str(), &error);
+  EXPECT_EQ(exit_code, 1);
+  EXPECT_NE(error.find("boom from cjs"), std::string::npos) << error;
+
+  std::error_code remove_ec;
+  std::filesystem::remove_all(temp_dir, remove_ec);
+}
+
 TEST_F(Test0RuntimePhase01, SourcePathCanBeTestedIndependently) {
   EnvScope s(runtime_.get());
 

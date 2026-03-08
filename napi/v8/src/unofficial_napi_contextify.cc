@@ -722,6 +722,13 @@ v8::MaybeLocal<v8::Value> SyntheticModuleEvaluationSteps(v8::Local<v8::Context> 
 
   napi_value ignored = nullptr;
   if (napi_call_function(env, wrapper, callback, 0, nullptr, &ignored) != napi_ok) {
+    bool pending = false;
+    if (napi_is_exception_pending(env, &pending) == napi_ok && pending) {
+      napi_value error = nullptr;
+      if (napi_get_and_clear_last_exception(env, &error) == napi_ok && error != nullptr) {
+        context->GetIsolate()->ThrowException(napi_v8_unwrap_value(error));
+      }
+    }
     return v8::MaybeLocal<v8::Value>();
   }
 
