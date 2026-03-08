@@ -14,6 +14,7 @@
 
 #include <libplatform/libplatform.h>
 
+#include "internal/node_v8_default_flags.h"
 #include "internal/napi_v8_env.h"
 #include "ubi_v8_platform.h"
 
@@ -108,8 +109,9 @@ class TrackingArrayBufferAllocator final : public v8::ArrayBuffer::Allocator {
 };
 
 void ApplyDefaultV8Flags() {
-  static constexpr char kDefaultFlags[] = "--js-float16array";
-  v8::V8::SetFlagsFromString(kDefaultFlags, static_cast<int>(sizeof(kDefaultFlags) - 1));
+  v8::V8::SetFlagsFromString(
+      kNodeDefaultShippingV8Flags,
+      static_cast<int>(sizeof(kNodeDefaultShippingV8Flags) - 1));
 }
 
 napi_status AcquireRuntime(UbiV8Platform** platform_out) {
