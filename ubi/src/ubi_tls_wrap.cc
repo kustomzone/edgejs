@@ -156,8 +156,8 @@ std::string ValueToUtf8(napi_env env, napi_value value) {
   return out;
 }
 
-void SetState(int idx, int32_t value) {
-  int32_t* state = UbiGetStreamBaseState();
+void SetState(napi_env env, int idx, int32_t value) {
+  int32_t* state = UbiGetStreamBaseState(env);
   if (state == nullptr) return;
   state[idx] = value;
 }
@@ -246,8 +246,8 @@ void EmitOnReadData(TlsWrap* wrap, const uint8_t* data, size_t len) {
   if (len > 0 && raw != nullptr) {
     std::memcpy(raw, data, len);
   }
-  SetState(kUbiReadBytesOrError, static_cast<int32_t>(len));
-  SetState(kUbiArrayBufferOffset, 0);
+  SetState(wrap->env, kUbiReadBytesOrError, static_cast<int32_t>(len));
+  SetState(wrap->env, kUbiArrayBufferOffset, 0);
   napi_value argv[1] = {arraybuffer};
   napi_value ignored = nullptr;
   (void)UbiAsyncWrapMakeCallback(
@@ -259,8 +259,8 @@ void EmitOnReadStatus(TlsWrap* wrap, int32_t status) {
   napi_value self = GetRefValue(wrap->env, wrap->wrapper_ref);
   napi_value onread = GetNamedValue(wrap->env, self, "onread");
   if (!IsFunction(wrap->env, onread)) return;
-  SetState(kUbiReadBytesOrError, status);
-  SetState(kUbiArrayBufferOffset, 0);
+  SetState(wrap->env, kUbiReadBytesOrError, status);
+  SetState(wrap->env, kUbiArrayBufferOffset, 0);
   napi_value argv[1] = {Undefined(wrap->env)};
   napi_value ignored = nullptr;
   (void)UbiAsyncWrapMakeCallback(
@@ -671,7 +671,7 @@ void TryStartParentWrite(TlsWrap* wrap) {
     OnInternalWriteDone(wrap, rc);
     return;
   }
-  int32_t* state = UbiGetStreamBaseState();
+  int32_t* state = UbiGetStreamBaseState(wrap->env);
   const bool async = state != nullptr && state[kUbiLastWriteWasAsync] != 0;
   if (!async) {
     OnInternalWriteDone(wrap, 0);
@@ -848,7 +848,7 @@ napi_value ForwardParentRead(napi_env env, napi_callback_info info) {
   TlsWrap* wrap = FindWrapByParent(env, parent);
   if (wrap == nullptr || wrap->ssl == nullptr) return Undefined(env);
 
-  int32_t* state = UbiGetStreamBaseState();
+  int32_t* state = UbiGetStreamBaseState(env);
   const int32_t nread = state != nullptr ? state[kUbiReadBytesOrError] : 0;
   const int32_t offset = state != nullptr ? state[kUbiArrayBufferOffset] : 0;
 
@@ -924,8 +924,8 @@ int32_t QueueAppWrite(TlsWrap* wrap, napi_value req_obj, const uint8_t* data, si
   if (req_obj != nullptr) napi_create_reference(wrap->env, req_obj, 1, &pending.req_ref);
   pending.data.assign(data, data + len);
   wrap->pending_app_writes.push_back(std::move(pending));
-  SetState(kUbiBytesWritten, static_cast<int32_t>(len));
-  SetState(kUbiLastWriteWasAsync, 1);
+  SetState(wrap->env, kUbiBytesWritten, static_cast<int32_t>(len));
+  SetState(wrap->env, kUbiLastWriteWasAsync, 1);
   Cycle(wrap);
   return 0;
 }

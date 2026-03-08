@@ -1335,6 +1335,11 @@ static napi_value UvErrNameCallback(napi_env env, napi_callback_info info) {
   return out;
 }
 
+bool UseEnvProxyEnabledByEnvironment() {
+  const char* value = std::getenv("NODE_USE_ENV_PROXY");
+  return value != nullptr && std::strcmp(value, "1") == 0;
+}
+
 static napi_value OptionsGetCLIOptionsValuesCallback(napi_env env, napi_callback_info /*info*/) {
   napi_value out = CreateNullProtoObject(env);
   if (out == nullptr) {
@@ -1510,6 +1515,11 @@ static napi_value OptionsGetCLIOptionsValuesCallback(napi_env env, napi_callback
       {"--test-skip-pattern", true},
       {"--watch-path", true},
   };
+  std::unordered_set<std::string> bool_option_set;
+  bool_option_set.reserve(bool_false.size() + bool_true.size());
+  for (const char* key : bool_false) bool_option_set.emplace(key);
+  for (const char* key : bool_true) bool_option_set.emplace(key);
+  bool saw_use_env_proxy_cli = false;
 
   napi_value process = GetGlobalNamedProperty(env, "process");
   const std::vector<std::vector<std::string>> lists = {
@@ -1546,7 +1556,16 @@ static napi_value OptionsGetCLIOptionsValuesCallback(napi_env env, napi_callback
       }
 
       if (eq == std::string::npos) {
+        if (key.rfind("--no-", 0) == 0) {
+          const std::string normalized = "--" + key.substr(5);
+          if (bool_option_set.find(normalized) != bool_option_set.end()) {
+            SetBoolProperty(env, out, normalized.c_str(), false);
+            if (normalized == "--use-env-proxy") saw_use_env_proxy_cli = true;
+            continue;
+          }
+        }
         SetBoolProperty(env, out, key.c_str(), true);
+        if (key == "--use-env-proxy") saw_use_env_proxy_cli = true;
       } else {
         double numeric = 0;
         if (TryParseDouble(raw, &numeric)) {
@@ -1560,6 +1579,10 @@ static napi_value OptionsGetCLIOptionsValuesCallback(napi_env env, napi_callback
         SetBoolProperty(env, out, "[has_eval_string]", true);
       }
     }
+  }
+
+  if (UseEnvProxyEnabledByEnvironment() && !saw_use_env_proxy_cli) {
+    SetBoolProperty(env, out, "--use-env-proxy", true);
   }
 
   return out;
@@ -1703,7 +1726,16 @@ static napi_value OptionsGetCLIOptionsInfoCallback(napi_env env, napi_callback_i
 
 static napi_value OptionsGetOptionsAsFlagsCallback(napi_env env, napi_callback_info /*info*/) {
   napi_value process = GetGlobalNamedProperty(env, "process");
-  const std::vector<std::string> exec_argv = GetStringArrayProperty(env, process, "execArgv");
+  std::vector<std::string> exec_argv = GetStringArrayProperty(env, process, "execArgv");
+  if (UseEnvProxyEnabledByEnvironment()) {
+    const bool has_use_env_proxy =
+        std::find(exec_argv.begin(), exec_argv.end(), "--use-env-proxy") != exec_argv.end();
+    const bool has_no_use_env_proxy =
+        std::find(exec_argv.begin(), exec_argv.end(), "--no-use-env-proxy") != exec_argv.end();
+    if (!has_use_env_proxy && !has_no_use_env_proxy) {
+      exec_argv.push_back("--use-env-proxy");
+    }
+  }
   napi_value out = nullptr;
   if (napi_create_array_with_length(env, exec_argv.size(), &out) != napi_ok || out == nullptr) {
     return UndefinedValue(env);

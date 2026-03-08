@@ -256,7 +256,13 @@ void ThrowUVExceptionCopyFile(napi_env env, int errorno, const char* src,
 
 void ThrowErrnoException(napi_env env, int errorno, const char* syscall,
                          const char* message, const char* path) {
-  std::string msg = message != nullptr ? message : strerror(errorno);
+  const char* code = uv_err_name(errorno < 0 ? errorno : -errorno);
+  if (code == nullptr) code = "ERR_UNKNOWN_ERRNO";
+  std::string msg = std::string(code) + ": " + (message != nullptr ? message : strerror(errorno));
+  if (syscall != nullptr && syscall[0] != '\0') {
+    msg += ", ";
+    msg += syscall;
+  }
   if (path != nullptr && path[0] != '\0') {
     msg += " '";
     msg += path;
@@ -273,9 +279,6 @@ void ThrowErrnoException(napi_env env, int errorno, const char* syscall,
       error == nullptr) {
     return;
   }
-  const char* code =
-      uv_err_name(errorno < 0 ? errorno : -errorno);
-  if (code == nullptr) code = "ERR_UNKNOWN_ERRNO";
   napi_value code_val = nullptr;
   if (napi_create_string_utf8(env, code, NAPI_AUTO_LENGTH, &code_val) ==
       napi_ok) {
@@ -479,48 +482,49 @@ bool MkdirpSync(std::string path, int mode, std::string* first_path,
     int err = uv_fs_mkdir(nullptr, &req, next_path.c_str(), mode, nullptr);
     uv_fs_req_cleanup(&req);
 
-    switch (err) {
-      case 0:
-        if (first_path && first_path->empty()) {
-          *first_path = next_path;
-        }
-        break;
-      case UV_EACCES:
-      case UV_ENOSPC:
-      case UV_ENOTDIR:
-      case UV_EPERM:
-        *out_err = err;
-        return false;
-      case UV_ENOENT: {
-        size_t sep = next_path.find_last_of(kPathSeparator);
-        std::string dirname =
-            (sep != std::string::npos) ? next_path.substr(0, sep) : next_path;
-        if (dirname != next_path) {
-          stack.push_back(std::move(next_path));
-          stack.push_back(std::move(dirname));
-        } else {
-          *out_err = UV_EEXIST;
-          return false;
-        }
-        break;
-      }
-      default: {
-        int stat_err = uv_fs_stat(nullptr, &req, next_path.c_str(), nullptr);
-        uv_fs_req_cleanup(&req);
-        if (stat_err == 0 && (req.statbuf.st_mode & S_IFMT) != S_IFDIR) {
-          if (err == UV_EEXIST && !stack.empty()) {
-            *out_err = UV_ENOTDIR;
-          } else {
-            *out_err = UV_EEXIST;
+    while (true) {
+      switch (err) {
+        case 0:
+          if (first_path && first_path->empty()) {
+            *first_path = next_path;
           }
+          break;
+        case UV_EACCES:
+        case UV_ENOSPC:
+        case UV_ENOTDIR:
+        case UV_EPERM:
+          *out_err = err;
           return false;
+        case UV_ENOENT: {
+          size_t sep = next_path.find_last_of(kPathSeparator);
+          std::string dirname =
+              (sep != std::string::npos) ? next_path.substr(0, sep) : next_path;
+          if (dirname != next_path) {
+            stack.push_back(next_path);
+            stack.push_back(std::move(dirname));
+          } else if (stack.empty()) {
+            err = UV_EEXIST;
+            continue;
+          }
+          break;
         }
-        if (stat_err < 0) {
-          *out_err = stat_err;
-          return false;
+        default: {
+          int orig_err = err;
+          int stat_err = uv_fs_stat(nullptr, &req, next_path.c_str(), nullptr);
+          const uv_stat_t statbuf = req.statbuf;
+          uv_fs_req_cleanup(&req);
+          if (stat_err == 0 && !S_ISDIR(statbuf.st_mode)) {
+            *out_err = (orig_err == UV_EEXIST && !stack.empty()) ? UV_ENOTDIR : UV_EEXIST;
+            return false;
+          }
+          if (stat_err < 0) {
+            *out_err = stat_err;
+            return false;
+          }
+          break;
         }
-        break;
       }
+      break;
     }
   }
   *out_err = 0;
@@ -613,11 +617,38 @@ napi_value BindingRmSync(napi_env env, napi_callback_info info) {
            ec == std::errc::operation_not_permitted;
   };
 
+  std::function<void(const fs::path&, std::error_code&)> remove_entry =
+      [&](const fs::path& entry_path, std::error_code& ec) {
+        if (ec) return;
+        const fs::file_status status = fs::symlink_status(entry_path, ec);
+        if (ec || status.type() == fs::file_type::not_found) return;
+
+        if (status.type() == fs::file_type::directory) {
+          fs::remove(entry_path, ec);
+          if (!ec || ec == std::errc::no_such_file_or_directory) {
+            ec.clear();
+            return;
+          }
+          if (ec != std::errc::directory_not_empty) {
+            return;
+          }
+          ec.clear();
+
+          for (const auto& child : fs::directory_iterator(entry_path, ec)) {
+            if (ec) return;
+            remove_entry(child.path(), ec);
+            if (ec) return;
+          }
+        }
+
+        fs::remove(entry_path, ec);
+      };
+
   int i = 1;
   while (max_retries >= 0) {
     error.clear();
     if (recursive) {
-      fs::remove_all(path, error);
+      remove_entry(fs::path(path), error);
     } else {
       fs::remove(path, error);
     }
@@ -1386,6 +1417,7 @@ napi_value BindingSymlink(napi_env env, napi_callback_info info) {
   if (argc >= 3 && argv[2] != nullptr) {
     if (napi_get_value_int32(env, argv[2], &flags) != napi_ok) return nullptr;
   }
+#if defined(_WIN32)
   uv_fs_t req;
   int err = uv_fs_symlink(nullptr, &req, target.c_str(), path.c_str(), flags, nullptr);
   uv_fs_req_cleanup(&req);
@@ -1393,6 +1425,13 @@ napi_value BindingSymlink(napi_env env, napi_callback_info info) {
     ThrowUVException(env, err, "symlink", path.c_str());
     return nullptr;
   }
+#else
+  (void)flags;
+  if (::symlink(target.c_str(), path.c_str()) != 0) {
+    ThrowErrnoException(env, errno, "symlink", strerror(errno), path.c_str());
+    return nullptr;
+  }
+#endif
   return nullptr;
 }
 

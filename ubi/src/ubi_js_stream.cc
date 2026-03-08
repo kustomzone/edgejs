@@ -150,7 +150,7 @@ napi_value CallOnWrite(napi_env env,
                        size_t total_bytes) {
   napi_value array = BuildWriteArray(env, chunks);
   if (array == nullptr) {
-    int32_t* state = UbiGetStreamBaseState();
+    int32_t* state = UbiGetStreamBaseState(env);
     if (state != nullptr) {
       state[kUbiBytesWritten] = 0;
       state[kUbiLastWriteWasAsync] = 0;
@@ -160,7 +160,7 @@ napi_value CallOnWrite(napi_env env,
 
   napi_value argv[2] = {req_obj != nullptr ? req_obj : UbiStreamBaseUndefined(env), array};
   int32_t status = CallMethodReturningInt32(env, self, wrap->base.async_id, "onwrite", 2, argv, UV_EPROTO);
-  int32_t* state = UbiGetStreamBaseState();
+  int32_t* state = UbiGetStreamBaseState(env);
   if (state != nullptr) {
     state[kUbiBytesWritten] = static_cast<int32_t>(status == 0 ? total_bytes : 0);
     state[kUbiLastWriteWasAsync] = status == 0 ? 1 : 0;
@@ -278,7 +278,7 @@ napi_value JsStreamWritev(napi_env env, napi_callback_info info) {
   if (napi_get_array_length(env, argv[1], &raw_len) != napi_ok) return UbiStreamBaseMakeInt32(env, UV_EINVAL);
   const uint32_t count = all_buffers ? raw_len : (raw_len / 2);
   if (count == 0) {
-    int32_t* state = UbiGetStreamBaseState();
+    int32_t* state = UbiGetStreamBaseState(env);
     if (state != nullptr) {
       state[kUbiBytesWritten] = 0;
       state[kUbiLastWriteWasAsync] = 0;

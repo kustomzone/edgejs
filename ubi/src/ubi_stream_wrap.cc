@@ -1,18 +1,20 @@
 #include "ubi_stream_wrap.h"
 
 #include <cstdint>
+#include <mutex>
 #include <unordered_map>
 
 #include "ubi_async_wrap.h"
 
 namespace {
 
-int32_t* g_stream_state = nullptr;
-
 struct StreamWrapBindingState {
+  bool cleanup_hook_registered = false;
   napi_ref binding_ref = nullptr;
+  int32_t* stream_state = nullptr;
 };
 
+std::mutex g_stream_wrap_mu;
 std::unordered_map<napi_env, StreamWrapBindingState> g_stream_wrap_bindings;
 
 struct StreamReqWrap {
@@ -125,10 +127,34 @@ void SetNamedU32(napi_env env, napi_value obj, const char* key, uint32_t value) 
   }
 }
 
+void CleanupStreamWrapBindingState(void* data) {
+  napi_env env = static_cast<napi_env>(data);
+  if (env == nullptr) return;
+  std::lock_guard<std::mutex> lock(g_stream_wrap_mu);
+  auto it = g_stream_wrap_bindings.find(env);
+  if (it == g_stream_wrap_bindings.end()) return;
+  DeleteRefIfPresent(env, &it->second.binding_ref);
+  g_stream_wrap_bindings.erase(it);
+}
+
+StreamWrapBindingState& EnsureBindingState(napi_env env) {
+  auto& state = g_stream_wrap_bindings[env];
+  if (!state.cleanup_hook_registered) {
+    if (napi_add_env_cleanup_hook(env, CleanupStreamWrapBindingState, env) == napi_ok) {
+      state.cleanup_hook_registered = true;
+    }
+  }
+  return state;
+}
+
 }  // namespace
 
-int32_t* UbiGetStreamBaseState() {
-  return g_stream_state;
+int32_t* UbiGetStreamBaseState(napi_env env) {
+  if (env == nullptr) return nullptr;
+  std::lock_guard<std::mutex> lock(g_stream_wrap_mu);
+  auto it = g_stream_wrap_bindings.find(env);
+  if (it == g_stream_wrap_bindings.end()) return nullptr;
+  return it->second.stream_state;
 }
 
 napi_value UbiCreateStreamReqObject(napi_env env) {
@@ -185,10 +211,14 @@ void UbiStreamReqMarkDone(napi_env env, napi_value req_obj) {
 }
 
 napi_value UbiInstallStreamWrapBinding(napi_env env) {
-  auto it = g_stream_wrap_bindings.find(env);
-  if (it != g_stream_wrap_bindings.end() && it->second.binding_ref != nullptr) {
-    napi_value cached = GetRefValue(env, it->second.binding_ref);
-    if (cached != nullptr) return cached;
+  {
+    std::lock_guard<std::mutex> lock(g_stream_wrap_mu);
+    StreamWrapBindingState& state = EnsureBindingState(env);
+    if (state.binding_ref != nullptr) {
+      napi_value cached = GetRefValue(env, state.binding_ref);
+      if (cached != nullptr) return cached;
+      DeleteRefIfPresent(env, &state.binding_ref);
+    }
   }
 
   napi_value binding = nullptr;
@@ -228,8 +258,8 @@ napi_value UbiInstallStreamWrapBinding(napi_env env) {
       state_ab == nullptr || state_data == nullptr) {
     return nullptr;
   }
-  g_stream_state = static_cast<int32_t*>(state_data);
-  for (int i = 0; i < kUbiStreamStateLength; i++) g_stream_state[i] = 0;
+  int32_t* stream_state_data = static_cast<int32_t*>(state_data);
+  for (int i = 0; i < kUbiStreamStateLength; i++) stream_state_data[i] = 0;
 
   napi_value stream_state = nullptr;
   if (napi_create_typedarray(env,
@@ -251,9 +281,13 @@ napi_value UbiInstallStreamWrapBinding(napi_env env) {
   SetNamedU32(env, binding, "kBytesWritten", kUbiBytesWritten);
   SetNamedU32(env, binding, "kLastWriteWasAsync", kUbiLastWriteWasAsync);
 
-  StreamWrapBindingState& state = g_stream_wrap_bindings[env];
-  DeleteRefIfPresent(env, &state.binding_ref);
-  napi_create_reference(env, binding, 1, &state.binding_ref);
+  {
+    std::lock_guard<std::mutex> lock(g_stream_wrap_mu);
+    StreamWrapBindingState& state = EnsureBindingState(env);
+    state.stream_state = stream_state_data;
+    DeleteRefIfPresent(env, &state.binding_ref);
+    napi_create_reference(env, binding, 1, &state.binding_ref);
+  }
 
   return binding;
 }

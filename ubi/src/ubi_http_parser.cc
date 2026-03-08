@@ -12,6 +12,7 @@
 
 #include <uv.h>
 
+#include "ubi_async_wrap.h"
 #include "ubi_runtime.h"
 #include "ubi_pipe_wrap.h"
 #include "ubi_tcp_wrap.h"
@@ -82,6 +83,8 @@ struct Parser {
   const char* current_buffer_data = nullptr;
   size_t current_buffer_len = 0;
   ConnectionsList* list = nullptr;
+  int64_t async_id = 0;
+  int32_t provider_type = kUbiProviderNone;
 };
 
 struct ParserReadBufferState {
@@ -107,6 +110,8 @@ napi_value CreateUint8ArrayCopy(napi_env env, const char* data, size_t length);
 napi_value CreateBufferCopy(napi_env env, const char* data, size_t length);
 napi_value GetWrappedObject(napi_env env, napi_ref ref);
 int FlushHeadersToJs(Parser* p);
+void ParserDetachFromConnectionsList(Parser* p);
+void ParserQueueDestroy(Parser* p);
 bool DispatchConsumedParserRead(Parser* p,
                                 napi_value parser_obj,
                                 const char* data,
@@ -204,6 +209,20 @@ void ClearConsumedStreamBinding(Parser* p) {
   }
   p->consumed_stream = nullptr;
   p->consumed_listener.previous = nullptr;
+}
+
+void ParserDetachFromConnectionsList(Parser* p) {
+  if (p == nullptr || p->list == nullptr || p->list->finalized) return;
+  p->list->all.erase(p);
+  p->list->active.erase(p);
+  p->list = nullptr;
+}
+
+void ParserQueueDestroy(Parser* p) {
+  if (p == nullptr || p->async_id <= 0) return;
+  UbiAsyncWrapQueueDestroyId(p->env, p->async_id);
+  p->async_id = 0;
+  p->provider_type = kUbiProviderNone;
 }
 
 napi_value MakeError(napi_env env,
@@ -545,11 +564,10 @@ int ParserOnChunkComplete(llhttp_t* llp) {
 
 void ParserFinalize(napi_env env, void* data, void* hint) {
   Parser* p = static_cast<Parser*>(data);
+  if (p == nullptr) return;
   ClearConsumedStreamBinding(p);
-  if (p->list != nullptr && !p->list->finalized) {
-    p->list->all.erase(p);
-    p->list->active.erase(p);
-  }
+  ParserDetachFromConnectionsList(p);
+  ParserQueueDestroy(p);
   if (p->wrapper_ref != nullptr) napi_delete_reference(env, p->wrapper_ref);
   delete p;
 }
@@ -609,7 +627,8 @@ napi_value ConnectionsListCtor(napi_env env, napi_callback_info info) {
 napi_value ParserInitialize(napi_env env, napi_callback_info info) {
   size_t argc = 5;
   napi_value argv[5] = {nullptr};
-  Parser* p = Unwrap<Parser>(env, info);
+  napi_value self = nullptr;
+  Parser* p = Unwrap<Parser>(env, info, &self);
   if (p == nullptr) return nullptr;
   napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
   int32_t type = HTTP_REQUEST;
@@ -635,7 +654,7 @@ napi_value ParserInitialize(napi_env env, napi_callback_info info) {
   p->have_flushed = false;
   p->got_exception = false;
   ClearConsumedStreamBinding(p);
-  p->list = nullptr;
+  ParserDetachFromConnectionsList(p);
   if (argc >= 5 && argv[4] != nullptr) {
     bool is_null = false;
     napi_valuetype value_type = napi_undefined;
@@ -654,6 +673,23 @@ napi_value ParserInitialize(napi_env env, napi_callback_info info) {
       }
     }
   }
+  p->provider_type = (type == HTTP_REQUEST) ? kUbiProviderHttpIncomingMessage
+                                            : kUbiProviderHttpClientRequest;
+  if (p->async_id > 0) {
+    UbiAsyncWrapReset(env, &p->async_id);
+  } else {
+    p->async_id = UbiAsyncWrapNextId(env);
+  }
+  napi_value resource = self;
+  if (argc >= 2 && argv[1] != nullptr) {
+    napi_valuetype resource_type = napi_undefined;
+    if (napi_typeof(env, argv[1], &resource_type) == napi_ok &&
+        (resource_type == napi_object || resource_type == napi_function)) {
+      resource = argv[1];
+    }
+  }
+  UbiAsyncWrapEmitInit(
+      env, p->async_id, p->provider_type, UbiAsyncWrapExecutionAsyncId(env), resource);
   if (lenient & static_cast<int32_t>(kLenientHeaders)) llhttp_set_lenient_headers(&p->parser, 1);
   if (lenient & static_cast<int32_t>(kLenientChunkedLength)) llhttp_set_lenient_chunked_length(&p->parser, 1);
   if (lenient & static_cast<int32_t>(kLenientKeepAlive)) llhttp_set_lenient_keep_alive(&p->parser, 1);
@@ -889,12 +925,9 @@ napi_value ParserRemove(napi_env env, napi_callback_info info) {
   Parser* p = Unwrap<Parser>(env, info);
   if (p == nullptr) return nullptr;
   ClearConsumedStreamBinding(p);
-  if (p->list != nullptr && !p->list->finalized) {
-    p->list->all.erase(p);
-    p->list->active.erase(p);
-    p->list = nullptr;
-  }
+  ParserDetachFromConnectionsList(p);
   p->last_message_start = 0;
+  ParserQueueDestroy(p);
   napi_value undefined = nullptr;
   napi_get_undefined(env, &undefined);
   return undefined;
@@ -913,12 +946,9 @@ napi_value ParserClose(napi_env env, napi_callback_info info) {
     return undefined;
   }
   ClearConsumedStreamBinding(p);
-  if (p->list != nullptr && !p->list->finalized) {
-    p->list->all.erase(p);
-    p->list->active.erase(p);
-    p->list = nullptr;
-  }
+  ParserDetachFromConnectionsList(p);
   p->last_message_start = 0;
+  ParserQueueDestroy(p);
 
   void* removed = nullptr;
   if (napi_remove_wrap(env, self, &removed) == napi_ok && removed != nullptr) {

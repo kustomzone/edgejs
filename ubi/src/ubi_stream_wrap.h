@@ -14,7 +14,7 @@ enum UbiStreamStateIndex : int {
 };
 
 napi_value UbiInstallStreamWrapBinding(napi_env env);
-int32_t* UbiGetStreamBaseState();
+int32_t* UbiGetStreamBaseState(napi_env env);
 napi_value UbiCreateStreamReqObject(napi_env env);
 
 int64_t UbiStreamReqGetAsyncId(napi_env env, napi_value req_obj);

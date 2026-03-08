@@ -192,8 +192,8 @@ void FreeExternalArrayBuffer(napi_env /*env*/, void* data, void* /*hint*/) {
   free(data);
 }
 
-void SetStreamState(int index, int32_t value) {
-  int32_t* state = UbiGetStreamBaseState();
+void SetStreamState(napi_env env, int index, int32_t value) {
+  int32_t* state = UbiGetStreamBaseState(env);
   if (state == nullptr) return;
   state[index] = value;
 }
@@ -308,8 +308,8 @@ bool CallJsOnRead(UbiStreamBase* base,
                   napi_value* result) {
   if (base == nullptr || base->env == nullptr) return false;
 
-  SetStreamState(kUbiReadBytesOrError, static_cast<int32_t>(nread));
-  SetStreamState(kUbiArrayBufferOffset, static_cast<int32_t>(offset));
+  SetStreamState(base->env, kUbiReadBytesOrError, static_cast<int32_t>(nread));
+  SetStreamState(base->env, kUbiArrayBufferOffset, static_cast<int32_t>(offset));
 
   napi_value callback = GetRefValue(base->env, base->onread_ref);
   if (!IsFunction(base->env, callback)) return false;
@@ -1076,15 +1076,15 @@ napi_value UbiLibuvStreamWriteBuffer(UbiStreamBase* base,
         uv_buf_init(const_cast<char*>(reinterpret_cast<const char*>(data)), static_cast<unsigned int>(len));
     const int try_rc = uv_try_write(stream, &try_buf, 1);
     if (try_rc == static_cast<int>(len)) {
-      SetStreamState(kUbiBytesWritten, static_cast<int32_t>(len));
-      SetStreamState(kUbiLastWriteWasAsync, 0);
+      SetStreamState(base->env, kUbiBytesWritten, static_cast<int32_t>(len));
+      SetStreamState(base->env, kUbiLastWriteWasAsync, 0);
       return UbiStreamBaseMakeInt32(base->env, 0);
     }
     if (try_rc > 0) {
       sync_written = static_cast<size_t>(try_rc);
     } else if (try_rc < 0 && try_rc != UV_EAGAIN && try_rc != UV_ENOSYS) {
-      SetStreamState(kUbiBytesWritten, static_cast<int32_t>(len));
-      SetStreamState(kUbiLastWriteWasAsync, 0);
+      SetStreamState(base->env, kUbiBytesWritten, static_cast<int32_t>(len));
+      SetStreamState(base->env, kUbiLastWriteWasAsync, 0);
       UbiStreamBaseSetReqError(base->env, req_obj, try_rc);
       return UbiStreamBaseMakeInt32(base->env, try_rc);
     }
@@ -1092,8 +1092,8 @@ napi_value UbiLibuvStreamWriteBuffer(UbiStreamBase* base,
 
   const size_t remaining = len >= sync_written ? (len - sync_written) : 0;
   if (remaining == 0) {
-    SetStreamState(kUbiBytesWritten, static_cast<int32_t>(len));
-    SetStreamState(kUbiLastWriteWasAsync, 0);
+    SetStreamState(base->env, kUbiBytesWritten, static_cast<int32_t>(len));
+    SetStreamState(base->env, kUbiLastWriteWasAsync, 0);
     return UbiStreamBaseMakeInt32(base->env, 0);
   }
 
@@ -1119,8 +1119,8 @@ napi_value UbiLibuvStreamWriteBuffer(UbiStreamBase* base,
   } else {
     char* copy = static_cast<char*>(malloc(remaining));
     if (copy == nullptr && remaining > 0) {
-      SetStreamState(kUbiBytesWritten, static_cast<int32_t>(len));
-      SetStreamState(kUbiLastWriteWasAsync, 0);
+      SetStreamState(base->env, kUbiBytesWritten, static_cast<int32_t>(len));
+      SetStreamState(base->env, kUbiLastWriteWasAsync, 0);
       UbiStreamBaseSetReqError(base->env, req_obj, UV_ENOMEM);
       FreeWriteReq(wr);
       return UbiStreamBaseMakeInt32(base->env, UV_ENOMEM);
@@ -1137,8 +1137,8 @@ napi_value UbiLibuvStreamWriteBuffer(UbiStreamBase* base,
   }
 
   wr->req.data = wr;
-  SetStreamState(kUbiBytesWritten, static_cast<int32_t>(len));
-  SetStreamState(kUbiLastWriteWasAsync, 1);
+  SetStreamState(base->env, kUbiBytesWritten, static_cast<int32_t>(len));
+  SetStreamState(base->env, kUbiLastWriteWasAsync, 1);
 
   int rc = 0;
   if (send_handle != nullptr) {
@@ -1147,7 +1147,7 @@ napi_value UbiLibuvStreamWriteBuffer(UbiStreamBase* base,
     rc = uv_write(&wr->req, stream, wr->bufs, wr->nbufs, OnWriteDone);
   }
   if (rc != 0) {
-    SetStreamState(kUbiLastWriteWasAsync, 0);
+    SetStreamState(base->env, kUbiLastWriteWasAsync, 0);
     UbiStreamBaseSetReqError(base->env, req_obj, rc);
     UbiStreamReqMarkDone(base->env, req_obj);
     FreeWriteReq(wr);
@@ -1191,8 +1191,8 @@ napi_value UbiLibuvStreamWriteV(UbiStreamBase* base,
   }
   const uint32_t nbufs = all_buffers ? raw_len : (raw_len / 2);
   if (nbufs == 0) {
-    SetStreamState(kUbiBytesWritten, 0);
-    SetStreamState(kUbiLastWriteWasAsync, 0);
+    SetStreamState(base->env, kUbiBytesWritten, 0);
+    SetStreamState(base->env, kUbiLastWriteWasAsync, 0);
     return UbiStreamBaseMakeInt32(base->env, 0);
   }
 
@@ -1240,8 +1240,8 @@ napi_value UbiLibuvStreamWriteV(UbiStreamBase* base,
     } else {
       char* copy = static_cast<char*>(malloc(len));
       if (copy == nullptr && len > 0) {
-        SetStreamState(kUbiBytesWritten, 0);
-        SetStreamState(kUbiLastWriteWasAsync, 0);
+        SetStreamState(base->env, kUbiBytesWritten, 0);
+        SetStreamState(base->env, kUbiLastWriteWasAsync, 0);
         UbiStreamBaseSetReqError(base->env, req_obj, UV_ENOMEM);
         FreeWriteReq(wr);
         return UbiStreamBaseMakeInt32(base->env, UV_ENOMEM);
@@ -1258,8 +1258,8 @@ napi_value UbiLibuvStreamWriteV(UbiStreamBase* base,
   if (send_handle == nullptr && total > 0) {
     const int try_rc = uv_try_write(stream, wr->bufs, wr->nbufs);
     if (try_rc == static_cast<int>(total)) {
-      SetStreamState(kUbiBytesWritten, static_cast<int32_t>(total));
-      SetStreamState(kUbiLastWriteWasAsync, 0);
+      SetStreamState(base->env, kUbiBytesWritten, static_cast<int32_t>(total));
+      SetStreamState(base->env, kUbiLastWriteWasAsync, 0);
       FreeWriteReq(wr);
       return UbiStreamBaseMakeInt32(base->env, 0);
     }
@@ -1279,8 +1279,8 @@ napi_value UbiLibuvStreamWriteV(UbiStreamBase* base,
       wr->bufs = vbufs;
       wr->nbufs = vcount;
     } else if (try_rc < 0 && try_rc != UV_EAGAIN && try_rc != UV_ENOSYS) {
-      SetStreamState(kUbiBytesWritten, static_cast<int32_t>(total));
-      SetStreamState(kUbiLastWriteWasAsync, 0);
+      SetStreamState(base->env, kUbiBytesWritten, static_cast<int32_t>(total));
+      SetStreamState(base->env, kUbiLastWriteWasAsync, 0);
       UbiStreamBaseSetReqError(base->env, req_obj, try_rc);
       FreeWriteReq(wr);
       return UbiStreamBaseMakeInt32(base->env, try_rc);
@@ -1288,8 +1288,8 @@ napi_value UbiLibuvStreamWriteV(UbiStreamBase* base,
   }
 
   if (wr->nbufs == 0) {
-    SetStreamState(kUbiBytesWritten, static_cast<int32_t>(total));
-    SetStreamState(kUbiLastWriteWasAsync, 0);
+    SetStreamState(base->env, kUbiBytesWritten, static_cast<int32_t>(total));
+    SetStreamState(base->env, kUbiLastWriteWasAsync, 0);
     FreeWriteReq(wr);
     return UbiStreamBaseMakeInt32(base->env, 0);
   }
@@ -1301,8 +1301,8 @@ napi_value UbiLibuvStreamWriteV(UbiStreamBase* base,
   }
 
   wr->req.data = wr;
-  SetStreamState(kUbiBytesWritten, static_cast<int32_t>(total));
-  SetStreamState(kUbiLastWriteWasAsync, 1);
+  SetStreamState(base->env, kUbiBytesWritten, static_cast<int32_t>(total));
+  SetStreamState(base->env, kUbiLastWriteWasAsync, 1);
 
   int rc = 0;
   if (send_handle != nullptr) {
@@ -1311,7 +1311,7 @@ napi_value UbiLibuvStreamWriteV(UbiStreamBase* base,
     rc = uv_write(&wr->req, stream, wr->bufs, wr->nbufs, OnWriteDone);
   }
   if (rc != 0) {
-    SetStreamState(kUbiLastWriteWasAsync, 0);
+    SetStreamState(base->env, kUbiLastWriteWasAsync, 0);
     UbiStreamBaseSetReqError(base->env, req_obj, rc);
     UbiStreamReqMarkDone(base->env, req_obj);
     FreeWriteReq(wr);

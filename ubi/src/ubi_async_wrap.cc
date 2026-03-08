@@ -247,6 +247,10 @@ int64_t UbiAsyncWrapExecutionAsyncId(napi_env env) {
 
 const char* UbiAsyncWrapProviderName(int32_t provider_type) {
   switch (provider_type) {
+    case kUbiProviderHttpClientRequest:
+      return "HTTPCLIENTREQUEST";
+    case kUbiProviderHttpIncomingMessage:
+      return "HTTPINCOMINGMESSAGE";
     case kUbiProviderJsStream:
       return "JSSTREAM";
     case kUbiProviderJsUdpWrap:

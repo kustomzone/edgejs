@@ -1613,7 +1613,6 @@ int RunScriptWithGlobals(napi_env env,
     }
     return 1;
   }
-
   auto require_bootstrap_module_exports = [&](const char* id, napi_value* out_exports) -> bool {
     napi_value exports = nullptr;
     if (UbiRequireBuiltin(env, id, &exports)) {
