@@ -281,6 +281,8 @@ const char* UbiAsyncWrapProviderName(int32_t provider_type) {
       return "UDPWRAP";
     case kUbiProviderWriteWrap:
       return "WRITEWRAP";
+    case kUbiProviderZlib:
+      return "ZLIB";
     default:
       return "NONE";
   }

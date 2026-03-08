@@ -137,6 +137,104 @@ set(CARES_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(CARES_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
 add_subdirectory("${PROJECT_ROOT}/deps/cares" "${CMAKE_CURRENT_BINARY_DIR}/deps/cares")
 
+set(BUILD_UNITTESTS OFF CACHE BOOL "" FORCE)
+set(BUILD_MINIZIP_BIN OFF CACHE BOOL "" FORCE)
+set(BUILD_ZPIPE OFF CACHE BOOL "" FORCE)
+set(BUILD_MINIGZIP OFF CACHE BOOL "" FORCE)
+add_subdirectory("${PROJECT_ROOT}/deps/zlib" "${CMAKE_CURRENT_BINARY_DIR}/deps/zlib")
+
+find_package(Threads REQUIRED)
+
+add_library(ubi_brotli STATIC
+  "${PROJECT_ROOT}/deps/brotli/c/common/constants.c"
+  "${PROJECT_ROOT}/deps/brotli/c/common/context.c"
+  "${PROJECT_ROOT}/deps/brotli/c/common/dictionary.c"
+  "${PROJECT_ROOT}/deps/brotli/c/common/platform.c"
+  "${PROJECT_ROOT}/deps/brotli/c/common/shared_dictionary.c"
+  "${PROJECT_ROOT}/deps/brotli/c/common/transform.c"
+  "${PROJECT_ROOT}/deps/brotli/c/dec/bit_reader.c"
+  "${PROJECT_ROOT}/deps/brotli/c/dec/decode.c"
+  "${PROJECT_ROOT}/deps/brotli/c/dec/huffman.c"
+  "${PROJECT_ROOT}/deps/brotli/c/dec/prefix.c"
+  "${PROJECT_ROOT}/deps/brotli/c/dec/state.c"
+  "${PROJECT_ROOT}/deps/brotli/c/dec/static_init.c"
+  "${PROJECT_ROOT}/deps/brotli/c/enc/backward_references.c"
+  "${PROJECT_ROOT}/deps/brotli/c/enc/backward_references_hq.c"
+  "${PROJECT_ROOT}/deps/brotli/c/enc/bit_cost.c"
+  "${PROJECT_ROOT}/deps/brotli/c/enc/block_splitter.c"
+  "${PROJECT_ROOT}/deps/brotli/c/enc/brotli_bit_stream.c"
+  "${PROJECT_ROOT}/deps/brotli/c/enc/cluster.c"
+  "${PROJECT_ROOT}/deps/brotli/c/enc/command.c"
+  "${PROJECT_ROOT}/deps/brotli/c/enc/compound_dictionary.c"
+  "${PROJECT_ROOT}/deps/brotli/c/enc/compress_fragment.c"
+  "${PROJECT_ROOT}/deps/brotli/c/enc/compress_fragment_two_pass.c"
+  "${PROJECT_ROOT}/deps/brotli/c/enc/dictionary_hash.c"
+  "${PROJECT_ROOT}/deps/brotli/c/enc/encode.c"
+  "${PROJECT_ROOT}/deps/brotli/c/enc/encoder_dict.c"
+  "${PROJECT_ROOT}/deps/brotli/c/enc/entropy_encode.c"
+  "${PROJECT_ROOT}/deps/brotli/c/enc/fast_log.c"
+  "${PROJECT_ROOT}/deps/brotli/c/enc/histogram.c"
+  "${PROJECT_ROOT}/deps/brotli/c/enc/literal_cost.c"
+  "${PROJECT_ROOT}/deps/brotli/c/enc/memory.c"
+  "${PROJECT_ROOT}/deps/brotli/c/enc/metablock.c"
+  "${PROJECT_ROOT}/deps/brotli/c/enc/static_dict.c"
+  "${PROJECT_ROOT}/deps/brotli/c/enc/static_dict_lut.c"
+  "${PROJECT_ROOT}/deps/brotli/c/enc/static_init.c"
+  "${PROJECT_ROOT}/deps/brotli/c/enc/utf8_util.c"
+)
+target_include_directories(ubi_brotli
+  PUBLIC
+    "${PROJECT_ROOT}/deps/brotli/c/include"
+)
+if(APPLE)
+  target_link_libraries(ubi_brotli PUBLIC m)
+elseif(UNIX)
+  target_link_libraries(ubi_brotli PUBLIC m)
+endif()
+
+add_library(ubi_zstd STATIC
+  "${PROJECT_ROOT}/deps/zstd/lib/common/debug.c"
+  "${PROJECT_ROOT}/deps/zstd/lib/common/entropy_common.c"
+  "${PROJECT_ROOT}/deps/zstd/lib/common/fse_decompress.c"
+  "${PROJECT_ROOT}/deps/zstd/lib/compress/fse_compress.c"
+  "${PROJECT_ROOT}/deps/zstd/lib/compress/huf_compress.c"
+  "${PROJECT_ROOT}/deps/zstd/lib/decompress/huf_decompress.c"
+  "${PROJECT_ROOT}/deps/zstd/lib/common/pool.c"
+  "${PROJECT_ROOT}/deps/zstd/lib/common/threading.c"
+  "${PROJECT_ROOT}/deps/zstd/lib/common/xxhash.c"
+  "${PROJECT_ROOT}/deps/zstd/lib/common/zstd_common.c"
+  "${PROJECT_ROOT}/deps/zstd/lib/common/error_private.c"
+  "${PROJECT_ROOT}/deps/zstd/lib/compress/hist.c"
+  "${PROJECT_ROOT}/deps/zstd/lib/compress/zstd_compress.c"
+  "${PROJECT_ROOT}/deps/zstd/lib/compress/zstd_compress_literals.c"
+  "${PROJECT_ROOT}/deps/zstd/lib/compress/zstd_compress_sequences.c"
+  "${PROJECT_ROOT}/deps/zstd/lib/compress/zstd_compress_superblock.c"
+  "${PROJECT_ROOT}/deps/zstd/lib/compress/zstd_double_fast.c"
+  "${PROJECT_ROOT}/deps/zstd/lib/compress/zstd_fast.c"
+  "${PROJECT_ROOT}/deps/zstd/lib/compress/zstd_lazy.c"
+  "${PROJECT_ROOT}/deps/zstd/lib/compress/zstd_ldm.c"
+  "${PROJECT_ROOT}/deps/zstd/lib/compress/zstd_opt.c"
+  "${PROJECT_ROOT}/deps/zstd/lib/compress/zstd_preSplit.c"
+  "${PROJECT_ROOT}/deps/zstd/lib/compress/zstdmt_compress.c"
+  "${PROJECT_ROOT}/deps/zstd/lib/decompress/zstd_ddict.c"
+  "${PROJECT_ROOT}/deps/zstd/lib/decompress/zstd_decompress.c"
+  "${PROJECT_ROOT}/deps/zstd/lib/decompress/zstd_decompress_block.c"
+)
+target_include_directories(ubi_zstd
+  PUBLIC
+    "${PROJECT_ROOT}/deps/zstd/lib"
+)
+target_compile_definitions(ubi_zstd
+  PUBLIC
+    XXH_NAMESPACE=ZSTD_
+    ZSTD_MULTITHREAD
+    ZSTD_DISABLE_ASM
+)
+target_link_libraries(ubi_zstd
+  PUBLIC
+    Threads::Threads
+)
+
 if(UBI_IS_WASIX_TARGET)
   set(UBI_OPENSSL_WASIX_ROOT
     "${PROJECT_ROOT}/deps/openssl-wasix"
@@ -393,9 +491,12 @@ target_link_libraries(ubi_runtime
     ubi_simdutf
     ubi_ada
     ubi_ncrypto
+    ubi_brotli
+    ubi_zstd
     uv_a
     c-ares::cares
     OpenSSL::Crypto
+    zlibstatic
 )
 if(APPLE)
   target_link_libraries(ubi_runtime PRIVATE icucore)

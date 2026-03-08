@@ -1,14 +1,20 @@
 #include "internal_binding/dispatch.h"
 
+#include <limits>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
 #include <unordered_map>
 
+#include "brotli/decode.h"
+#include "brotli/encode.h"
 #include <openssl/ec.h>
 #include <openssl/rsa.h>
 #include <openssl/ssl.h>
+#include "zlib.h"
+#include "zstd.h"
+#include "zstd_errors.h"
 
 #include "internal_binding/helpers.h"
 
@@ -17,6 +23,31 @@ namespace internal_binding {
 namespace {
 
 std::unordered_map<napi_env, napi_ref> g_constants_refs;
+
+constexpr int32_t kZlibModeDeflate = 1;
+constexpr int32_t kZlibModeInflate = 2;
+constexpr int32_t kZlibModeGzip = 3;
+constexpr int32_t kZlibModeGunzip = 4;
+constexpr int32_t kZlibModeDeflateRaw = 5;
+constexpr int32_t kZlibModeInflateRaw = 6;
+constexpr int32_t kZlibModeUnzip = 7;
+constexpr int32_t kZlibModeBrotliDecode = 8;
+constexpr int32_t kZlibModeBrotliEncode = 9;
+constexpr int32_t kZlibModeZstdCompress = 10;
+constexpr int32_t kZlibModeZstdDecompress = 11;
+
+constexpr int32_t kZMinChunk = 64;
+constexpr double kZMaxChunk = std::numeric_limits<double>::infinity();
+constexpr int32_t kZDefaultChunk = 16 * 1024;
+constexpr int32_t kZMinMemLevel = 1;
+constexpr int32_t kZMaxMemLevel = 9;
+constexpr int32_t kZDefaultMemLevel = 8;
+constexpr int32_t kZMinLevel = -1;
+constexpr int32_t kZMaxLevel = 9;
+constexpr int32_t kZDefaultLevel = Z_DEFAULT_COMPRESSION;
+constexpr int32_t kZMinWindowBits = 8;
+constexpr int32_t kZMaxWindowBits = 15;
+constexpr int32_t kZDefaultWindowBits = 15;
 
 bool IsObjectLike(napi_env env, napi_value value) {
   if (value == nullptr) return false;
@@ -107,6 +138,198 @@ void EnsureInt64Default(napi_env env, napi_value target, const char* key, int64_
   if (napi_create_int64(env, value, &out) == napi_ok && out != nullptr) {
     napi_set_named_property(env, target, key, out);
   }
+}
+
+void EnsureDoubleDefault(napi_env env, napi_value target, const char* key, double value) {
+  if (!IsObjectLike(env, target)) return;
+  bool has_key = false;
+  if (napi_has_named_property(env, target, key, &has_key) != napi_ok || has_key) return;
+  napi_value out = nullptr;
+  if (napi_create_double(env, value, &out) == napi_ok && out != nullptr) {
+    napi_set_named_property(env, target, key, out);
+  }
+}
+
+void PopulateZlibConstants(napi_env env, napi_value zlib_obj) {
+  if (!IsObjectLike(env, zlib_obj)) return;
+
+#define UBI_ENSURE_CONST(name) \
+  EnsureInt32Default(env, zlib_obj, #name, static_cast<int32_t>(name))
+
+  UBI_ENSURE_CONST(Z_NO_FLUSH);
+  UBI_ENSURE_CONST(Z_PARTIAL_FLUSH);
+  UBI_ENSURE_CONST(Z_SYNC_FLUSH);
+  UBI_ENSURE_CONST(Z_FULL_FLUSH);
+  UBI_ENSURE_CONST(Z_FINISH);
+  UBI_ENSURE_CONST(Z_BLOCK);
+  UBI_ENSURE_CONST(Z_OK);
+  UBI_ENSURE_CONST(Z_STREAM_END);
+  UBI_ENSURE_CONST(Z_NEED_DICT);
+  UBI_ENSURE_CONST(Z_ERRNO);
+  UBI_ENSURE_CONST(Z_STREAM_ERROR);
+  UBI_ENSURE_CONST(Z_DATA_ERROR);
+  UBI_ENSURE_CONST(Z_MEM_ERROR);
+  UBI_ENSURE_CONST(Z_BUF_ERROR);
+  UBI_ENSURE_CONST(Z_VERSION_ERROR);
+  UBI_ENSURE_CONST(Z_NO_COMPRESSION);
+  UBI_ENSURE_CONST(Z_BEST_SPEED);
+  UBI_ENSURE_CONST(Z_BEST_COMPRESSION);
+  UBI_ENSURE_CONST(Z_DEFAULT_COMPRESSION);
+  UBI_ENSURE_CONST(Z_FILTERED);
+  UBI_ENSURE_CONST(Z_HUFFMAN_ONLY);
+  UBI_ENSURE_CONST(Z_RLE);
+  UBI_ENSURE_CONST(Z_FIXED);
+  UBI_ENSURE_CONST(Z_DEFAULT_STRATEGY);
+  UBI_ENSURE_CONST(ZLIB_VERNUM);
+  EnsureInt32Default(env, zlib_obj, "DEFLATE", kZlibModeDeflate);
+  EnsureInt32Default(env, zlib_obj, "INFLATE", kZlibModeInflate);
+  EnsureInt32Default(env, zlib_obj, "GZIP", kZlibModeGzip);
+  EnsureInt32Default(env, zlib_obj, "GUNZIP", kZlibModeGunzip);
+  EnsureInt32Default(env, zlib_obj, "DEFLATERAW", kZlibModeDeflateRaw);
+  EnsureInt32Default(env, zlib_obj, "INFLATERAW", kZlibModeInflateRaw);
+  EnsureInt32Default(env, zlib_obj, "UNZIP", kZlibModeUnzip);
+  EnsureInt32Default(env, zlib_obj, "BROTLI_DECODE", kZlibModeBrotliDecode);
+  EnsureInt32Default(env, zlib_obj, "BROTLI_ENCODE", kZlibModeBrotliEncode);
+  EnsureInt32Default(env, zlib_obj, "ZSTD_COMPRESS", kZlibModeZstdCompress);
+  EnsureInt32Default(env, zlib_obj, "ZSTD_DECOMPRESS", kZlibModeZstdDecompress);
+  EnsureInt32Default(env, zlib_obj, "Z_MIN_WINDOWBITS", kZMinWindowBits);
+  EnsureInt32Default(env, zlib_obj, "Z_MAX_WINDOWBITS", kZMaxWindowBits);
+  EnsureInt32Default(env, zlib_obj, "Z_DEFAULT_WINDOWBITS", kZDefaultWindowBits);
+  EnsureInt32Default(env, zlib_obj, "Z_MIN_CHUNK", kZMinChunk);
+  EnsureDoubleDefault(env, zlib_obj, "Z_MAX_CHUNK", kZMaxChunk);
+  EnsureInt32Default(env, zlib_obj, "Z_DEFAULT_CHUNK", kZDefaultChunk);
+  EnsureInt32Default(env, zlib_obj, "Z_MIN_MEMLEVEL", kZMinMemLevel);
+  EnsureInt32Default(env, zlib_obj, "Z_MAX_MEMLEVEL", kZMaxMemLevel);
+  EnsureInt32Default(env, zlib_obj, "Z_DEFAULT_MEMLEVEL", kZDefaultMemLevel);
+  EnsureInt32Default(env, zlib_obj, "Z_MIN_LEVEL", kZMinLevel);
+  EnsureInt32Default(env, zlib_obj, "Z_MAX_LEVEL", kZMaxLevel);
+  EnsureInt32Default(env, zlib_obj, "Z_DEFAULT_LEVEL", kZDefaultLevel);
+
+  UBI_ENSURE_CONST(BROTLI_OPERATION_PROCESS);
+  UBI_ENSURE_CONST(BROTLI_OPERATION_FLUSH);
+  UBI_ENSURE_CONST(BROTLI_OPERATION_FINISH);
+  UBI_ENSURE_CONST(BROTLI_OPERATION_EMIT_METADATA);
+  UBI_ENSURE_CONST(BROTLI_PARAM_MODE);
+  UBI_ENSURE_CONST(BROTLI_MODE_GENERIC);
+  UBI_ENSURE_CONST(BROTLI_MODE_TEXT);
+  UBI_ENSURE_CONST(BROTLI_MODE_FONT);
+  UBI_ENSURE_CONST(BROTLI_DEFAULT_MODE);
+  UBI_ENSURE_CONST(BROTLI_PARAM_QUALITY);
+  UBI_ENSURE_CONST(BROTLI_MIN_QUALITY);
+  UBI_ENSURE_CONST(BROTLI_MAX_QUALITY);
+  UBI_ENSURE_CONST(BROTLI_DEFAULT_QUALITY);
+  UBI_ENSURE_CONST(BROTLI_PARAM_LGWIN);
+  UBI_ENSURE_CONST(BROTLI_MIN_WINDOW_BITS);
+  UBI_ENSURE_CONST(BROTLI_MAX_WINDOW_BITS);
+  UBI_ENSURE_CONST(BROTLI_LARGE_MAX_WINDOW_BITS);
+  UBI_ENSURE_CONST(BROTLI_DEFAULT_WINDOW);
+  UBI_ENSURE_CONST(BROTLI_PARAM_LGBLOCK);
+  UBI_ENSURE_CONST(BROTLI_MIN_INPUT_BLOCK_BITS);
+  UBI_ENSURE_CONST(BROTLI_MAX_INPUT_BLOCK_BITS);
+  UBI_ENSURE_CONST(BROTLI_PARAM_DISABLE_LITERAL_CONTEXT_MODELING);
+  UBI_ENSURE_CONST(BROTLI_PARAM_SIZE_HINT);
+  UBI_ENSURE_CONST(BROTLI_PARAM_LARGE_WINDOW);
+  UBI_ENSURE_CONST(BROTLI_PARAM_NPOSTFIX);
+  UBI_ENSURE_CONST(BROTLI_PARAM_NDIRECT);
+  UBI_ENSURE_CONST(BROTLI_DECODER_RESULT_ERROR);
+  UBI_ENSURE_CONST(BROTLI_DECODER_RESULT_SUCCESS);
+  UBI_ENSURE_CONST(BROTLI_DECODER_RESULT_NEEDS_MORE_INPUT);
+  UBI_ENSURE_CONST(BROTLI_DECODER_RESULT_NEEDS_MORE_OUTPUT);
+  UBI_ENSURE_CONST(BROTLI_DECODER_PARAM_DISABLE_RING_BUFFER_REALLOCATION);
+  UBI_ENSURE_CONST(BROTLI_DECODER_PARAM_LARGE_WINDOW);
+  UBI_ENSURE_CONST(BROTLI_DECODER_NO_ERROR);
+  UBI_ENSURE_CONST(BROTLI_DECODER_SUCCESS);
+  UBI_ENSURE_CONST(BROTLI_DECODER_NEEDS_MORE_INPUT);
+  UBI_ENSURE_CONST(BROTLI_DECODER_NEEDS_MORE_OUTPUT);
+  UBI_ENSURE_CONST(BROTLI_DECODER_ERROR_FORMAT_EXUBERANT_NIBBLE);
+  UBI_ENSURE_CONST(BROTLI_DECODER_ERROR_FORMAT_RESERVED);
+  UBI_ENSURE_CONST(BROTLI_DECODER_ERROR_FORMAT_EXUBERANT_META_NIBBLE);
+  UBI_ENSURE_CONST(BROTLI_DECODER_ERROR_FORMAT_SIMPLE_HUFFMAN_ALPHABET);
+  UBI_ENSURE_CONST(BROTLI_DECODER_ERROR_FORMAT_SIMPLE_HUFFMAN_SAME);
+  UBI_ENSURE_CONST(BROTLI_DECODER_ERROR_FORMAT_CL_SPACE);
+  UBI_ENSURE_CONST(BROTLI_DECODER_ERROR_FORMAT_HUFFMAN_SPACE);
+  UBI_ENSURE_CONST(BROTLI_DECODER_ERROR_FORMAT_CONTEXT_MAP_REPEAT);
+  UBI_ENSURE_CONST(BROTLI_DECODER_ERROR_FORMAT_BLOCK_LENGTH_1);
+  UBI_ENSURE_CONST(BROTLI_DECODER_ERROR_FORMAT_BLOCK_LENGTH_2);
+  UBI_ENSURE_CONST(BROTLI_DECODER_ERROR_FORMAT_TRANSFORM);
+  UBI_ENSURE_CONST(BROTLI_DECODER_ERROR_FORMAT_DICTIONARY);
+  UBI_ENSURE_CONST(BROTLI_DECODER_ERROR_FORMAT_WINDOW_BITS);
+  UBI_ENSURE_CONST(BROTLI_DECODER_ERROR_FORMAT_PADDING_1);
+  UBI_ENSURE_CONST(BROTLI_DECODER_ERROR_FORMAT_PADDING_2);
+  UBI_ENSURE_CONST(BROTLI_DECODER_ERROR_FORMAT_DISTANCE);
+  UBI_ENSURE_CONST(BROTLI_DECODER_ERROR_DICTIONARY_NOT_SET);
+  UBI_ENSURE_CONST(BROTLI_DECODER_ERROR_INVALID_ARGUMENTS);
+  UBI_ENSURE_CONST(BROTLI_DECODER_ERROR_ALLOC_CONTEXT_MODES);
+  UBI_ENSURE_CONST(BROTLI_DECODER_ERROR_ALLOC_TREE_GROUPS);
+  UBI_ENSURE_CONST(BROTLI_DECODER_ERROR_ALLOC_CONTEXT_MAP);
+  UBI_ENSURE_CONST(BROTLI_DECODER_ERROR_ALLOC_RING_BUFFER_1);
+  UBI_ENSURE_CONST(BROTLI_DECODER_ERROR_ALLOC_RING_BUFFER_2);
+  UBI_ENSURE_CONST(BROTLI_DECODER_ERROR_ALLOC_BLOCK_TYPE_TREES);
+  UBI_ENSURE_CONST(BROTLI_DECODER_ERROR_UNREACHABLE);
+
+  UBI_ENSURE_CONST(ZSTD_e_continue);
+  UBI_ENSURE_CONST(ZSTD_e_flush);
+  UBI_ENSURE_CONST(ZSTD_e_end);
+  UBI_ENSURE_CONST(ZSTD_fast);
+  UBI_ENSURE_CONST(ZSTD_dfast);
+  UBI_ENSURE_CONST(ZSTD_greedy);
+  UBI_ENSURE_CONST(ZSTD_lazy);
+  UBI_ENSURE_CONST(ZSTD_lazy2);
+  UBI_ENSURE_CONST(ZSTD_btlazy2);
+  UBI_ENSURE_CONST(ZSTD_btopt);
+  UBI_ENSURE_CONST(ZSTD_btultra);
+  UBI_ENSURE_CONST(ZSTD_btultra2);
+  UBI_ENSURE_CONST(ZSTD_c_compressionLevel);
+  UBI_ENSURE_CONST(ZSTD_c_windowLog);
+  UBI_ENSURE_CONST(ZSTD_c_hashLog);
+  UBI_ENSURE_CONST(ZSTD_c_chainLog);
+  UBI_ENSURE_CONST(ZSTD_c_searchLog);
+  UBI_ENSURE_CONST(ZSTD_c_minMatch);
+  UBI_ENSURE_CONST(ZSTD_c_targetLength);
+  UBI_ENSURE_CONST(ZSTD_c_strategy);
+  UBI_ENSURE_CONST(ZSTD_c_enableLongDistanceMatching);
+  UBI_ENSURE_CONST(ZSTD_c_ldmHashLog);
+  UBI_ENSURE_CONST(ZSTD_c_ldmMinMatch);
+  UBI_ENSURE_CONST(ZSTD_c_ldmBucketSizeLog);
+  UBI_ENSURE_CONST(ZSTD_c_ldmHashRateLog);
+  UBI_ENSURE_CONST(ZSTD_c_contentSizeFlag);
+  UBI_ENSURE_CONST(ZSTD_c_checksumFlag);
+  UBI_ENSURE_CONST(ZSTD_c_dictIDFlag);
+  UBI_ENSURE_CONST(ZSTD_c_nbWorkers);
+  UBI_ENSURE_CONST(ZSTD_c_jobSize);
+  UBI_ENSURE_CONST(ZSTD_c_overlapLog);
+  UBI_ENSURE_CONST(ZSTD_d_windowLogMax);
+  UBI_ENSURE_CONST(ZSTD_CLEVEL_DEFAULT);
+  UBI_ENSURE_CONST(ZSTD_error_no_error);
+  UBI_ENSURE_CONST(ZSTD_error_GENERIC);
+  UBI_ENSURE_CONST(ZSTD_error_prefix_unknown);
+  UBI_ENSURE_CONST(ZSTD_error_version_unsupported);
+  UBI_ENSURE_CONST(ZSTD_error_frameParameter_unsupported);
+  UBI_ENSURE_CONST(ZSTD_error_frameParameter_windowTooLarge);
+  UBI_ENSURE_CONST(ZSTD_error_corruption_detected);
+  UBI_ENSURE_CONST(ZSTD_error_checksum_wrong);
+  UBI_ENSURE_CONST(ZSTD_error_literals_headerWrong);
+  UBI_ENSURE_CONST(ZSTD_error_dictionary_corrupted);
+  UBI_ENSURE_CONST(ZSTD_error_dictionary_wrong);
+  UBI_ENSURE_CONST(ZSTD_error_dictionaryCreation_failed);
+  UBI_ENSURE_CONST(ZSTD_error_parameter_unsupported);
+  UBI_ENSURE_CONST(ZSTD_error_parameter_combination_unsupported);
+  UBI_ENSURE_CONST(ZSTD_error_parameter_outOfBound);
+  UBI_ENSURE_CONST(ZSTD_error_tableLog_tooLarge);
+  UBI_ENSURE_CONST(ZSTD_error_maxSymbolValue_tooLarge);
+  UBI_ENSURE_CONST(ZSTD_error_maxSymbolValue_tooSmall);
+  UBI_ENSURE_CONST(ZSTD_error_stabilityCondition_notRespected);
+  UBI_ENSURE_CONST(ZSTD_error_stage_wrong);
+  UBI_ENSURE_CONST(ZSTD_error_init_missing);
+  UBI_ENSURE_CONST(ZSTD_error_memory_allocation);
+  UBI_ENSURE_CONST(ZSTD_error_workSpace_tooSmall);
+  UBI_ENSURE_CONST(ZSTD_error_dstSize_tooSmall);
+  UBI_ENSURE_CONST(ZSTD_error_srcSize_wrong);
+  UBI_ENSURE_CONST(ZSTD_error_dstBuffer_null);
+  UBI_ENSURE_CONST(ZSTD_error_noForwardProgress_destFull);
+  UBI_ENSURE_CONST(ZSTD_error_noForwardProgress_inputEmpty);
+
+#undef UBI_ENSURE_CONST
 }
 
 void CopyOwnProperties(napi_env env, napi_value src, napi_value dst) {
@@ -397,74 +620,12 @@ void NormalizeConstantsShape(napi_env env, napi_value constants) {
   napi_object_freeze(env, normalized_signals);
   napi_set_named_property(env, os_obj, "signals", normalized_signals);
 
-  // Keep zlib constants minimally non-empty so zlib.js can compute
-  // parameter-array bounds during module initialization.
+  // Match Node's zlib constants surface closely because zlib.js derives
+  // modes, parameter bounds, and convenience APIs from this object during
+  // module initialization.
   napi_value zlib_obj = EnsureObjectProperty(env, constants, "zlib");
-  EnsureInt32Default(env, zlib_obj, "Z_NO_FLUSH", 0);
-  EnsureInt32Default(env, zlib_obj, "Z_PARTIAL_FLUSH", 1);
-  EnsureInt32Default(env, zlib_obj, "Z_SYNC_FLUSH", 2);
-  EnsureInt32Default(env, zlib_obj, "Z_FULL_FLUSH", 3);
-  EnsureInt32Default(env, zlib_obj, "Z_FINISH", 4);
-  EnsureInt32Default(env, zlib_obj, "Z_BLOCK", 5);
-  EnsureInt32Default(env, zlib_obj, "Z_OK", 0);
-  EnsureInt32Default(env, zlib_obj, "Z_STREAM_END", 1);
-  EnsureInt32Default(env, zlib_obj, "Z_NEED_DICT", 2);
-  EnsureInt32Default(env, zlib_obj, "Z_ERRNO", -1);
-  EnsureInt32Default(env, zlib_obj, "Z_STREAM_ERROR", -2);
-  EnsureInt32Default(env, zlib_obj, "Z_DATA_ERROR", -3);
-  EnsureInt32Default(env, zlib_obj, "Z_MEM_ERROR", -4);
-  EnsureInt32Default(env, zlib_obj, "Z_BUF_ERROR", -5);
-  EnsureInt32Default(env, zlib_obj, "Z_VERSION_ERROR", -6);
-  EnsureInt32Default(env, zlib_obj, "Z_NO_COMPRESSION", 0);
-  EnsureInt32Default(env, zlib_obj, "Z_BEST_SPEED", 1);
-  EnsureInt32Default(env, zlib_obj, "Z_BEST_COMPRESSION", 9);
-  EnsureInt32Default(env, zlib_obj, "Z_DEFAULT_COMPRESSION", -1);
-  EnsureInt32Default(env, zlib_obj, "Z_DEFAULT_LEVEL", -1);
-  EnsureInt32Default(env, zlib_obj, "Z_FILTERED", 1);
-  EnsureInt32Default(env, zlib_obj, "Z_HUFFMAN_ONLY", 2);
-  EnsureInt32Default(env, zlib_obj, "Z_RLE", 3);
-  EnsureInt32Default(env, zlib_obj, "Z_FIXED", 4);
-  EnsureInt32Default(env, zlib_obj, "Z_DEFAULT_STRATEGY", 0);
-  EnsureInt32Default(env, zlib_obj, "DEFLATE", 1);
-  EnsureInt32Default(env, zlib_obj, "INFLATE", 2);
-  EnsureInt32Default(env, zlib_obj, "GZIP", 3);
-  EnsureInt32Default(env, zlib_obj, "GUNZIP", 4);
-  EnsureInt32Default(env, zlib_obj, "DEFLATERAW", 5);
-  EnsureInt32Default(env, zlib_obj, "INFLATERAW", 6);
-  EnsureInt32Default(env, zlib_obj, "UNZIP", 7);
-  EnsureInt32Default(env, zlib_obj, "BROTLI_DECODE", 8);
-  EnsureInt32Default(env, zlib_obj, "BROTLI_ENCODE", 9);
-  EnsureInt32Default(env, zlib_obj, "ZSTD_COMPRESS", 10);
-  EnsureInt32Default(env, zlib_obj, "ZSTD_DECOMPRESS", 11);
-  EnsureInt32Default(env, zlib_obj, "Z_MIN_WINDOWBITS", 8);
-  EnsureInt32Default(env, zlib_obj, "Z_MAX_WINDOWBITS", 15);
-  EnsureInt32Default(env, zlib_obj, "Z_DEFAULT_WINDOWBITS", 15);
-  EnsureInt32Default(env, zlib_obj, "Z_MIN_CHUNK", 64);
-  EnsureInt32Default(env, zlib_obj, "Z_MAX_CHUNK", 2147483647);
-  EnsureInt32Default(env, zlib_obj, "Z_DEFAULT_CHUNK", 16384);
-  EnsureInt32Default(env, zlib_obj, "Z_MIN_MEMLEVEL", 1);
-  EnsureInt32Default(env, zlib_obj, "Z_MAX_MEMLEVEL", 9);
-  EnsureInt32Default(env, zlib_obj, "Z_DEFAULT_MEMLEVEL", 8);
-  EnsureInt32Default(env, zlib_obj, "Z_MIN_LEVEL", -1);
-  EnsureInt32Default(env, zlib_obj, "Z_MAX_LEVEL", 9);
-  EnsureInt32Default(env, zlib_obj, "BROTLI_OPERATION_PROCESS", 0);
-  EnsureInt32Default(env, zlib_obj, "BROTLI_OPERATION_FLUSH", 1);
-  EnsureInt32Default(env, zlib_obj, "BROTLI_OPERATION_FINISH", 2);
-  EnsureInt32Default(env, zlib_obj, "BROTLI_OPERATION_EMIT_METADATA", 3);
-  EnsureInt32Default(env, zlib_obj, "BROTLI_PARAM_QUALITY", 1);
-  EnsureInt32Default(env, zlib_obj, "BROTLI_PARAM_MODE", 0);
-  EnsureInt32Default(env, zlib_obj, "BROTLI_PARAM_LGWIN", 2);
-  EnsureInt32Default(env, zlib_obj, "BROTLI_PARAM_LGBLOCK", 3);
-  EnsureInt32Default(env, zlib_obj, "BROTLI_PARAM_DISABLE_LITERAL_CONTEXT_MODELING", 4);
-  EnsureInt32Default(env, zlib_obj, "BROTLI_PARAM_SIZE_HINT", 5);
-  EnsureInt32Default(env, zlib_obj, "BROTLI_PARAM_LARGE_WINDOW", 6);
-  EnsureInt32Default(env, zlib_obj, "BROTLI_PARAM_NPOSTFIX", 7);
-  EnsureInt32Default(env, zlib_obj, "BROTLI_PARAM_NDIRECT", 8);
-  EnsureInt32Default(env, zlib_obj, "ZSTD_e_continue", 0);
-  EnsureInt32Default(env, zlib_obj, "ZSTD_e_flush", 1);
-  EnsureInt32Default(env, zlib_obj, "ZSTD_e_end", 2);
-  EnsureInt32Default(env, zlib_obj, "ZSTD_c_compressionLevel", 1);
-  EnsureInt32Default(env, zlib_obj, "ZSTD_d_windowLogMax", 1);
+  PopulateZlibConstants(env, zlib_obj);
+  napi_object_freeze(env, zlib_obj);
 
   // Keep critical crypto constants aligned with Node's constants module shape.
   napi_value crypto_obj = EnsureObjectProperty(env, constants, "crypto");
