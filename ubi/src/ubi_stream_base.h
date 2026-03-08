@@ -33,6 +33,7 @@ struct UbiStreamBase {
   bool user_buffer_listener_active = false;
   bool closing = false;
   bool closed = false;
+  bool eof_emitted = false;
   bool finalized = false;
   bool delete_on_close = false;
   bool destroy_notified = false;

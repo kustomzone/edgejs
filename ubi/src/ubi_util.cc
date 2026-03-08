@@ -23,6 +23,10 @@
 #include <utility>
 #include <vector>
 
+#ifndef _WIN32
+#include <sys/stat.h>
+#endif
+
 namespace {
 
 constexpr int32_t kPromisePending = 0;
@@ -408,7 +412,20 @@ napi_value GuessHandleType(napi_env env, napi_callback_info info) {
     }
     return Undefined(env);
   }
-  const uv_handle_type t = uv_guess_handle(static_cast<uv_file>(fd));
+  uv_handle_type t = uv_guess_handle(static_cast<uv_file>(fd));
+#ifndef _WIN32
+  if (fd == 0 && t == UV_FILE) {
+    struct stat fd_stat {};
+    struct stat null_stat {};
+    if (fstat(fd, &fd_stat) == 0 &&
+        stat("/dev/null", &null_stat) == 0 &&
+        S_ISCHR(fd_stat.st_mode) &&
+        S_ISCHR(null_stat.st_mode) &&
+        fd_stat.st_rdev == null_stat.st_rdev) {
+      t = UV_NAMED_PIPE;
+    }
+  }
+#endif
   napi_value result = nullptr;
   if (napi_create_uint32(env, GetUVHandleTypeCode(t), &result) != napi_ok || result == nullptr) {
     return Undefined(env);

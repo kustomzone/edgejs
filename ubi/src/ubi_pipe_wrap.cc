@@ -165,6 +165,22 @@ void OnRead(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
   UbiStreamBaseOnUvRead(wrap != nullptr ? &wrap->base : nullptr, nread, buf);
 }
 
+template <typename GetNameFn>
+int PipeGetName(PipeWrap* wrap, GetNameFn fn, std::string* name_out) {
+  if (wrap == nullptr || name_out == nullptr) return UV_EINVAL;
+  size_t len = 256;
+  std::string name(len, '\0');
+  int rc = fn(&wrap->handle, name.data(), &len);
+  if (rc == UV_ENOBUFS) {
+    name.resize(len);
+    rc = fn(&wrap->handle, name.data(), &len);
+  }
+  if (rc != 0) return rc;
+  name.resize(len);
+  *name_out = std::move(name);
+  return 0;
+}
+
 void OnWriteDone(uv_write_t* req, int status) {
   (void)req;
   (void)status;
@@ -219,6 +235,13 @@ napi_value PipeCtor(napi_env env, napi_callback_info info) {
   }, nullptr, &wrap->base.wrapper_ref);
   UbiStreamBaseSetWrapperRef(&wrap->base, wrap->base.wrapper_ref);
   UbiStreamBaseSetInitialStreamProperties(&wrap->base, false, false);
+  if (socket_type == kPipeServer) {
+    napi_value undefined = UbiStreamBaseUndefined(env);
+    if (undefined != nullptr) {
+      napi_set_named_property(env, self, "getsockname", undefined);
+      napi_set_named_property(env, self, "getpeername", undefined);
+    }
+  }
   return self;
 }
 
@@ -512,12 +535,9 @@ napi_value PipeGetSockName(napi_env env, napi_callback_info info) {
   PipeWrap* wrap = nullptr;
   GetThis(env, info, &argc, argv, &wrap);
   if (wrap == nullptr || argc < 1) return UbiStreamBaseMakeInt32(env, UV_EINVAL);
-  size_t len = 0;
-  uv_pipe_getsockname(&wrap->handle, nullptr, &len);
-  std::string name(len, '\0');
-  int rc = uv_pipe_getsockname(&wrap->handle, name.data(), &len);
+  std::string name;
+  int rc = PipeGetName(wrap, uv_pipe_getsockname, &name);
   if (rc == 0) {
-    name.resize(len);
     napi_value value = nullptr;
     napi_create_string_utf8(env, name.c_str(), name.size(), &value);
     if (value != nullptr) napi_set_named_property(env, argv[0], "address", value);
@@ -531,12 +551,9 @@ napi_value PipeGetPeerName(napi_env env, napi_callback_info info) {
   PipeWrap* wrap = nullptr;
   GetThis(env, info, &argc, argv, &wrap);
   if (wrap == nullptr || argc < 1) return UbiStreamBaseMakeInt32(env, UV_EINVAL);
-  size_t len = 0;
-  uv_pipe_getpeername(&wrap->handle, nullptr, &len);
-  std::string name(len, '\0');
-  int rc = uv_pipe_getpeername(&wrap->handle, name.data(), &len);
+  std::string name;
+  int rc = PipeGetName(wrap, uv_pipe_getpeername, &name);
   if (rc == 0) {
-    name.resize(len);
     napi_value value = nullptr;
     napi_create_string_utf8(env, name.c_str(), name.size(), &value);
     if (value != nullptr) napi_set_named_property(env, argv[0], "address", value);

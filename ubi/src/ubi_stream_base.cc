@@ -448,6 +448,32 @@ void DeleteOnReadRefs(UbiStreamBase* base) {
   base->user_buffer_len = 0;
 }
 
+void EmitSyntheticEofIfNeeded(UbiStreamBase* base) {
+  if (base == nullptr || base->env == nullptr || base->eof_emitted || base->onread_ref == nullptr) return;
+
+  napi_value self = UbiStreamBaseGetWrapper(base);
+  napi_value owner_symbol = GetOwnerSymbol(base->env);
+  napi_value owner = nullptr;
+  if (self != nullptr &&
+      owner_symbol != nullptr &&
+      napi_get_property(base->env, self, owner_symbol, &owner) == napi_ok &&
+      owner != nullptr) {
+    napi_valuetype owner_type = napi_undefined;
+    if (napi_typeof(base->env, owner, &owner_type) == napi_ok &&
+        owner_type != napi_null &&
+        owner_type != napi_undefined) {
+    napi_value connecting = GetNamedPropertyValue(base->env, owner, "connecting");
+    bool is_connecting = false;
+    if (connecting != nullptr && napi_get_value_bool(base->env, connecting, &is_connecting) == napi_ok && is_connecting) {
+      return;
+    }
+    }
+  }
+
+  base->eof_emitted = true;
+  (void)CallJsOnRead(base, UV_EOF, nullptr, 0, nullptr);
+}
+
 void MaybeCallHandleOnClose(UbiStreamBase* base) {
   if (base == nullptr || base->env == nullptr || base->finalized) return;
   napi_value self = UbiStreamBaseGetWrapper(base);
@@ -696,6 +722,10 @@ void UbiStreamBaseOnUvRead(UbiStreamBase* base, ssize_t nread, const uv_buf_t* b
     return;
   }
 
+  if (nread == UV_EOF) {
+    base->eof_emitted = true;
+  }
+
   if (base->ops != nullptr && base->ops->accept_pending_handle != nullptr) {
     napi_value self = UbiStreamBaseGetWrapper(base);
     napi_value pending_handle = base->ops->accept_pending_handle(base);
@@ -730,6 +760,7 @@ napi_value UbiStreamBaseClose(UbiStreamBase* base, napi_value close_callback) {
   }
 
   UbiStreamBaseSetCloseCallback(base, close_callback);
+  EmitSyntheticEofIfNeeded(base);
 
   base->closing = true;
   if (base->ops != nullptr && base->ops->on_close != nullptr) {
@@ -916,13 +947,10 @@ napi_value UbiStreamBaseUndefined(napi_env env) {
 
 void UbiStreamBaseSetReqError(napi_env env, napi_value req_obj, int status) {
   if (env == nullptr || req_obj == nullptr || status >= 0) return;
-  const char* err_name = uv_err_name(status);
-  napi_value err_value = nullptr;
-  napi_create_string_utf8(env,
-                          err_name != nullptr ? err_name : "UV_ERROR",
-                          NAPI_AUTO_LENGTH,
-                          &err_value);
-  if (err_value != nullptr) napi_set_named_property(env, req_obj, "error", err_value);
+  napi_value undefined = nullptr;
+  if (napi_get_undefined(env, &undefined) == napi_ok && undefined != nullptr) {
+    napi_set_named_property(env, req_obj, "error", undefined);
+  }
 }
 
 void UbiStreamBaseInvokeReqOnComplete(napi_env env,

@@ -32,6 +32,8 @@ struct TimersHostState {
   bool check_running = false;
   bool idle_initialized = false;
   bool idle_running = false;
+  bool running_timers_callback = false;
+  bool timer_rescheduled_in_callback = false;
   bool cleanup_started = false;
   uint32_t pending_handle_closes = 0;
 };
@@ -420,9 +422,17 @@ void ScheduleFromNextExpiry(TimersHostState* st, double next_expiry, double now)
   uv_timer_start(&st->timer_handle,
                  [](uv_timer_t* handle) {
                    auto* state = static_cast<TimersHostState*>(handle->data);
+                   if (state == nullptr) return;
+                   state->running_timers_callback = true;
+                   state->timer_rescheduled_in_callback = false;
                    const double now_ms = GetNowMs(state);
                    const double next = CallTimersCallback(state, now_ms);
-                   ScheduleFromNextExpiry(state, next, now_ms);
+                   const bool timer_rescheduled = state->timer_rescheduled_in_callback;
+                   state->running_timers_callback = false;
+                   state->timer_rescheduled_in_callback = false;
+                   if (!timer_rescheduled) {
+                     ScheduleFromNextExpiry(state, next, now_ms);
+                   }
                  },
                  timeout,
                  0);
@@ -464,12 +474,23 @@ napi_value ScheduleTimer(napi_env env, napi_callback_info info) {
 
   EnsureTimerHandle(st);
   if (st->timer_initialized) {
+    if (st->running_timers_callback) {
+      st->timer_rescheduled_in_callback = true;
+    }
     uv_timer_start(&st->timer_handle,
                    [](uv_timer_t* handle) {
                      auto* state = static_cast<TimersHostState*>(handle->data);
+                     if (state == nullptr) return;
+                     state->running_timers_callback = true;
+                     state->timer_rescheduled_in_callback = false;
                      const double now_ms = GetNowMs(state);
                      const double next = CallTimersCallback(state, now_ms);
-                     ScheduleFromNextExpiry(state, next, now_ms);
+                     const bool timer_rescheduled = state->timer_rescheduled_in_callback;
+                     state->running_timers_callback = false;
+                     state->timer_rescheduled_in_callback = false;
+                     if (!timer_rescheduled) {
+                       ScheduleFromNextExpiry(state, next, now_ms);
+                     }
                    },
                    static_cast<uint64_t>(duration),
                    0);

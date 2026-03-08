@@ -20,6 +20,13 @@ enum class BlockRuleType : uint8_t {
   kSubnet,
 };
 
+enum class AddressOrdering : int8_t {
+  kLess = -1,
+  kEquivalent = 0,
+  kGreater = 1,
+  kUnordered = 2,
+};
+
 struct SocketAddressWrap {
   napi_ref wrapper_ref = nullptr;
   int32_t family = AF_INET;
@@ -31,9 +38,14 @@ struct SocketAddressWrap {
 struct BlockRule {
   BlockRuleType type = BlockRuleType::kAddress;
   int32_t family = AF_INET;
+  int32_t end_family = AF_INET;
   std::array<uint8_t, 16> start{};
   std::array<uint8_t, 16> end{};
   uint8_t prefix = 0;
+};
+
+constexpr std::array<uint8_t, 12> kIpv4MappedIpv6Prefix = {
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff,
 };
 
 struct BlockListWrap {
@@ -83,18 +95,102 @@ int CompareIp(const std::array<uint8_t, 16>& a, const std::array<uint8_t, 16>& b
   return std::memcmp(a.data(), b.data(), len);
 }
 
-bool InSubnet(const std::array<uint8_t, 16>& address,
-              const std::array<uint8_t, 16>& network,
-              int32_t family,
-              uint8_t prefix) {
-  const uint8_t max_prefix = family == AF_INET ? 32 : 128;
-  if (prefix > max_prefix) return false;
+bool IsIpv4MappedIpv6(const std::array<uint8_t, 16>& address) {
+  return std::memcmp(address.data(), kIpv4MappedIpv6Prefix.data(), kIpv4MappedIpv6Prefix.size()) == 0;
+}
+
+AddressOrdering FromCompareResult(int value) {
+  if (value < 0) return AddressOrdering::kLess;
+  if (value > 0) return AddressOrdering::kGreater;
+  return AddressOrdering::kEquivalent;
+}
+
+AddressOrdering ReverseOrdering(AddressOrdering ordering) {
+  switch (ordering) {
+    case AddressOrdering::kLess:
+      return AddressOrdering::kGreater;
+    case AddressOrdering::kGreater:
+      return AddressOrdering::kLess;
+    default:
+      return ordering;
+  }
+}
+
+bool PrefixMatches(const uint8_t* address, const uint8_t* network, uint8_t prefix, size_t size) {
+  if (address == nullptr || network == nullptr || prefix > size * 8) return false;
   const size_t full_bytes = prefix / 8;
   const uint8_t rem_bits = prefix % 8;
-  if (full_bytes > 0 && std::memcmp(address.data(), network.data(), full_bytes) != 0) return false;
+  if (full_bytes > 0 && std::memcmp(address, network, full_bytes) != 0) return false;
   if (rem_bits == 0) return true;
   const uint8_t mask = static_cast<uint8_t>(0xFFu << (8 - rem_bits));
   return (address[full_bytes] & mask) == (network[full_bytes] & mask);
+}
+
+bool IsAddressMatch(int32_t left_family,
+                    const std::array<uint8_t, 16>& left,
+                    int32_t right_family,
+                    const std::array<uint8_t, 16>& right) {
+  if (left_family == right_family) {
+    return CompareIp(left, right, left_family) == 0;
+  }
+
+  if (left_family == AF_INET && right_family == AF_INET6) {
+    return IsIpv4MappedIpv6(right) &&
+           std::memcmp(left.data(), right.data() + kIpv4MappedIpv6Prefix.size(), 4) == 0;
+  }
+
+  if (left_family == AF_INET6 && right_family == AF_INET) {
+    return IsIpv4MappedIpv6(left) &&
+           std::memcmp(left.data() + kIpv4MappedIpv6Prefix.size(), right.data(), 4) == 0;
+  }
+
+  return false;
+}
+
+AddressOrdering CompareAddresses(int32_t left_family,
+                                 const std::array<uint8_t, 16>& left,
+                                 int32_t right_family,
+                                 const std::array<uint8_t, 16>& right) {
+  if (left_family == right_family) {
+    return FromCompareResult(CompareIp(left, right, left_family));
+  }
+
+  if (left_family == AF_INET && right_family == AF_INET6) {
+    if (!IsIpv4MappedIpv6(right)) return AddressOrdering::kUnordered;
+    return FromCompareResult(std::memcmp(left.data(), right.data() + kIpv4MappedIpv6Prefix.size(), 4));
+  }
+
+  if (left_family == AF_INET6 && right_family == AF_INET) {
+    if (!IsIpv4MappedIpv6(left)) return AddressOrdering::kUnordered;
+    return ReverseOrdering(
+        FromCompareResult(std::memcmp(right.data(), left.data() + kIpv4MappedIpv6Prefix.size(), 4)));
+  }
+
+  return AddressOrdering::kUnordered;
+}
+
+bool InSubnet(int32_t address_family,
+              const std::array<uint8_t, 16>& address,
+              int32_t network_family,
+              const std::array<uint8_t, 16>& network,
+              uint8_t prefix) {
+  if (address_family == network_family) {
+    return PrefixMatches(address.data(), network.data(), prefix, FamilySize(network_family));
+  }
+
+  if (address_family == AF_INET && network_family == AF_INET6) {
+    std::array<uint8_t, 16> mapped = {};
+    std::memcpy(mapped.data(), kIpv4MappedIpv6Prefix.data(), kIpv4MappedIpv6Prefix.size());
+    std::memcpy(mapped.data() + kIpv4MappedIpv6Prefix.size(), address.data(), 4);
+    return PrefixMatches(mapped.data(), network.data(), prefix, mapped.size());
+  }
+
+  if (address_family == AF_INET6 && network_family == AF_INET) {
+    return IsIpv4MappedIpv6(address) &&
+           PrefixMatches(address.data() + kIpv4MappedIpv6Prefix.size(), network.data(), prefix, 4);
+  }
+
+  return false;
 }
 
 void SocketAddressFinalize(napi_env env, void* data, void* /*hint*/) {
@@ -204,6 +300,7 @@ napi_value BlockListAddAddress(napi_env env, napi_callback_info info) {
   BlockRule rule;
   rule.type = BlockRuleType::kAddress;
   rule.family = address->family;
+  rule.end_family = address->family;
   rule.start = address->bytes;
   rule.end = address->bytes;
   wrap->rules.push_back(rule);
@@ -219,15 +316,19 @@ napi_value BlockListAddRange(napi_env env, napi_callback_info info) {
   SocketAddressWrap* start = argc >= 1 ? UnwrapSocketAddress(env, argv[0]) : nullptr;
   SocketAddressWrap* end = argc >= 2 ? UnwrapSocketAddress(env, argv[1]) : nullptr;
   bool ok = false;
-  if (wrap != nullptr && start != nullptr && end != nullptr && start->family == end->family &&
-      CompareIp(start->bytes, end->bytes, start->family) <= 0) {
+  if (wrap != nullptr && start != nullptr && end != nullptr) {
+    const AddressOrdering ordering =
+        CompareAddresses(start->family, start->bytes, end->family, end->bytes);
+    if (ordering != AddressOrdering::kUnordered && ordering != AddressOrdering::kGreater) {
     BlockRule rule;
     rule.type = BlockRuleType::kRange;
     rule.family = start->family;
+    rule.end_family = end->family;
     rule.start = start->bytes;
     rule.end = end->bytes;
     wrap->rules.push_back(rule);
     ok = true;
+    }
   }
   napi_value out = nullptr;
   napi_get_boolean(env, ok, &out);
@@ -251,6 +352,7 @@ napi_value BlockListAddSubnet(napi_env env, napi_callback_info info) {
   BlockRule rule;
   rule.type = BlockRuleType::kSubnet;
   rule.family = network->family;
+  rule.end_family = network->family;
   rule.start = network->bytes;
   rule.prefix = static_cast<uint8_t>(prefix);
   wrap->rules.push_back(rule);
@@ -267,19 +369,24 @@ napi_value BlockListCheck(napi_env env, napi_callback_info info) {
   bool blocked = false;
   if (wrap != nullptr && address != nullptr) {
     for (const BlockRule& rule : wrap->rules) {
-      if (rule.family != address->family) continue;
       switch (rule.type) {
         case BlockRuleType::kAddress:
-          if (CompareIp(address->bytes, rule.start, rule.family) == 0) blocked = true;
+          if (IsAddressMatch(address->family, address->bytes, rule.family, rule.start)) blocked = true;
           break;
         case BlockRuleType::kRange:
-          if (CompareIp(address->bytes, rule.start, rule.family) >= 0 &&
-              CompareIp(address->bytes, rule.end, rule.family) <= 0) {
+          if (CompareAddresses(address->family, address->bytes, rule.family, rule.start) !=
+                  AddressOrdering::kLess &&
+              CompareAddresses(address->family, address->bytes, rule.family, rule.start) !=
+                  AddressOrdering::kUnordered &&
+              CompareAddresses(address->family, address->bytes, rule.end_family, rule.end) !=
+                  AddressOrdering::kGreater &&
+              CompareAddresses(address->family, address->bytes, rule.end_family, rule.end) !=
+                  AddressOrdering::kUnordered) {
             blocked = true;
           }
           break;
         case BlockRuleType::kSubnet:
-          if (InSubnet(address->bytes, rule.start, rule.family, rule.prefix)) blocked = true;
+          if (InSubnet(address->family, address->bytes, rule.family, rule.start, rule.prefix)) blocked = true;
           break;
       }
       if (blocked) break;
@@ -302,9 +409,9 @@ napi_value BlockListGetRules(napi_env env, napi_callback_info info) {
   if (wrap == nullptr) return out;
 
   for (uint32_t i = 0; i < wrap->rules.size(); ++i) {
-    const BlockRule& rule = wrap->rules[i];
+    const BlockRule& rule = wrap->rules[wrap->rules.size() - 1 - i];
     const std::string start = FormatIp(rule.family, rule.start);
-    const std::string end = FormatIp(rule.family, rule.end);
+    const std::string end = FormatIp(rule.end_family, rule.end);
     std::string text;
     switch (rule.type) {
       case BlockRuleType::kAddress:

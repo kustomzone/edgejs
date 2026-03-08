@@ -73,6 +73,8 @@ struct MessagingState {
   napi_ref message_port_ctor_ref = nullptr;
   napi_ref no_message_symbol_ref = nullptr;
   napi_ref oninit_symbol_ref = nullptr;
+  uint32_t next_shared_handle_id = 1;
+  std::unordered_map<uint32_t, napi_ref> shared_handle_refs;
 };
 
 std::unordered_map<napi_env, MessagingState> g_messaging_states;
@@ -85,6 +87,7 @@ napi_value ResolveEmitMessageValue(napi_env env);
 MessagePortWrap* UnwrapMessagePort(napi_env env, napi_value value);
 napi_value GetTransferListValue(napi_env env, napi_value value);
 bool ApplyArrayBufferTransfers(napi_env env, napi_value options);
+napi_value TryRequireModule(napi_env env, const char* module_name);
 
 napi_value GetNamed(napi_env env, napi_value obj, const char* key) {
   napi_value out = nullptr;
@@ -160,6 +163,11 @@ void OnMessagingEnvCleanup(void* data) {
 
   auto it = g_messaging_states.find(env);
   if (it == g_messaging_states.end()) return;
+  for (auto& entry : it->second.shared_handle_refs) {
+    if (entry.second != nullptr) {
+      napi_delete_reference(env, entry.second);
+    }
+  }
   DeleteRefIfPresent(env, &it->second.binding_ref);
   DeleteRefIfPresent(env, &it->second.deserializer_create_object_ref);
   DeleteRefIfPresent(env, &it->second.emit_message_ref);
@@ -328,39 +336,146 @@ bool IsBlobHandleValue(napi_env env, napi_value value) {
   return napi_has_named_property(env, value, "__ubi_blob_data", &has_blob_data) == napi_ok && has_blob_data;
 }
 
-napi_value CreateBlobHandleCloneMarker(napi_env env, napi_value handle) {
-  napi_value blob_data = GetNamed(env, handle, "__ubi_blob_data");
-  if (blob_data == nullptr) return nullptr;
+bool IsInstanceOfValue(napi_env env, napi_value value, napi_value ctor) {
+  if (!IsObjectLike(env, value) || !IsFunction(env, ctor)) return false;
+  bool is_instance = false;
+  if (napi_instanceof(env, value, ctor, &is_instance) != napi_ok) {
+    ClearPendingException(env);
+    return false;
+  }
+  return is_instance;
+}
 
+napi_value GetBlockListBindingValue(napi_env env) {
+  return GetInternalBindingValue(env, "block_list");
+}
+
+napi_value GetBlockListBindingCtor(napi_env env, const char* name) {
+  return GetNamed(env, GetBlockListBindingValue(env), name);
+}
+
+bool IsSocketAddressHandleValue(napi_env env, napi_value value) {
+  return IsInstanceOfValue(env, value, GetBlockListBindingCtor(env, "SocketAddress"));
+}
+
+bool IsBlockListHandleValue(napi_env env, napi_value value) {
+  return IsInstanceOfValue(env, value, GetBlockListBindingCtor(env, "BlockList"));
+}
+
+napi_value CreateHandleCloneMarker(napi_env env, const char* marker_name, napi_value data) {
+  if (marker_name == nullptr || data == nullptr) return nullptr;
   napi_value marker = nullptr;
   if (napi_create_object(env, &marker) != napi_ok || marker == nullptr) return nullptr;
   napi_value true_value = nullptr;
   if (napi_get_boolean(env, true, &true_value) != napi_ok || true_value == nullptr ||
-      napi_set_named_property(env, marker, "__ubiBlobHandleCloneMarker", true_value) != napi_ok ||
-      napi_set_named_property(env, marker, "data", blob_data) != napi_ok) {
+      napi_set_named_property(env, marker, marker_name, true_value) != napi_ok ||
+      napi_set_named_property(env, marker, "data", data) != napi_ok) {
     return nullptr;
   }
   return marker;
 }
 
-bool IsBlobHandleCloneMarker(napi_env env, napi_value value, napi_value* data_out) {
+bool IsHandleCloneMarker(napi_env env,
+                         napi_value value,
+                         const char* marker_name,
+                         napi_value* data_out) {
   if (data_out != nullptr) *data_out = nullptr;
-  if (!IsObjectLike(env, value)) return false;
+  if (!IsObjectLike(env, value) || marker_name == nullptr) return false;
 
   bool has_marker = false;
-  if (napi_has_named_property(env, value, "__ubiBlobHandleCloneMarker", &has_marker) != napi_ok || !has_marker) {
+  if (napi_has_named_property(env, value, marker_name, &has_marker) != napi_ok || !has_marker) {
     return false;
   }
 
-  napi_value marker_value = GetNamed(env, value, "__ubiBlobHandleCloneMarker");
+  napi_value marker_value = GetNamed(env, value, marker_name);
   bool is_marker = false;
   if (marker_value == nullptr || napi_get_value_bool(env, marker_value, &is_marker) != napi_ok || !is_marker) {
     return false;
   }
 
-  napi_value blob_data = GetNamed(env, value, "data");
-  if (blob_data == nullptr) return false;
-  if (data_out != nullptr) *data_out = blob_data;
+  napi_value data = GetNamed(env, value, "data");
+  if (data == nullptr) return false;
+  if (data_out != nullptr) *data_out = data;
+  return true;
+}
+
+napi_value CreateBlobHandleCloneMarker(napi_env env, napi_value handle) {
+  napi_value blob_data = GetNamed(env, handle, "__ubi_blob_data");
+  if (blob_data == nullptr) return nullptr;
+
+  return CreateHandleCloneMarker(env, "__ubiBlobHandleCloneMarker", blob_data);
+}
+
+bool IsBlobHandleCloneMarker(napi_env env, napi_value value, napi_value* data_out) {
+  return IsHandleCloneMarker(env, value, "__ubiBlobHandleCloneMarker", data_out);
+}
+
+napi_value CreateSocketAddressHandleCloneMarker(napi_env env, napi_value handle) {
+  napi_value detail_fn = GetNamed(env, handle, "detail");
+  if (!IsFunction(env, detail_fn)) return nullptr;
+
+  napi_value detail = nullptr;
+  if (napi_create_object(env, &detail) != napi_ok || detail == nullptr) return nullptr;
+
+  napi_value argv[1] = {detail};
+  napi_value detail_out = nullptr;
+  if (napi_call_function(env, handle, detail_fn, 1, argv, &detail_out) != napi_ok || detail_out == nullptr) {
+    return nullptr;
+  }
+
+  return CreateHandleCloneMarker(env, "__ubiSocketAddressHandleCloneMarker", detail_out);
+}
+
+bool IsSocketAddressHandleCloneMarker(napi_env env, napi_value value, napi_value* data_out) {
+  return IsHandleCloneMarker(env, value, "__ubiSocketAddressHandleCloneMarker", data_out);
+}
+
+napi_value CreateBlockListHandleCloneMarker(napi_env env, napi_value handle) {
+  auto it = g_messaging_states.find(env);
+  if (it == g_messaging_states.end()) return nullptr;
+
+  const uint32_t id = it->second.next_shared_handle_id++;
+  napi_ref handle_ref = nullptr;
+  if (napi_create_reference(env, handle, 1, &handle_ref) != napi_ok || handle_ref == nullptr) {
+    return nullptr;
+  }
+  it->second.shared_handle_refs[id] = handle_ref;
+
+  napi_value id_value = nullptr;
+  if (napi_create_uint32(env, id, &id_value) != napi_ok || id_value == nullptr) {
+    napi_delete_reference(env, handle_ref);
+    it->second.shared_handle_refs.erase(id);
+    return nullptr;
+  }
+
+  return CreateHandleCloneMarker(env, "__ubiBlockListHandleCloneMarker", id_value);
+}
+
+bool IsBlockListHandleCloneMarker(napi_env env, napi_value value, napi_value* data_out) {
+  return IsHandleCloneMarker(env, value, "__ubiBlockListHandleCloneMarker", data_out);
+}
+
+bool IsJSTransferableCloneMarker(napi_env env, napi_value value, napi_value* data_out, napi_value* info_out) {
+  if (data_out != nullptr) *data_out = nullptr;
+  if (info_out != nullptr) *info_out = nullptr;
+  if (!IsObjectLike(env, value)) return false;
+
+  bool has_marker = false;
+  if (napi_has_named_property(env, value, "__ubiJSTransferableCloneMarker", &has_marker) != napi_ok || !has_marker) {
+    return false;
+  }
+
+  napi_value marker_value = GetNamed(env, value, "__ubiJSTransferableCloneMarker");
+  bool is_marker = false;
+  if (marker_value == nullptr || napi_get_value_bool(env, marker_value, &is_marker) != napi_ok || !is_marker) {
+    return false;
+  }
+
+  napi_value data = GetNamed(env, value, "data");
+  napi_value info = GetNamed(env, value, "deserializeInfo");
+  if (data == nullptr || info == nullptr) return false;
+  if (data_out != nullptr) *data_out = data;
+  if (info_out != nullptr) *info_out = info;
   return true;
 }
 
@@ -384,6 +499,11 @@ bool IsStructuredClonePassThroughValue(napi_env env, napi_value value) {
 
 napi_value PrepareTransferableDataForStructuredClone(napi_env env, napi_value value);
 napi_value RestoreTransferableDataAfterStructuredClone(napi_env env, napi_value value);
+bool PrepareJSTransferableCloneData(
+    napi_env env, napi_value value, napi_value* data_out, napi_value* deserialize_info_out);
+napi_value CreateJSTransferableCloneMarker(napi_env env, napi_value value);
+napi_value DeserializeJSTransferableCloneMarker(napi_env env, napi_value data, napi_value deserialize_info);
+napi_value CloneRootJSTransferableValueForQueue(napi_env env, napi_value value);
 
 napi_value CloneArrayEntriesForStructuredClone(napi_env env, napi_value array) {
   uint32_t length = 0;
@@ -432,6 +552,12 @@ napi_value PrepareTransferableDataForStructuredClone(napi_env env, napi_value va
   if (IsBlobHandleValue(env, value)) {
     return CreateBlobHandleCloneMarker(env, value);
   }
+  if (IsSocketAddressHandleValue(env, value)) {
+    return CreateSocketAddressHandleCloneMarker(env, value);
+  }
+  if (IsBlockListHandleValue(env, value)) {
+    return CreateBlockListHandleCloneMarker(env, value);
+  }
   if (!IsObjectLike(env, value)) return value;
 
   bool is_array = false;
@@ -477,14 +603,104 @@ napi_value CreateBlobHandleFromCloneData(napi_env env, napi_value blob_data) {
   return handle;
 }
 
+napi_value CreateSocketAddressHandleFromCloneData(napi_env env, napi_value data) {
+  napi_value ctor = GetBlockListBindingCtor(env, "SocketAddress");
+  if (!IsFunction(env, ctor) || data == nullptr) return nullptr;
+
+  napi_value argv[4] = {
+      GetNamed(env, data, "address"),
+      GetNamed(env, data, "port"),
+      GetNamed(env, data, "family"),
+      GetNamed(env, data, "flowlabel"),
+  };
+  if (argv[0] == nullptr || argv[1] == nullptr || argv[2] == nullptr || argv[3] == nullptr) return nullptr;
+
+  napi_value handle = nullptr;
+  if (napi_new_instance(env, ctor, 4, argv, &handle) != napi_ok || handle == nullptr) {
+    return nullptr;
+  }
+  return handle;
+}
+
+napi_value ExtractHandleFromTransferableClone(napi_env env, napi_value value) {
+  if (value == nullptr) return nullptr;
+  napi_value clone_symbol = GetMessagingSymbol(env, "messaging_clone_symbol");
+  napi_value clone_method = nullptr;
+  if (clone_symbol == nullptr ||
+      napi_get_property(env, value, clone_symbol, &clone_method) != napi_ok ||
+      !IsFunction(env, clone_method)) {
+    return nullptr;
+  }
+
+  napi_value clone_result = nullptr;
+  if (napi_call_function(env, value, clone_method, 0, nullptr, &clone_result) != napi_ok || clone_result == nullptr) {
+    return nullptr;
+  }
+
+  napi_value clone_data = GetNamed(env, clone_result, "data");
+  return GetNamed(env, clone_data, "handle");
+}
+
+napi_value CreateBlockListHandleFromCloneData(napi_env env, napi_value rules) {
+  uint32_t handle_id = 0;
+  if (rules != nullptr && napi_get_value_uint32(env, rules, &handle_id) == napi_ok) {
+    auto it = g_messaging_states.find(env);
+    if (it != g_messaging_states.end()) {
+      auto ref_it = it->second.shared_handle_refs.find(handle_id);
+      if (ref_it != it->second.shared_handle_refs.end()) {
+        return GetRefValue(env, ref_it->second);
+      }
+    }
+    return nullptr;
+  }
+
+  napi_value blocklist_module = TryRequireModule(env, "internal/blocklist");
+  napi_value blocklist_ctor = GetNamed(env, blocklist_module, "BlockList");
+  if (!IsFunction(env, blocklist_ctor)) return nullptr;
+
+  napi_value blocklist = nullptr;
+  if (napi_new_instance(env, blocklist_ctor, 0, nullptr, &blocklist) != napi_ok || blocklist == nullptr) {
+    return nullptr;
+  }
+
+  napi_value from_json = GetNamed(env, blocklist, "fromJSON");
+  if (!IsFunction(env, from_json)) return nullptr;
+
+  napi_value argv[1] = {rules};
+  napi_value ignored = nullptr;
+  if (napi_call_function(env, blocklist, from_json, 1, argv, &ignored) != napi_ok) {
+    return nullptr;
+  }
+
+  return ExtractHandleFromTransferableClone(env, blocklist);
+}
+
 napi_value RestoreTransferableDataAfterStructuredClone(napi_env env, napi_value value) {
   if (value == nullptr || IsNullOrUndefinedValue(env, value) || IsStructuredClonePassThroughValue(env, value)) {
     return value;
   }
 
+  napi_value transferable_data = nullptr;
+  napi_value deserialize_info = nullptr;
+  if (IsJSTransferableCloneMarker(env, value, &transferable_data, &deserialize_info)) {
+    napi_value restored_data = RestoreTransferableDataAfterStructuredClone(env, transferable_data);
+    if (restored_data == nullptr) return nullptr;
+    return DeserializeJSTransferableCloneMarker(env, restored_data, deserialize_info);
+  }
+
   napi_value blob_data = nullptr;
   if (IsBlobHandleCloneMarker(env, value, &blob_data)) {
     return CreateBlobHandleFromCloneData(env, blob_data);
+  }
+
+  napi_value socket_address_data = nullptr;
+  if (IsSocketAddressHandleCloneMarker(env, value, &socket_address_data)) {
+    return CreateSocketAddressHandleFromCloneData(env, socket_address_data);
+  }
+
+  napi_value block_list_data = nullptr;
+  if (IsBlockListHandleCloneMarker(env, value, &block_list_data)) {
+    return CreateBlockListHandleFromCloneData(env, block_list_data);
   }
 
   if (!IsObjectLike(env, value)) return value;
@@ -518,36 +734,8 @@ napi_value RestoreTransferableDataAfterStructuredClone(napi_env env, napi_value 
   return value;
 }
 
-napi_value StructuredCloneJSTransferableValue(napi_env env, napi_value value) {
-  if (!IsCloneableTransferableValue(env, value)) return nullptr;
-
-  napi_value clone_symbol = GetMessagingSymbol(env, "messaging_clone_symbol");
-  napi_value clone_method = nullptr;
-  if (clone_symbol == nullptr ||
-      napi_get_property(env, value, clone_symbol, &clone_method) != napi_ok ||
-      !IsFunction(env, clone_method)) {
-    return nullptr;
-  }
-
-  napi_value clone_result = nullptr;
-  if (napi_call_function(env, value, clone_method, 0, nullptr, &clone_result) != napi_ok || clone_result == nullptr) {
-    return nullptr;
-  }
-
-  napi_value clone_data = GetNamed(env, clone_result, "data");
-  napi_value deserialize_info = GetNamed(env, clone_result, "deserializeInfo");
-  if (clone_data == nullptr || deserialize_info == nullptr) return nullptr;
-
-  napi_value prepared_data = PrepareTransferableDataForStructuredClone(env, clone_data);
-  if (prepared_data == nullptr) return nullptr;
-
-  napi_value cloned_data = nullptr;
-  if (unofficial_napi_structured_clone(env, prepared_data, &cloned_data) != napi_ok || cloned_data == nullptr) {
-    return nullptr;
-  }
-
-  cloned_data = RestoreTransferableDataAfterStructuredClone(env, cloned_data);
-  if (cloned_data == nullptr) return nullptr;
+napi_value DeserializeJSTransferableCloneMarker(napi_env env, napi_value data, napi_value deserialize_info) {
+  if (data == nullptr || deserialize_info == nullptr) return nullptr;
 
   auto it = g_messaging_states.find(env);
   if (it == g_messaging_states.end() || it->second.deserializer_create_object_ref == nullptr) return nullptr;
@@ -556,9 +744,9 @@ napi_value StructuredCloneJSTransferableValue(napi_env env, napi_value value) {
   if (!IsFunction(env, deserializer_factory)) return nullptr;
 
   napi_value receiver = Undefined(env);
-  napi_value argv[1] = {deserialize_info};
+  napi_value factory_argv[1] = {deserialize_info};
   napi_value out = nullptr;
-  if (napi_call_function(env, receiver, deserializer_factory, 1, argv, &out) != napi_ok || out == nullptr) {
+  if (napi_call_function(env, receiver, deserializer_factory, 1, factory_argv, &out) != napi_ok || out == nullptr) {
     return nullptr;
   }
 
@@ -570,13 +758,99 @@ napi_value StructuredCloneJSTransferableValue(napi_env env, napi_value value) {
     return nullptr;
   }
 
-  napi_value deserialize_argv[1] = {cloned_data};
+  napi_value deserialize_argv[1] = {data};
   napi_value ignored = nullptr;
   if (napi_call_function(env, out, deserialize_method, 1, deserialize_argv, &ignored) != napi_ok) {
     return nullptr;
   }
 
   return out;
+}
+
+bool PrepareJSTransferableCloneData(
+    napi_env env, napi_value value, napi_value* data_out, napi_value* deserialize_info_out) {
+  if (data_out != nullptr) *data_out = nullptr;
+  if (deserialize_info_out != nullptr) *deserialize_info_out = nullptr;
+  if (!IsCloneableTransferableValue(env, value)) return false;
+
+  napi_value clone_symbol = GetMessagingSymbol(env, "messaging_clone_symbol");
+  napi_value clone_method = nullptr;
+  if (clone_symbol == nullptr ||
+      napi_get_property(env, value, clone_symbol, &clone_method) != napi_ok ||
+      !IsFunction(env, clone_method)) {
+    return false;
+  }
+
+  napi_value clone_result = nullptr;
+  if (napi_call_function(env, value, clone_method, 0, nullptr, &clone_result) != napi_ok || clone_result == nullptr) {
+    return false;
+  }
+
+  napi_value clone_data = GetNamed(env, clone_result, "data");
+  napi_value deserialize_info = GetNamed(env, clone_result, "deserializeInfo");
+  if (clone_data == nullptr || deserialize_info == nullptr) return false;
+
+  napi_value prepared_data = PrepareTransferableDataForStructuredClone(env, clone_data);
+  if (prepared_data == nullptr) return false;
+
+  if (data_out != nullptr) *data_out = prepared_data;
+  if (deserialize_info_out != nullptr) *deserialize_info_out = deserialize_info;
+  return true;
+}
+
+napi_value CreateJSTransferableCloneMarker(napi_env env, napi_value value) {
+  napi_value prepared_data = nullptr;
+  napi_value deserialize_info = nullptr;
+  if (!PrepareJSTransferableCloneData(env, value, &prepared_data, &deserialize_info) ||
+      prepared_data == nullptr ||
+      deserialize_info == nullptr) {
+    return nullptr;
+  }
+
+  napi_value marker = nullptr;
+  if (napi_create_object(env, &marker) != napi_ok || marker == nullptr) return nullptr;
+
+  napi_value true_value = nullptr;
+  if (napi_get_boolean(env, true, &true_value) != napi_ok || true_value == nullptr ||
+      napi_set_named_property(env, marker, "__ubiJSTransferableCloneMarker", true_value) != napi_ok ||
+      napi_set_named_property(env, marker, "data", prepared_data) != napi_ok ||
+      napi_set_named_property(env, marker, "deserializeInfo", deserialize_info) != napi_ok) {
+    return nullptr;
+  }
+
+  return marker;
+}
+
+napi_value CloneRootJSTransferableValueForQueue(napi_env env, napi_value value) {
+  napi_value marker = CreateJSTransferableCloneMarker(env, value);
+  if (marker == nullptr) return nullptr;
+
+  napi_value cloned = nullptr;
+  if (unofficial_napi_structured_clone(env, marker, &cloned) != napi_ok || cloned == nullptr) {
+    return nullptr;
+  }
+
+  return cloned;
+}
+
+napi_value StructuredCloneJSTransferableValue(napi_env env, napi_value value) {
+  napi_value prepared_data = nullptr;
+  napi_value deserialize_info = nullptr;
+  if (!PrepareJSTransferableCloneData(env, value, &prepared_data, &deserialize_info) ||
+      prepared_data == nullptr ||
+      deserialize_info == nullptr) {
+    return nullptr;
+  }
+
+  napi_value cloned_data = nullptr;
+  if (unofficial_napi_structured_clone(env, prepared_data, &cloned_data) != napi_ok || cloned_data == nullptr) {
+    return nullptr;
+  }
+
+  cloned_data = RestoreTransferableDataAfterStructuredClone(env, cloned_data);
+  if (cloned_data == nullptr) return nullptr;
+
+  return DeserializeJSTransferableCloneMarker(env, cloned_data, deserialize_info);
 }
 
 napi_value TryRequireModule(napi_env env, const char* module_name) {
@@ -665,6 +939,15 @@ bool IsMessagePortValue(napi_env env, napi_value value) {
   if (value == nullptr) return false;
   napi_valuetype type = napi_undefined;
   if (napi_typeof(env, value, &type) != napi_ok || type != napi_object) return false;
+  auto it = g_messaging_states.find(env);
+  if (it == g_messaging_states.end()) return false;
+  napi_value ctor = GetRefValue(env, it->second.message_port_ctor_ref);
+  if (!IsFunction(env, ctor)) return false;
+  bool is_instance = false;
+  if (napi_instanceof(env, value, ctor, &is_instance) != napi_ok || !is_instance) {
+    ClearPendingException(env);
+    return false;
+  }
   return UnwrapMessagePort(env, value) != nullptr;
 }
 
@@ -1386,6 +1669,9 @@ napi_value TransformTransferredPortsForQueue(
   if (value == nullptr || IsNullOrUndefinedValue(env, value) || IsCloneByReferenceValue(env, value)) {
     return value;
   }
+  if (IsCloneableTransferableValue(env, value)) {
+    return value;
+  }
 
   napi_valuetype type = napi_undefined;
   if (napi_typeof(env, value, &type) != napi_ok || (type != napi_object && type != napi_function)) {
@@ -1821,6 +2107,12 @@ void ProcessQueuedMessages(MessagePortWrap* wrap, bool force) {
       next.payload_data = nullptr;
     }
     if (self != nullptr && message_error == nullptr) {
+      payload = RestoreTransferableDataAfterStructuredClone(
+          wrap->handle_wrap.env,
+          payload != nullptr ? payload : Undefined(wrap->handle_wrap.env));
+      message_error = TakePendingException(wrap->handle_wrap.env);
+    }
+    if (self != nullptr && message_error == nullptr) {
       ReceivedTransferredPortState received_ports;
       std::vector<ValueTransformPair> seen_pairs;
       payload = RestoreTransferredPortsInValue(
@@ -2126,7 +2418,12 @@ napi_value MessagePortPostMessageCallback(napi_env env, napi_callback_info info)
   napi_value transformed_payload =
       TransformTransferredPortsForQueue(env, payload, transferred_ports, &seen_pairs);
 
-  napi_value cloned_payload = CloneMessageValue(env, transformed_payload, normalized_transfer_arg);
+  napi_value cloned_payload = nullptr;
+  if (IsCloneableTransferableValue(env, transformed_payload)) {
+    cloned_payload = CloneRootJSTransferableValueForQueue(env, transformed_payload);
+  } else {
+    cloned_payload = CloneMessageValue(env, transformed_payload, normalized_transfer_arg);
+  }
   if (cloned_payload == nullptr) {
     bool pending = false;
     if (napi_is_exception_pending(env, &pending) == napi_ok && pending) {
