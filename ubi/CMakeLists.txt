@@ -500,6 +500,7 @@ target_include_directories(ubi_runtime
 target_link_libraries(ubi_runtime
   PUBLIC
     ubi_node_api
+    ${UBI_ICU_LINK_LIBS}
   PRIVATE
     ubi_simdjson
     ubi_simdutf
@@ -511,7 +512,6 @@ target_link_libraries(ubi_runtime
     c-ares::cares
     OpenSSL::Crypto
     zlibstatic
-    ${UBI_ICU_LINK_LIBS}
 )
 if(UBI_NAPI_PROVIDER STREQUAL "bundled-v8")
   target_link_libraries(ubi_runtime PUBLIC napi_v8)
