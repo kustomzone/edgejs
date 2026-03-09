@@ -1,65 +1,6 @@
 #!/usr/bin/env sh
 
-export WASIXCC_WASM_EXCEPTIONS="${WASIXCC_WASM_EXCEPTIONS:-yes}"
-
-# Prefer the EH sysroot; fall back to EH+PIC if needed.
-if [ -z "${WASIXCC_SYSROOT:-}" ] && [ "${WASIXCC_WASM_EXCEPTIONS}" = "yes" ]; then
-  WASIX_DEFAULT_SYSROOT="$(wasixcc --print-sysroot 2>/dev/null || true)"
-  WASIX_SYSROOT_PREFIX=""
-  WASIX_DEFAULT_BASENAME=""
-
-  if [ -n "${WASIX_DEFAULT_SYSROOT}" ]; then
-    WASIX_SYSROOT_PREFIX="$(dirname "${WASIX_DEFAULT_SYSROOT}")"
-    WASIX_DEFAULT_BASENAME="$(basename "${WASIX_DEFAULT_SYSROOT}")"
-  fi
-
-  if [ -z "${WASIX_SYSROOT_PREFIX}" ]; then
-    WASIX_CXX_BIN="$(command -v wasixcc++ 2>/dev/null || true)"
-    if [ -n "${WASIX_CXX_BIN}" ]; then
-      WASIX_HOME="$(cd "$(dirname "${WASIX_CXX_BIN}")/.." 2>/dev/null && pwd)"
-      if [ -n "${WASIX_HOME}" ] && [ -d "${WASIX_HOME}/sysroot" ]; then
-        WASIX_SYSROOT_PREFIX="${WASIX_HOME}/sysroot"
-      fi
-    fi
-  fi
-
-  if [ -z "${WASIX_SYSROOT_PREFIX}" ] && [ -n "${HOME:-}" ] && [ -d "${HOME}/.wasixcc/sysroot" ]; then
-    WASIX_SYSROOT_PREFIX="${HOME}/.wasixcc/sysroot"
-  fi
-
-  if [ -n "${WASIX_SYSROOT_PREFIX}" ]; then
-    WASIX_CANDIDATES=""
-
-    if [ -n "${WASIX_DEFAULT_BASENAME}" ]; then
-      case "${WASIX_DEFAULT_BASENAME}" in
-        *-eh)
-          WASIX_CANDIDATES="${WASIX_SYSROOT_PREFIX}/${WASIX_DEFAULT_BASENAME%-eh}-ehpic"
-          ;;
-      esac
-    fi
-
-    for CANDIDATE in \
-      "${WASIX_SYSROOT_PREFIX}/sysroot-eh" \
-      "${WASIX_SYSROOT_PREFIX}/sysroot-ehpic" \
-      "${WASIX_SYSROOT_PREFIX}/sysroot"; do
-      case ":${WASIX_CANDIDATES}:" in
-        *:"${CANDIDATE}":*) ;;
-        "") WASIX_CANDIDATES="${CANDIDATE}" ;;
-        *) WASIX_CANDIDATES="${WASIX_CANDIDATES}:${CANDIDATE}" ;;
-      esac
-    done
-
-    OLD_IFS="${IFS}"
-    IFS=":"
-    for CANDIDATE in ${WASIX_CANDIDATES}; do
-      if [ -f "${CANDIDATE}/include/dlfcn.h" ]; then
-        export WASIXCC_SYSROOT="${CANDIDATE}"
-        break
-      fi
-    done
-    IFS="${OLD_IFS}"
-  fi
-fi
+. "$(dirname "$0")/wasixcc-env.sh" wasixcc++
 
 case "${WASIXCC_COMPILER_POST_FLAGS_CXX:-}" in
   *-std=c++20*)
