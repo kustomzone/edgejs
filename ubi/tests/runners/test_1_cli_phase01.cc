@@ -11,7 +11,9 @@
 #endif
 
 #include "test_env.h"
+#include "node_version.h"
 #include "ubi_cli.h"
+#include "ubi_version.h"
 
 class Test1CliPhase01 : public FixtureTestBase {};
 
@@ -548,6 +550,69 @@ TEST_F(Test1CliPhase01, PrintFlagEvaluatesExpression) {
   EXPECT_EQ(exit_code, 0) << "error=" << error;
   EXPECT_TRUE(error.empty()) << "error=" << error;
   EXPECT_NE(stdout_output.find("42"), std::string::npos);
+}
+
+TEST_F(Test1CliPhase01, PrintFlagExposesUbiProcessVersionEntry) {
+  const char* argv[] = {"ubi", "-p", "process.versions.ubi"};
+  testing::internal::CaptureStdout();
+  std::string error;
+  const int exit_code = UbiRunCli(3, argv, &error);
+  const std::string stdout_output = testing::internal::GetCapturedStdout();
+
+  EXPECT_EQ(exit_code, 0) << "error=" << error;
+  EXPECT_TRUE(error.empty()) << "error=" << error;
+  EXPECT_NE(stdout_output.find(UBI_VERSION_STRING), std::string::npos) << stdout_output;
+}
+
+TEST_F(Test1CliPhase01, SafeFlagExitsWithUnavailableMessage) {
+  const char* argv[] = {"ubi", "--safe"};
+  std::string error;
+
+  const int exit_code = UbiRunCli(2, argv, &error);
+
+  EXPECT_EQ(exit_code, 1);
+  EXPECT_EQ(error, "--safe mode is not enabled in this release of ubi");
+}
+
+TEST_F(Test1CliPhase01, InteractiveWelcomeMessageIncludesUbiAndNodeVersions) {
+#if defined(_WIN32)
+  GTEST_SKIP() << "interactive repl subprocess check is POSIX-only";
+#else
+  namespace fs = std::filesystem;
+  const auto ubi_path = ResolveBuiltUbiBinary();
+  ASSERT_FALSE(ubi_path.empty()) << "Failed to resolve built ubi binary";
+
+  const fs::path temp_root = fs::temp_directory_path() / "ubi_phase01_cli_repl_banner";
+  const fs::path stdout_path = temp_root / "stdout.txt";
+  const fs::path stderr_path = temp_root / "stderr.txt";
+  std::error_code ec;
+  fs::remove_all(temp_root, ec);
+  fs::create_directories(temp_root, ec);
+  ASSERT_FALSE(ec) << "Failed to create temp directory";
+
+  const std::string cmd =
+      "printf '.exit\\n' | script -q " +
+      ShellSingleQuoted(stdout_path.string()) + " " +
+      ShellSingleQuoted(ubi_path.string()) + " -i >/dev/null 2>" +
+      ShellSingleQuoted(stderr_path.string());
+  const int status = std::system(cmd.c_str());
+  ASSERT_NE(status, -1);
+  ASSERT_TRUE(WIFEXITED(status)) << "status=" << status;
+
+  std::ifstream stdout_in(stdout_path);
+  const std::string stdout_output((std::istreambuf_iterator<char>(stdout_in)),
+                                  std::istreambuf_iterator<char>());
+  std::ifstream stderr_in(stderr_path);
+  const std::string stderr_output((std::istreambuf_iterator<char>(stderr_in)),
+                                  std::istreambuf_iterator<char>());
+  fs::remove_all(temp_root, ec);
+
+  EXPECT_EQ(WEXITSTATUS(status), 0) << "stderr=" << stderr_output;
+  EXPECT_TRUE(stderr_output.empty()) << "stderr=" << stderr_output;
+  EXPECT_NE(stdout_output.find("Welcome to Ubi " UBI_VERSION_STRING " (Node " NODE_VERSION ")."),
+            std::string::npos)
+      << stdout_output;
+#endif
 }
 
 TEST_F(Test1CliPhase01, ScriptFileDoesNotLeakEvalGlobals) {

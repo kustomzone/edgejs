@@ -1,6 +1,7 @@
 #include <string>
 
 #include "test_env.h"
+#include "ubi_version.h"
 #include "ubi_runtime.h"
 
 class Test5InternalBindingParityPhase03 : public FixtureTestBase {};
@@ -27,6 +28,7 @@ const config = internalBinding('config');
 assert.ok(config && typeof config === 'object');
 assert.strictEqual(typeof config.getDefaultLocale, 'function');
 assert.strictEqual(config.hasOpenSSL, !!(process.versions && process.versions.openssl));
+assert.strictEqual(process.versions.ubi, ')JS" UBI_VERSION_STRING R"JS(');
 assert.strictEqual(typeof config.bits, 'number');
 assert.ok(config.bits === 32 || config.bits === 64);
 const locale = config.getDefaultLocale();

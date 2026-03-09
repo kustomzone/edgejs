@@ -46,6 +46,7 @@
 #include "acorn_version.h"
 #include "cjs_module_lexer_version.h"
 #include "node_version.h"
+#include "ubi_version.h"
 #include "unofficial_napi.h"
 #include "ubi_node_addon_compat.h"
 #include "ubi_timers_host.h"
@@ -153,8 +154,12 @@ void CloseDynamicLibrary(uv_lib_t* lib) {
 #endif
 }
 
+#ifndef UBI_STRINGIFY_HELPER
 #define UBI_STRINGIFY_HELPER(x) #x
+#endif
+#ifndef UBI_STRINGIFY
 #define UBI_STRINGIFY(x) UBI_STRINGIFY_HELPER(x)
+#endif
 
 struct ProcessMethodsBindingState {
   napi_ref binding_ref = nullptr;
@@ -1056,6 +1061,7 @@ std::vector<ProcessVersionEntry> BuildProcessVersionEntries(bool has_intl) {
       {"simdjson", SIMDJSON_VERSION},
       {"simdutf", SIMDUTF_VERSION},
       {"undici", GetUndiciVersion()},
+      {"ubi", UBI_VERSION_STRING},
       {"uv", uv_version_string()},
       {"uvwasi", kUvwasiVersion},
       {"v8", UBI_EMBEDDED_V8_VERSION},

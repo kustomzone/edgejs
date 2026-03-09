@@ -31,6 +31,7 @@
 namespace {
 
 constexpr const char kUsage[] = "Usage: ubi <script.js>";
+constexpr const char kSafeModeUnavailable[] = "--safe mode is not enabled in this release of ubi";
 constexpr unsigned kMaxSignal = 32;
 std::once_flag g_cli_init_once;
 
@@ -650,6 +651,12 @@ int UbiRunCli(int argc, const char* const* argv, std::string* error_out) {
     if (TokenRequiresNonEmptyInlineValue(token)) {
       set_requires_argument_error(token.substr(0, token.size() - 1));
       return 9;
+    }
+    if (token == "--safe") {
+      if (error_out != nullptr) {
+        *error_out = kSafeModeUnavailable;
+      }
+      return 1;
     }
 
     if (token == "-c" || token == "--check") {
