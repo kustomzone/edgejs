@@ -245,6 +245,14 @@ int64_t UbiAsyncWrapExecutionAsyncId(napi_env env) {
   return default_trigger_async_id > 0 ? default_trigger_async_id : 1;
 }
 
+int64_t UbiAsyncWrapCurrentExecutionAsyncId(napi_env env) {
+  double* fields = GetAsyncIdFields(env);
+  if (fields == nullptr) return 0;
+
+  constexpr size_t kExecutionAsyncId = 0;
+  return static_cast<int64_t>(fields[kExecutionAsyncId]);
+}
+
 const char* UbiAsyncWrapProviderName(int32_t provider_type) {
   switch (provider_type) {
     case kUbiProviderHttpClientRequest:
@@ -288,13 +296,34 @@ const char* UbiAsyncWrapProviderName(int32_t provider_type) {
   }
 }
 
-void UbiAsyncWrapEmitInit(napi_env env,
-                          int64_t async_id,
-                          int32_t provider_type,
-                          int64_t trigger_async_id,
-                          napi_value resource) {
-  if (env == nullptr || async_id <= 0) return;
+void CallHookWithAsyncId(napi_env env, napi_value hooks, const char* hook_name, int64_t async_id) {
+  if (env == nullptr || hooks == nullptr || hook_name == nullptr || async_id <= 0) return;
+  napi_value hook_fn = nullptr;
+  if (napi_get_named_property(env, hooks, hook_name, &hook_fn) != napi_ok || hook_fn == nullptr) {
+    return;
+  }
 
+  napi_valuetype fn_type = napi_undefined;
+  if (napi_typeof(env, hook_fn, &fn_type) != napi_ok || fn_type != napi_function) return;
+
+  napi_value async_id_v = nullptr;
+  napi_create_int64(env, async_id, &async_id_v);
+  napi_value ignored = nullptr;
+  if (napi_call_function(env, hooks, hook_fn, 1, &async_id_v, &ignored) != napi_ok) {
+    bool pending = false;
+    if (napi_is_exception_pending(env, &pending) == napi_ok && pending) {
+      napi_value ignored_error = nullptr;
+      napi_get_and_clear_last_exception(env, &ignored_error);
+    }
+  }
+}
+
+void UbiAsyncWrapEmitInitString(napi_env env,
+                                int64_t async_id,
+                                const char* type,
+                                int64_t trigger_async_id,
+                                napi_value resource) {
+  if (env == nullptr || async_id <= 0 || type == nullptr) return;
   napi_value hooks = internal_binding::AsyncWrapGetHooksObject(env);
   if (hooks == nullptr) return;
 
@@ -311,7 +340,7 @@ void UbiAsyncWrapEmitInit(napi_env env,
   napi_value trigger_async_id_v = nullptr;
   napi_value promise_hook_v = nullptr;
   napi_create_int64(env, async_id, &async_id_v);
-  napi_create_string_utf8(env, UbiAsyncWrapProviderName(provider_type), NAPI_AUTO_LENGTH, &type_v);
+  napi_create_string_utf8(env, type, NAPI_AUTO_LENGTH, &type_v);
   napi_create_int64(env, trigger_async_id, &trigger_async_id_v);
   napi_get_boolean(env, false, &promise_hook_v);
   napi_value argv[5] = {
@@ -329,6 +358,39 @@ void UbiAsyncWrapEmitInit(napi_env env,
       napi_get_and_clear_last_exception(env, &ignored_error);
     }
   }
+}
+
+void UbiAsyncWrapEmitInit(napi_env env,
+                          int64_t async_id,
+                          int32_t provider_type,
+                          int64_t trigger_async_id,
+                          napi_value resource) {
+  UbiAsyncWrapEmitInitString(
+      env, async_id, UbiAsyncWrapProviderName(provider_type), trigger_async_id, resource);
+}
+
+void UbiAsyncWrapEmitBefore(napi_env env, int64_t async_id) {
+  napi_value hooks = internal_binding::AsyncWrapGetHooksObject(env);
+  CallHookWithAsyncId(env, hooks, "before", async_id);
+}
+
+void UbiAsyncWrapEmitAfter(napi_env env, int64_t async_id) {
+  napi_value hooks = internal_binding::AsyncWrapGetHooksObject(env);
+  CallHookWithAsyncId(env, hooks, "after", async_id);
+}
+
+void UbiAsyncWrapPushContext(napi_env env,
+                             int64_t async_id,
+                             int64_t trigger_async_id,
+                             napi_value resource) {
+  if (env == nullptr) return;
+  internal_binding::AsyncWrapPushContext(
+      env, static_cast<double>(async_id), static_cast<double>(trigger_async_id), resource);
+}
+
+bool UbiAsyncWrapPopContext(napi_env env, int64_t async_id) {
+  if (env == nullptr) return false;
+  return internal_binding::AsyncWrapPopContext(env, static_cast<double>(async_id));
 }
 
 napi_status UbiAsyncWrapMakeCallback(napi_env env,

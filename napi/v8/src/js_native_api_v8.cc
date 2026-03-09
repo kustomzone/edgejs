@@ -48,11 +48,6 @@ struct napi_escapable_handle_scope__ {
   bool escaped = false;
 };
 
-struct napi_async_context__ {
-  napi_env env = nullptr;
-  v8::Global<v8::Object> resource;
-};
-
 struct napi_buffer_record__ {
   napi_env env = nullptr;
   v8::Global<v8::Object> holder;
@@ -2847,43 +2842,6 @@ napi_status NAPI_CDECL napi_run_script(napi_env env,
   }
   *result = napi_v8_wrap_value(env, out);
   return (*result == nullptr) ? napi_generic_failure : napi_ok;
-}
-
-napi_status NAPI_CDECL napi_async_init(node_api_basic_env env,
-                                       napi_value async_resource,
-                                       napi_value async_resource_name,
-                                       napi_async_context* result) {
-  auto* napiEnv = const_cast<napi_env>(env);
-  if (!CheckEnv(napiEnv) || async_resource_name == nullptr || result == nullptr) {
-    return napi_invalid_arg;
-  }
-  v8::Local<v8::Context> context = napiEnv->context();
-  v8::Context::Scope context_scope(context);
-
-  auto* asyncContext = new (std::nothrow) napi_async_context__();
-  if (asyncContext == nullptr) return napi_generic_failure;
-  asyncContext->env = napiEnv;
-
-  v8::Local<v8::Object> resource_obj;
-  if (async_resource != nullptr) {
-    v8::Local<v8::Value> candidate = napi_v8_unwrap_value(async_resource);
-    if (candidate->IsObject()) {
-      resource_obj = candidate.As<v8::Object>();
-    }
-  }
-  if (resource_obj.IsEmpty()) {
-    resource_obj = v8::Object::New(napiEnv->isolate);
-  }
-  asyncContext->resource.Reset(napiEnv->isolate, resource_obj);
-  *result = asyncContext;
-  return napi_ok;
-}
-
-napi_status NAPI_CDECL napi_async_destroy(node_api_basic_env env, napi_async_context async_context) {
-  auto* napiEnv = const_cast<napi_env>(env);
-  if (!CheckEnv(napiEnv) || async_context == nullptr) return napi_invalid_arg;
-  delete async_context;
-  return napi_ok;
 }
 
 napi_status NAPI_CDECL napi_fatal_exception(napi_env env, napi_value err) {

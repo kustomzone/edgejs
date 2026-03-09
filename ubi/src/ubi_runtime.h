@@ -45,6 +45,12 @@ napi_status UbiMakeCallbackWithFlags(napi_env env,
                                      napi_value* argv,
                                      napi_value* result,
                                      int flags);
+napi_status UbiCallCallbackWithDomain(napi_env env,
+                                      napi_value recv,
+                                      napi_value callback,
+                                      size_t argc,
+                                      napi_value* argv,
+                                      napi_value* result);
 
 napi_status UbiMakeCallback(napi_env env,
                               napi_value recv,

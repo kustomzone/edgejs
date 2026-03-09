@@ -13,6 +13,8 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <arpa/inet.h>
 #include <cerrno>
@@ -59,6 +61,7 @@
 #include "ubi_cares_wrap.h"
 #include "ubi_timers_host.h"
 #include "ubi_spawn_sync.h"
+#include "internal_binding/helpers.h"
 
 namespace {
 
@@ -71,6 +74,13 @@ const auto g_process_start_time = std::chrono::steady_clock::now();
 std::once_flag g_process_stdio_init_once;
 constexpr int kExitCodeInvalidFatalExceptionMonkeyPatching = 6;
 constexpr int kExitCodeExceptionInFatalExceptionHandler = 7;
+
+struct DomainCallbackCache {
+  napi_ref helper_ref = nullptr;
+};
+
+std::unordered_map<napi_env, DomainCallbackCache> g_domain_callback_cache;
+std::unordered_set<napi_env> g_domain_callback_cleanup_hooks;
 
 enum class UbiBootstrapMode {
   kMainThread,
@@ -95,6 +105,116 @@ void InstallDefaultSignalBehavior() {
   });
 }
 #endif
+
+void ResetDomainHelperRef(napi_env env, napi_ref* ref) {
+  if (env == nullptr || ref == nullptr || *ref == nullptr) return;
+  napi_delete_reference(env, *ref);
+  *ref = nullptr;
+}
+
+void OnDomainCallbackEnvCleanup(void* data) {
+  napi_env env = static_cast<napi_env>(data);
+  g_domain_callback_cleanup_hooks.erase(env);
+  auto it = g_domain_callback_cache.find(env);
+  if (it == g_domain_callback_cache.end()) return;
+  ResetDomainHelperRef(env, &it->second.helper_ref);
+  g_domain_callback_cache.erase(it);
+}
+
+void EnsureDomainCallbackCleanupHook(napi_env env) {
+  if (env == nullptr) return;
+  auto [it, inserted] = g_domain_callback_cleanup_hooks.emplace(env);
+  if (!inserted) return;
+  if (napi_add_env_cleanup_hook(env, OnDomainCallbackEnvCleanup, env) != napi_ok) {
+    g_domain_callback_cleanup_hooks.erase(it);
+  }
+}
+
+bool IsNullOrUndefinedValue(napi_env env, napi_value value) {
+  if (env == nullptr || value == nullptr) return true;
+  napi_valuetype type = napi_undefined;
+  return napi_typeof(env, value, &type) == napi_ok &&
+         (type == napi_undefined || type == napi_null);
+}
+
+bool IsDomainHelperFunctionValue(napi_env env, napi_value value) {
+  if (env == nullptr || value == nullptr) return false;
+  napi_valuetype type = napi_undefined;
+  return napi_typeof(env, value, &type) == napi_ok && type == napi_function;
+}
+
+napi_value GetCachedDomainCallbackHelper(napi_env env) {
+  if (env == nullptr) return nullptr;
+  EnsureDomainCallbackCleanupHook(env);
+
+  auto& cache = g_domain_callback_cache[env];
+  if (cache.helper_ref != nullptr) {
+    napi_value helper = nullptr;
+    if (napi_get_reference_value(env, cache.helper_ref, &helper) == napi_ok && helper != nullptr) {
+      return helper;
+    }
+    ResetDomainHelperRef(env, &cache.helper_ref);
+  }
+
+  static const char kHelperSource[] =
+      "(function(domain, recv, callback, args) {"
+      "  domain.enter();"
+      "  var ret = Reflect.apply(callback, recv, args);"
+      "  domain.exit();"
+      "  return ret;"
+      "})";
+
+  napi_value source = nullptr;
+  napi_value helper = nullptr;
+  if (napi_create_string_utf8(env, kHelperSource, NAPI_AUTO_LENGTH, &source) != napi_ok ||
+      source == nullptr ||
+      napi_run_script(env, source, &helper) != napi_ok ||
+      helper == nullptr ||
+      !IsDomainHelperFunctionValue(env, helper)) {
+    return nullptr;
+  }
+
+  if (napi_create_reference(env, helper, 1, &cache.helper_ref) != napi_ok) {
+    cache.helper_ref = nullptr;
+    return nullptr;
+  }
+  return helper;
+}
+
+bool GetCallbackDomain(napi_env env, napi_value recv, napi_value* domain_out) {
+  if (domain_out == nullptr) return false;
+  *domain_out = nullptr;
+  if (env == nullptr || recv == nullptr) return false;
+
+  napi_valuetype recv_type = napi_undefined;
+  if (napi_typeof(env, recv, &recv_type) != napi_ok ||
+      (recv_type != napi_object && recv_type != napi_function)) {
+    return false;
+  }
+
+  bool has_domain = false;
+  if (napi_has_named_property(env, recv, "domain", &has_domain) != napi_ok || !has_domain) {
+    return false;
+  }
+
+  napi_value domain = nullptr;
+  if (napi_get_named_property(env, recv, "domain", &domain) != napi_ok ||
+      IsNullOrUndefinedValue(env, domain)) {
+    return false;
+  }
+
+  napi_value enter = nullptr;
+  napi_value exit = nullptr;
+  if (napi_get_named_property(env, domain, "enter", &enter) != napi_ok ||
+      napi_get_named_property(env, domain, "exit", &exit) != napi_ok ||
+      !IsDomainHelperFunctionValue(env, enter) ||
+      !IsDomainHelperFunctionValue(env, exit)) {
+    return false;
+  }
+
+  *domain_out = domain;
+  return true;
+}
 
 bool DebugExceptionsEnabled() {
   const char* env = std::getenv("UBI_DEBUG_EXCEPTIONS");
@@ -2297,7 +2417,7 @@ napi_status UbiMakeCallbackWithFlags(napi_env env,
   }
   thread_local int callback_scope_depth = 0;
   callback_scope_depth++;
-  napi_status status = napi_call_function(env, recv, callback, argc, argv, result);
+  napi_status status = UbiCallCallbackWithDomain(env, recv, callback, argc, argv, result);
 
   bool has_pending = false;
   const bool skip_task_queues = (flags & kUbiMakeCallbackSkipTaskQueues) != 0;
@@ -2311,6 +2431,43 @@ napi_status UbiMakeCallbackWithFlags(napi_env env,
 
   callback_scope_depth--;
   return status;
+}
+
+napi_status UbiCallCallbackWithDomain(napi_env env,
+                                      napi_value recv,
+                                      napi_value callback,
+                                      size_t argc,
+                                      napi_value* argv,
+                                      napi_value* result) {
+  if (env == nullptr || recv == nullptr || callback == nullptr) {
+    return napi_invalid_arg;
+  }
+
+  napi_value domain = nullptr;
+  if (!GetCallbackDomain(env, recv, &domain) || domain == nullptr) {
+    return napi_call_function(env, recv, callback, argc, argv, result);
+  }
+
+  napi_value helper = GetCachedDomainCallbackHelper(env);
+  if (helper == nullptr) {
+    return napi_generic_failure;
+  }
+
+  napi_value args_array = nullptr;
+  if (napi_create_array_with_length(env, argc, &args_array) != napi_ok || args_array == nullptr) {
+    return napi_generic_failure;
+  }
+  for (size_t i = 0; i < argc; ++i) {
+    if (napi_set_element(env, args_array, static_cast<uint32_t>(i), argv[i]) != napi_ok) {
+      return napi_generic_failure;
+    }
+  }
+
+  napi_value global = internal_binding::GetGlobal(env);
+  if (global == nullptr) return napi_generic_failure;
+
+  napi_value helper_argv[4] = {domain, recv, callback, args_array};
+  return napi_call_function(env, global, helper, 4, helper_argv, result);
 }
 
 napi_status UbiMakeCallback(napi_env env,

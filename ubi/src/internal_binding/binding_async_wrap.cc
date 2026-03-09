@@ -258,24 +258,25 @@ napi_value AsyncWrapSetCallbackTrampoline(napi_env env, napi_callback_info info)
   return Undefined(env);
 }
 
-napi_value AsyncWrapPushAsyncContext(napi_env env, napi_callback_info info) {
-  AsyncWrapState* state = GetState(env);
+void PushAsyncContextImpl(napi_env env,
+                          AsyncWrapState* state,
+                          double async_id,
+                          double trigger_id,
+                          napi_value resource) {
   uint32_t* fields = HookFields(env, state);
   double* ids = IdFields(env, state);
   size_t capacity_pairs = 0;
   double* stack = IdStack(env, state, &capacity_pairs);
-  if (state == nullptr || fields == nullptr || ids == nullptr || stack == nullptr) return Undefined(env);
-
-  size_t argc = 2;
-  napi_value argv[2] = {nullptr, nullptr};
-  napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
-
-  double async_id = 0;
-  double trigger_id = 0;
-  if (argc >= 1 && argv[0] != nullptr) napi_get_value_double(env, argv[0], &async_id);
-  if (argc >= 2 && argv[1] != nullptr) napi_get_value_double(env, argv[1], &trigger_id);
+  if (state == nullptr || fields == nullptr || ids == nullptr || stack == nullptr) return;
 
   const uint32_t offset = fields[kStackLength];
+  if (resource != nullptr) {
+    napi_value resources = GetExecutionResources(env, state);
+    if (resources != nullptr) {
+      napi_set_element(env, resources, offset, resource);
+    }
+  }
+
   if (offset < capacity_pairs) {
     stack[offset * 2] = ids[kExecutionAsyncId];
     stack[offset * 2 + 1] = ids[kTriggerAsyncId];
@@ -289,22 +290,14 @@ napi_value AsyncWrapPushAsyncContext(napi_env env, napi_callback_info info) {
   fields[kStackLength] = offset + 1;
   ids[kExecutionAsyncId] = async_id;
   ids[kTriggerAsyncId] = trigger_id;
-  return Undefined(env);
 }
 
-napi_value AsyncWrapPopAsyncContext(napi_env env, napi_callback_info info) {
-  AsyncWrapState* state = GetState(env);
+bool PopAsyncContextImpl(napi_env env, AsyncWrapState* state, double async_id) {
   uint32_t* fields = HookFields(env, state);
   double* ids = IdFields(env, state);
   size_t capacity_pairs = 0;
   double* stack = IdStack(env, state, &capacity_pairs);
-  if (state == nullptr || fields == nullptr || ids == nullptr || stack == nullptr) return Undefined(env);
-
-  size_t argc = 1;
-  napi_value argv[1] = {nullptr};
-  napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
-  double async_id = 0;
-  if (argc >= 1 && argv[0] != nullptr) napi_get_value_double(env, argv[0], &async_id);
+  if (state == nullptr || fields == nullptr || ids == nullptr || stack == nullptr) return false;
 
   const uint32_t stack_length = fields[kStackLength];
   bool result = false;
@@ -343,7 +336,36 @@ napi_value AsyncWrapPopAsyncContext(napi_env env, napi_callback_info info) {
       }
     }
   }
+  return result;
+}
 
+napi_value AsyncWrapPushAsyncContext(napi_env env, napi_callback_info info) {
+  AsyncWrapState* state = GetState(env);
+  if (state == nullptr) return Undefined(env);
+
+  size_t argc = 2;
+  napi_value argv[2] = {nullptr, nullptr};
+  napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+
+  double async_id = 0;
+  double trigger_id = 0;
+  if (argc >= 1 && argv[0] != nullptr) napi_get_value_double(env, argv[0], &async_id);
+  if (argc >= 2 && argv[1] != nullptr) napi_get_value_double(env, argv[1], &trigger_id);
+  PushAsyncContextImpl(env, state, async_id, trigger_id, nullptr);
+  return Undefined(env);
+}
+
+napi_value AsyncWrapPopAsyncContext(napi_env env, napi_callback_info info) {
+  AsyncWrapState* state = GetState(env);
+  if (state == nullptr) return Undefined(env);
+
+  size_t argc = 1;
+  napi_value argv[1] = {nullptr};
+  napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+  double async_id = 0;
+  if (argc >= 1 && argv[0] != nullptr) napi_get_value_double(env, argv[0], &async_id);
+
+  bool result = PopAsyncContextImpl(env, state, async_id);
   napi_value out = nullptr;
   napi_get_boolean(env, result, &out);
   return out != nullptr ? out : Undefined(env);
@@ -543,6 +565,21 @@ napi_value AsyncWrapGetCallbackTrampoline(napi_env env) {
   AsyncWrapState* state = GetState(env);
   if (state == nullptr) return nullptr;
   return GetRefValue(env, state->callback_trampoline_ref);
+}
+
+void AsyncWrapPushContext(napi_env env,
+                          double async_id,
+                          double trigger_async_id,
+                          napi_value resource) {
+  AsyncWrapState* state = GetState(env);
+  if (state == nullptr) return;
+  PushAsyncContextImpl(env, state, async_id, trigger_async_id, resource);
+}
+
+bool AsyncWrapPopContext(napi_env env, double async_id) {
+  AsyncWrapState* state = GetState(env);
+  if (state == nullptr) return false;
+  return PopAsyncContextImpl(env, state, async_id);
 }
 
 napi_value ResolveAsyncWrap(napi_env env, const ResolveOptions& /*options*/) {

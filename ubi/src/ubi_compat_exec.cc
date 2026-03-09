@@ -74,7 +74,9 @@ bool UbiShouldWrapCompatCommand(std::string_view command) {
   static constexpr std::string_view kWrappedCommands[] = {
       "node",
       "npm",
+      "npx",
       "pnpm",
+      "pnpx",
       "yarn",
       "bun",
       "deno",
