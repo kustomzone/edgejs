@@ -12,6 +12,8 @@ jobs:
     env:
       NAPI_V8_BUILD_METHOD: prebuilt
       SCCACHE_GHA_ENABLED: "true"
+      CC: clang
+      CXX: clang++
     steps:
       - uses: actions/checkout@v4
         with:
