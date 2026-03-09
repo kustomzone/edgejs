@@ -321,6 +321,19 @@ if(UBI_NAPI_PROVIDER STREQUAL "imports")
     COMPILE_DEFINITIONS "NAPI_EXTERN=")
 endif()
 
+set(UBI_ICU_INCLUDE_DIRS
+  "${PROJECT_ROOT}/deps/icu-small/source/common"
+  "${PROJECT_ROOT}/deps/icu-small/source/i18n"
+)
+set(UBI_ICU_LINK_LIBS "")
+if(APPLE)
+  list(APPEND UBI_ICU_LINK_LIBS icucore)
+elseif(NOT UBI_IS_WASIX_TARGET)
+  find_package(ICU REQUIRED COMPONENTS uc)
+  set(UBI_ICU_INCLUDE_DIRS ${ICU_INCLUDE_DIRS})
+  list(APPEND UBI_ICU_LINK_LIBS ICU::uc)
+endif()
+
 add_library(ubi_ncrypto STATIC
   "${PROJECT_ROOT}/deps/ncrypto/ncrypto.cc"
   "${PROJECT_ROOT}/deps/ncrypto/engine.cc"
@@ -482,8 +495,7 @@ target_include_directories(ubi_runtime
     "${PROJECT_ROOT}/deps"
     "${PROJECT_ROOT}/deps/llhttp/include"
     "${PROJECT_ROOT}/deps/ncrypto"
-    "${PROJECT_ROOT}/deps/icu-small/source/common"
-    "${PROJECT_ROOT}/deps/icu-small/source/i18n"
+    ${UBI_ICU_INCLUDE_DIRS}
 )
 target_link_libraries(ubi_runtime
   PUBLIC
@@ -499,10 +511,8 @@ target_link_libraries(ubi_runtime
     c-ares::cares
     OpenSSL::Crypto
     zlibstatic
+    ${UBI_ICU_LINK_LIBS}
 )
-if(APPLE)
-  target_link_libraries(ubi_runtime PRIVATE icucore)
-endif()
 if(UBI_NAPI_PROVIDER STREQUAL "bundled-v8")
   target_link_libraries(ubi_runtime PUBLIC napi_v8)
 endif()
