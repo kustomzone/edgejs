@@ -197,8 +197,6 @@ void FinalizeModuleLoaderState(napi_env env) {
 void OnModuleLoaderEnvCleanup(void* arg) {
   napi_env env = static_cast<napi_env>(arg);
   g_loader_cleanup_hook_registered.erase(env);
-  if (UbiGetExistingEnvLoop(env) != nullptr) return;
-  FinalizeModuleLoaderState(env);
 }
 
 void EnsureModuleLoaderCleanupHook(napi_env env) {
@@ -3068,7 +3066,16 @@ static napi_value ContextifyContainsModuleSyntaxCallback(napi_env env, napi_call
   }
   bool cjs_var_in_scope = true;
   if (argc >= 4 && argv[3] != nullptr) {
-    napi_get_value_bool(env, argv[3], &cjs_var_in_scope);
+    napi_valuetype arg_type = napi_undefined;
+    if (napi_typeof(env, argv[3], &arg_type) == napi_ok) {
+      if (arg_type == napi_string) {
+        // Match Node's ContainsModuleSyntax(): a string sentinel means the
+        // CommonJS eval scope should not provide CJS wrapper variables.
+        cjs_var_in_scope = false;
+      } else if (arg_type == napi_boolean) {
+        napi_get_value_bool(env, argv[3], &cjs_var_in_scope);
+      }
+    }
   }
 
   bool result = false;

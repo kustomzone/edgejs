@@ -5,14 +5,17 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstdint>
+#include <cstring>
 #include <memory>
 #include <mutex>
 #include <new>
 #include <optional>
+#include <sstream>
 #include <unordered_map>
 #include <vector>
 
 #include <libplatform/libplatform.h>
+#include <v8-profiler.h>
 
 #include "internal/node_v8_default_flags.h"
 #include "internal/napi_v8_env.h"
@@ -73,6 +76,186 @@ struct NearHeapLimitCallbackState {
 };
 
 std::unordered_map<v8::Isolate*, NearHeapLimitCallbackState> g_near_heap_limit_callbacks;
+
+struct InterruptRequest {
+  napi_env env = nullptr;
+  unofficial_napi_interrupt_callback callback = nullptr;
+  void* data = nullptr;
+};
+
+struct ProfilerState {
+  v8::CpuProfiler* cpu_profiler = nullptr;
+  std::vector<uint32_t> active_cpu_profiles;
+  bool heap_profile_started = false;
+};
+
+std::unordered_map<napi_env, ProfilerState> g_profiler_states;
+
+class StringOutputStream final : public v8::OutputStream {
+ public:
+  WriteResult WriteAsciiChunk(char* data, int size) override {
+    if (data != nullptr && size > 0) output_.append(data, size);
+    return kContinue;
+  }
+
+  void EndOfStream() override {}
+
+  const std::string& output() const { return output_; }
+
+ private:
+  std::string output_;
+};
+
+void DisposeProfilerState(napi_env env, ProfilerState* state) {
+  if (env == nullptr || env->isolate == nullptr || state == nullptr) return;
+  if (state->heap_profile_started) {
+    env->isolate->GetHeapProfiler()->StopSamplingHeapProfiler();
+    state->heap_profile_started = false;
+  }
+  if (state->cpu_profiler != nullptr) {
+    for (uint32_t profile_id : state->active_cpu_profiles) {
+      if (v8::CpuProfile* profile = state->cpu_profiler->Stop(profile_id)) {
+        profile->Delete();
+      }
+    }
+    state->active_cpu_profiles.clear();
+    state->cpu_profiler->Dispose();
+    state->cpu_profiler = nullptr;
+  }
+}
+
+ProfilerState& EnsureProfilerState(napi_env env) {
+  return g_profiler_states[env];
+}
+
+bool CopyStringToMallocBuffer(const std::string& input, char** data_out, size_t* len_out) {
+  if (data_out == nullptr || len_out == nullptr) return false;
+  *data_out = nullptr;
+  *len_out = 0;
+  char* buffer = static_cast<char*>(std::malloc(input.size() + 1));
+  if (buffer == nullptr) return false;
+  if (!input.empty()) {
+    std::memcpy(buffer, input.data(), input.size());
+  }
+  buffer[input.size()] = '\0';
+  *data_out = buffer;
+  *len_out = input.size();
+  return true;
+}
+
+void AppendEscapedJsonString(std::string* out, std::string_view input) {
+  if (out == nullptr) return;
+  out->push_back('"');
+  for (unsigned char ch : input) {
+    switch (ch) {
+      case '"':
+        out->append("\\\"");
+        break;
+      case '\\':
+        out->append("\\\\");
+        break;
+      case '\b':
+        out->append("\\b");
+        break;
+      case '\f':
+        out->append("\\f");
+        break;
+      case '\n':
+        out->append("\\n");
+        break;
+      case '\r':
+        out->append("\\r");
+        break;
+      case '\t':
+        out->append("\\t");
+        break;
+      default:
+        if (ch < 0x20) {
+          char buffer[7];
+          std::snprintf(buffer, sizeof(buffer), "\\u%04x", ch);
+          out->append(buffer);
+        } else {
+          out->push_back(static_cast<char>(ch));
+        }
+    }
+  }
+  out->push_back('"');
+}
+
+template <typename T>
+void AppendJsonNumber(std::string* out, T value) {
+  if (out == nullptr) return;
+  std::ostringstream stream;
+  stream << value;
+  out->append(stream.str());
+}
+
+void BuildHeapProfileNode(v8::Isolate* isolate,
+                          const v8::AllocationProfile::Node* profile_node,
+                          std::string* out) {
+  if (out == nullptr) return;
+  size_t self_size = 0;
+  for (const auto& allocation : profile_node->allocations) {
+    self_size += allocation.size * allocation.count;
+  }
+
+  out->push_back('{');
+  out->append("\"selfSize\":");
+  AppendJsonNumber(out, self_size);
+  out->append(",\"id\":");
+  AppendJsonNumber(out, profile_node->node_id);
+  out->append(",\"callFrame\":{");
+  out->append("\"scriptId\":");
+  AppendJsonNumber(out, profile_node->script_id);
+  out->append(",\"lineNumber\":");
+  AppendJsonNumber(out, profile_node->line_number - 1);
+  out->append(",\"columnNumber\":");
+  AppendJsonNumber(out, profile_node->column_number - 1);
+  v8::String::Utf8Value fn_name(isolate, profile_node->name);
+  v8::String::Utf8Value script_name(isolate, profile_node->script_name);
+  out->append(",\"functionName\":");
+  AppendEscapedJsonString(out, *fn_name ? *fn_name : "");
+  out->append(",\"url\":");
+  AppendEscapedJsonString(out, *script_name ? *script_name : "");
+  out->append("},\"children\":[");
+  bool first = true;
+  for (const auto* child : profile_node->children) {
+    if (!first) out->push_back(',');
+    BuildHeapProfileNode(isolate, child, out);
+    first = false;
+  }
+  out->append("]}");
+}
+
+bool SerializeHeapProfile(v8::Isolate* isolate, std::string* out) {
+  if (isolate == nullptr || out == nullptr) return false;
+  v8::HeapProfiler* profiler = isolate->GetHeapProfiler();
+  std::unique_ptr<v8::AllocationProfile> profile(profiler->GetAllocationProfile());
+  if (!profile) return false;
+
+  out->clear();
+  out->append("{\"samples\":[");
+  bool first = true;
+  for (const auto& sample : profile->GetSamples()) {
+    if (!first) out->push_back(',');
+    out->append("{\"size\":");
+    AppendJsonNumber(out, sample.size * sample.count);
+    out->append(",\"nodeId\":");
+    AppendJsonNumber(out, sample.node_id);
+    out->append(",\"ordinal\":");
+    AppendJsonNumber(out, static_cast<double>(sample.sample_id));
+    out->push_back('}');
+    first = false;
+  }
+  out->append("],\"head\":");
+  BuildHeapProfileNode(isolate, profile->GetRootNode(), out);
+  out->push_back('}');
+  return true;
+}
+
+bool IsEnvThreadEntered(napi_env env) {
+  return env != nullptr && env->isolate != nullptr && v8::Isolate::GetCurrent() == env->isolate;
+}
 
 size_t NearHeapLimitCallback(void* raw_env,
                              size_t current_heap_limit,
@@ -906,22 +1089,40 @@ class StructuredCloneSerializerDelegate final : public v8::ValueSerializer::Dele
     return v8::Just(static_cast<uint32_t>(shared_array_buffers_.size() - 1));
   }
 
+  v8::Maybe<uint32_t> GetWasmModuleTransferId(
+      v8::Isolate* /*isolate*/,
+      v8::Local<v8::WasmModuleObject> module) override {
+    wasm_modules_.push_back(module->GetCompiledModule());
+    return v8::Just(static_cast<uint32_t>(wasm_modules_.size() - 1));
+  }
+
   const std::vector<std::shared_ptr<v8::BackingStore>>& shared_array_buffers() const {
     return shared_array_buffers_;
+  }
+
+  const std::vector<v8::CompiledWasmModule>& wasm_modules() const {
+    return wasm_modules_;
+  }
+
+  std::vector<v8::CompiledWasmModule> TakeWasmModules() {
+    return std::move(wasm_modules_);
   }
 
  private:
   v8::Isolate* isolate_ = nullptr;
   std::vector<std::shared_ptr<v8::BackingStore>> shared_array_buffers_;
+  std::vector<v8::CompiledWasmModule> wasm_modules_;
 };
 
 class StructuredCloneDeserializerDelegate final : public v8::ValueDeserializer::Delegate {
  public:
   StructuredCloneDeserializerDelegate(
       v8::Isolate* isolate,
-      const std::vector<std::shared_ptr<v8::BackingStore>>& shared_array_buffers)
+      const std::vector<std::shared_ptr<v8::BackingStore>>& shared_array_buffers,
+      const std::vector<v8::CompiledWasmModule>& wasm_modules)
       : isolate_(isolate),
-        shared_array_buffers_(shared_array_buffers) {}
+        shared_array_buffers_(shared_array_buffers),
+        wasm_modules_(wasm_modules) {}
 
   v8::MaybeLocal<v8::SharedArrayBuffer> GetSharedArrayBufferFromId(
       v8::Isolate* isolate,
@@ -930,14 +1131,23 @@ class StructuredCloneDeserializerDelegate final : public v8::ValueDeserializer::
     return v8::SharedArrayBuffer::New(isolate, shared_array_buffers_[clone_id]);
   }
 
+  v8::MaybeLocal<v8::WasmModuleObject> GetWasmModuleFromId(
+      v8::Isolate* isolate,
+      uint32_t transfer_id) override {
+    if (transfer_id >= wasm_modules_.size()) return {};
+    return v8::WasmModuleObject::FromCompiledModule(isolate, wasm_modules_[transfer_id]);
+  }
+
  private:
   v8::Isolate* isolate_ = nullptr;
   const std::vector<std::shared_ptr<v8::BackingStore>>& shared_array_buffers_;
+  const std::vector<v8::CompiledWasmModule>& wasm_modules_;
 };
 
 struct SerializedClonePayload {
   std::vector<uint8_t> bytes;
   std::vector<std::shared_ptr<v8::BackingStore>> shared_array_buffers;
+  std::vector<v8::CompiledWasmModule> wasm_modules;
 };
 
 }  // namespace
@@ -977,6 +1187,8 @@ napi_status NAPI_CDECL unofficial_napi_create_env_from_context(
 
 napi_status NAPI_CDECL unofficial_napi_destroy_env_instance(napi_env env) {
   if (env == nullptr) return napi_invalid_arg;
+  ProfilerState profiler_state;
+  bool has_profiler_state = false;
   {
     std::lock_guard<std::mutex> lock(g_runtime_mu);
     if (g_runtime.platform != nullptr) {
@@ -1000,8 +1212,18 @@ napi_status NAPI_CDECL unofficial_napi_destroy_env_instance(napi_env env) {
     }
     g_fatal_error_callbacks.erase(env->isolate);
     g_near_heap_limit_callbacks.erase(env->isolate);
+    auto profiler_it = g_profiler_states.find(env);
+    if (profiler_it != g_profiler_states.end()) {
+      profiler_state = std::move(profiler_it->second);
+      g_profiler_states.erase(profiler_it);
+      has_profiler_state = true;
+    }
   }
   if (env->isolate != nullptr) {
+    if (has_profiler_state) {
+      DisposeProfilerState(env, &profiler_state);
+    }
+    env->isolate->CancelTerminateExecution();
     env->isolate->SetPromiseHook(nullptr);
     env->isolate->SetPromiseRejectCallback(nullptr);
     env->isolate->SetFatalErrorHandler(nullptr);
@@ -1198,6 +1420,14 @@ napi_status NAPI_CDECL unofficial_napi_release_env(void* scope_ptr) {
   return status;
 }
 
+napi_status NAPI_CDECL unofficial_napi_set_flags_from_string(
+    const char* flags,
+    size_t length) {
+  if (flags == nullptr) return napi_invalid_arg;
+  v8::V8::SetFlagsFromString(flags, static_cast<int>(length));
+  return napi_ok;
+}
+
 void DrainMicrotasksForEnv(napi_env env) {
   if (env == nullptr || env->isolate == nullptr) return;
   v8::Local<v8::Context> context = env->context();
@@ -1234,6 +1464,45 @@ napi_status NAPI_CDECL unofficial_napi_terminate_execution(napi_env env) {
   return napi_ok;
 }
 
+napi_status NAPI_CDECL unofficial_napi_cancel_terminate_execution(napi_env env) {
+  if (env == nullptr || env->isolate == nullptr) return napi_invalid_arg;
+  env->isolate->CancelTerminateExecution();
+  return napi_ok;
+}
+
+napi_status NAPI_CDECL unofficial_napi_request_interrupt(
+    napi_env env,
+    unofficial_napi_interrupt_callback callback,
+    void* data) {
+  if (env == nullptr || env->isolate == nullptr || callback == nullptr) {
+    return napi_invalid_arg;
+  }
+
+  auto* request = new (std::nothrow) InterruptRequest();
+  if (request == nullptr) return napi_generic_failure;
+  request->env = env;
+  request->callback = callback;
+  request->data = data;
+
+  env->isolate->RequestInterrupt(
+      [](v8::Isolate* isolate, void* raw) {
+        std::unique_ptr<InterruptRequest> request(
+            static_cast<InterruptRequest*>(raw));
+        if (request == nullptr || request->env == nullptr ||
+            request->callback == nullptr ||
+            request->env->isolate != isolate) {
+          return;
+        }
+        v8::HandleScope handle_scope(isolate);
+        v8::Local<v8::Context> context = request->env->context();
+        if (context.IsEmpty()) return;
+        v8::Context::Scope context_scope(context);
+        request->callback(request->env, request->data);
+      },
+      request);
+  return napi_ok;
+}
+
 napi_status NAPI_CDECL unofficial_napi_structured_clone(
     napi_env env,
     napi_value value,
@@ -1261,7 +1530,7 @@ napi_status NAPI_CDECL unofficial_napi_structured_clone(
   std::unique_ptr<uint8_t, decltype(&std::free)> buffer(released.first, &std::free);
 
   StructuredCloneDeserializerDelegate deserializer_delegate(
-      isolate, serializer_delegate.shared_array_buffers());
+      isolate, serializer_delegate.shared_array_buffers(), serializer_delegate.wasm_modules());
   v8::ValueDeserializer deserializer(
       isolate,
       buffer.get(),
@@ -1316,6 +1585,7 @@ napi_status NAPI_CDECL unofficial_napi_serialize_value(
   payload->bytes.assign(released.first, released.first + released.second);
   std::free(released.first);
   payload->shared_array_buffers = serializer_delegate.shared_array_buffers();
+  payload->wasm_modules = serializer_delegate.TakeWasmModules();
   *payload_out = payload;
   return napi_ok;
 }
@@ -1335,7 +1605,8 @@ napi_status NAPI_CDECL unofficial_napi_deserialize_value(
   v8::Local<v8::Context> context = env->context();
   v8::Context::Scope context_scope(context);
 
-  StructuredCloneDeserializerDelegate deserializer_delegate(isolate, payload->shared_array_buffers);
+  StructuredCloneDeserializerDelegate deserializer_delegate(
+      isolate, payload->shared_array_buffers, payload->wasm_modules);
   v8::ValueDeserializer deserializer(
       isolate,
       payload->bytes.data(),
@@ -1835,6 +2106,197 @@ napi_status NAPI_CDECL unofficial_napi_get_heap_code_statistics(
   stats_out->external_script_source_size = stats.external_script_source_size();
   stats_out->cpu_profiler_metadata_size = stats.cpu_profiler_metadata_size();
   return napi_ok;
+}
+
+napi_status NAPI_CDECL unofficial_napi_start_cpu_profile(
+    napi_env env,
+    unofficial_napi_cpu_profile_start_result* result_out,
+    uint32_t* profile_id_out) {
+  if (env == nullptr || env->isolate == nullptr || result_out == nullptr ||
+      profile_id_out == nullptr) {
+    return napi_invalid_arg;
+  }
+  *result_out = unofficial_napi_cpu_profile_start_ok;
+  *profile_id_out = 0;
+  if (!IsEnvThreadEntered(env)) return napi_cannot_run_js;
+
+  ProfilerState* state = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(g_runtime_mu);
+    state = &EnsureProfilerState(env);
+    if (state->cpu_profiler == nullptr) {
+      state->cpu_profiler = v8::CpuProfiler::New(env->isolate);
+      if (state->cpu_profiler == nullptr) return napi_generic_failure;
+    }
+  }
+
+  v8::CpuProfilingResult result = state->cpu_profiler->Start(
+      v8::CpuProfilingOptions{v8::CpuProfilingMode::kLeafNodeLineNumbers,
+                              v8::CpuProfilingOptions::kNoSampleLimit});
+  if (result.status == v8::CpuProfilingStatus::kErrorTooManyProfilers) {
+    *result_out = unofficial_napi_cpu_profile_start_too_many;
+    return napi_ok;
+  }
+  if (result.status != v8::CpuProfilingStatus::kStarted) {
+    return napi_generic_failure;
+  }
+
+  *profile_id_out = static_cast<uint32_t>(result.id);
+  {
+    std::lock_guard<std::mutex> lock(g_runtime_mu);
+    auto it = g_profiler_states.find(env);
+    if (it != g_profiler_states.end()) {
+      it->second.active_cpu_profiles.push_back(*profile_id_out);
+    }
+  }
+  return napi_ok;
+}
+
+napi_status NAPI_CDECL unofficial_napi_stop_cpu_profile(
+    napi_env env,
+    uint32_t profile_id,
+    bool* found_out,
+    char** json_out,
+    size_t* json_len_out) {
+  if (env == nullptr || env->isolate == nullptr || found_out == nullptr ||
+      json_out == nullptr || json_len_out == nullptr) {
+    return napi_invalid_arg;
+  }
+  *found_out = false;
+  *json_out = nullptr;
+  *json_len_out = 0;
+  if (!IsEnvThreadEntered(env)) return napi_cannot_run_js;
+
+  v8::CpuProfiler* cpu_profiler = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(g_runtime_mu);
+    auto it = g_profiler_states.find(env);
+    if (it == g_profiler_states.end() || it->second.cpu_profiler == nullptr) {
+      return napi_ok;
+    }
+    auto active_it = std::find(
+        it->second.active_cpu_profiles.begin(),
+        it->second.active_cpu_profiles.end(),
+        profile_id);
+    if (active_it == it->second.active_cpu_profiles.end()) {
+      return napi_ok;
+    }
+    it->second.active_cpu_profiles.erase(active_it);
+    cpu_profiler = it->second.cpu_profiler;
+  }
+
+  v8::CpuProfile* profile = cpu_profiler->Stop(profile_id);
+  if (profile == nullptr) {
+    return napi_ok;
+  }
+
+  StringOutputStream stream;
+  profile->Serialize(&stream, v8::CpuProfile::SerializationFormat::kJSON);
+  profile->Delete();
+  if (!CopyStringToMallocBuffer(stream.output(), json_out, json_len_out)) {
+    return napi_generic_failure;
+  }
+  *found_out = true;
+  return napi_ok;
+}
+
+napi_status NAPI_CDECL unofficial_napi_start_heap_profile(
+    napi_env env,
+    bool* started_out) {
+  if (env == nullptr || env->isolate == nullptr || started_out == nullptr) {
+    return napi_invalid_arg;
+  }
+  *started_out = false;
+  if (!IsEnvThreadEntered(env)) return napi_cannot_run_js;
+
+  const bool started = env->isolate->GetHeapProfiler()->StartSamplingHeapProfiler();
+  if (started) {
+    std::lock_guard<std::mutex> lock(g_runtime_mu);
+    EnsureProfilerState(env).heap_profile_started = true;
+  }
+  *started_out = started;
+  return napi_ok;
+}
+
+napi_status NAPI_CDECL unofficial_napi_stop_heap_profile(
+    napi_env env,
+    bool* found_out,
+    char** json_out,
+    size_t* json_len_out) {
+  if (env == nullptr || env->isolate == nullptr || found_out == nullptr ||
+      json_out == nullptr || json_len_out == nullptr) {
+    return napi_invalid_arg;
+  }
+  *found_out = false;
+  *json_out = nullptr;
+  *json_len_out = 0;
+  if (!IsEnvThreadEntered(env)) return napi_cannot_run_js;
+
+  {
+    std::lock_guard<std::mutex> lock(g_runtime_mu);
+    auto it = g_profiler_states.find(env);
+    if (it == g_profiler_states.end() || !it->second.heap_profile_started) {
+      return napi_ok;
+    }
+  }
+
+  std::string json;
+  if (!SerializeHeapProfile(env->isolate, &json)) {
+    return napi_ok;
+  }
+  env->isolate->GetHeapProfiler()->StopSamplingHeapProfiler();
+  {
+    std::lock_guard<std::mutex> lock(g_runtime_mu);
+    auto it = g_profiler_states.find(env);
+    if (it != g_profiler_states.end()) {
+      it->second.heap_profile_started = false;
+    }
+  }
+  if (!CopyStringToMallocBuffer(json, json_out, json_len_out)) {
+    return napi_generic_failure;
+  }
+  *found_out = true;
+  return napi_ok;
+}
+
+napi_status NAPI_CDECL unofficial_napi_take_heap_snapshot(
+    napi_env env,
+    const unofficial_napi_heap_snapshot_options* options,
+    char** json_out,
+    size_t* json_len_out) {
+  if (env == nullptr || env->isolate == nullptr || json_out == nullptr ||
+      json_len_out == nullptr) {
+    return napi_invalid_arg;
+  }
+  *json_out = nullptr;
+  *json_len_out = 0;
+  if (!IsEnvThreadEntered(env)) return napi_cannot_run_js;
+
+  v8::HeapProfiler::HeapSnapshotOptions snapshot_options;
+  snapshot_options.snapshot_mode =
+      (options != nullptr && options->expose_internals)
+          ? v8::HeapProfiler::HeapSnapshotMode::kExposeInternals
+          : v8::HeapProfiler::HeapSnapshotMode::kRegular;
+  snapshot_options.numerics_mode =
+      (options != nullptr && options->expose_numeric_values)
+          ? v8::HeapProfiler::NumericsMode::kExposeNumericValues
+          : v8::HeapProfiler::NumericsMode::kHideNumericValues;
+
+  const v8::HeapSnapshot* snapshot =
+      env->isolate->GetHeapProfiler()->TakeHeapSnapshot(snapshot_options);
+  if (snapshot == nullptr) return napi_generic_failure;
+
+  StringOutputStream stream;
+  snapshot->Serialize(&stream, v8::HeapSnapshot::kJSON);
+  const_cast<v8::HeapSnapshot*>(snapshot)->Delete();
+  if (!CopyStringToMallocBuffer(stream.output(), json_out, json_len_out)) {
+    return napi_generic_failure;
+  }
+  return napi_ok;
+}
+
+void NAPI_CDECL unofficial_napi_free_buffer(void* data) {
+  std::free(data);
 }
 
 napi_status NAPI_CDECL unofficial_napi_get_continuation_preserved_embedder_data(

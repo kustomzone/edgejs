@@ -22,6 +22,7 @@
 #include "ubi_env_loop.h"
 #include "ubi_handle_wrap.h"
 #include "ubi_runtime.h"
+#include "ubi_worker_env.h"
 
 namespace internal_binding {
 
@@ -113,6 +114,10 @@ bool IsFsFileHandleValue(napi_env env, napi_value value);
 bool IsPlainObjectContainer(napi_env env, napi_value value);
 std::string GetObjectTag(napi_env env, napi_value value);
 std::string GetCtorNameForValue(napi_env env, napi_value value);
+bool ValueUsesTransferArrayBuffer(napi_env env,
+                                  napi_value value,
+                                  napi_value target_arraybuffer,
+                                  std::vector<napi_value>* seen);
 
 napi_value GetNamed(napi_env env, napi_value obj, const char* key) {
   napi_value out = nullptr;
@@ -160,7 +165,11 @@ std::string ValueToUtf8(napi_env env, napi_value value) {
   return out;
 }
 
+
 void ClearPendingException(napi_env env) {
+  if (env != nullptr && UbiWorkerEnvStopRequested(env)) {
+    return;
+  }
   bool pending = false;
   if (napi_is_exception_pending(env, &pending) == napi_ok && pending) {
     napi_value ignored = nullptr;
@@ -410,28 +419,6 @@ std::string DescribeCloneFailureValue(napi_env env, napi_value value) {
         IsCloneableTransferableValue(env, value) ||
         UnwrapMessagePort(env, value) != nullptr) {
       return {};
-    }
-
-    const std::string tag = GetObjectTag(env, value);
-    if (tag == "[object Object]") {
-      return "Cannot clone object of unsupported type.";
-    }
-    const std::string ctor_name = GetCtorNameForValue(env, value);
-    if (!ctor_name.empty()) {
-      static const std::unordered_set<std::string> kKnownCloneableCtors = {
-          "Object",          "Array",          "ArrayBuffer",   "SharedArrayBuffer",
-          "DataView",        "Int8Array",      "Uint8Array",    "Uint8ClampedArray",
-          "Int16Array",      "Uint16Array",    "Int32Array",    "Uint32Array",
-          "Float32Array",    "Float64Array",   "BigInt64Array", "BigUint64Array",
-          "Map",             "Set",            "Date",          "RegExp",
-          "Error",           "EvalError",      "RangeError",    "ReferenceError",
-          "SyntaxError",     "TypeError",      "URIError",      "DOMException",
-          "MessagePort",     "Blob",           "File",          "URL",
-          "URLSearchParams", "Promise",
-      };
-      if (kKnownCloneableCtors.find(ctor_name) == kKnownCloneableCtors.end()) {
-        return "Cannot clone object of unsupported type.";
-      }
     }
     return {};
   }
@@ -1489,7 +1476,9 @@ napi_value GetUntransferableObjectPrivateSymbol(napi_env env) {
   return GetNamed(env, private_symbols, "untransferable_object_private_symbol");
 }
 
-bool TransferListContainsMarkedUntransferable(napi_env env, napi_value transfer_list) {
+bool TransferListContainsMarkedUntransferable(napi_env env,
+                                              napi_value transfer_list,
+                                              napi_value payload = nullptr) {
   if (transfer_list == nullptr || IsUndefinedValue(env, transfer_list)) return false;
 
   bool is_array = false;
@@ -1517,6 +1506,168 @@ bool TransferListContainsMarkedUntransferable(napi_env env, napi_value transfer_
     }
   }
 
+  return false;
+}
+
+bool ValueUsesTransferArrayBuffer(napi_env env,
+                                  napi_value value,
+                                  napi_value target_arraybuffer,
+                                  std::vector<napi_value>* seen) {
+  if (env == nullptr || value == nullptr || target_arraybuffer == nullptr) return false;
+
+  napi_valuetype type = napi_undefined;
+  if (napi_typeof(env, value, &type) != napi_ok || (type != napi_object && type != napi_function)) {
+    return false;
+  }
+
+  for (napi_value prior : *seen) {
+    bool same = false;
+    if (napi_strict_equals(env, prior, value, &same) == napi_ok && same) {
+      return false;
+    }
+  }
+  seen->push_back(value);
+
+  bool same_ab = false;
+  if (napi_strict_equals(env, value, target_arraybuffer, &same_ab) == napi_ok && same_ab) {
+    return true;
+  }
+
+  bool is_buffer = false;
+  if (napi_is_buffer(env, value, &is_buffer) == napi_ok && is_buffer) {
+    void* ignored_data = nullptr;
+    size_t ignored_len = 0;
+    napi_value buffer_ab = nullptr;
+    if (napi_get_buffer_info(env, value, &ignored_data, &ignored_len) == napi_ok &&
+        napi_get_named_property(env, value, "buffer", &buffer_ab) == napi_ok &&
+        buffer_ab != nullptr) {
+      bool same = false;
+      if (napi_strict_equals(env, buffer_ab, target_arraybuffer, &same) == napi_ok && same) {
+        return true;
+      }
+    }
+  }
+
+  bool is_typed_array = false;
+  if (napi_is_typedarray(env, value, &is_typed_array) == napi_ok && is_typed_array) {
+    napi_typedarray_type ignored_type = napi_int8_array;
+    size_t ignored_length = 0;
+    void* ignored_data = nullptr;
+    napi_value view_ab = nullptr;
+    size_t ignored_offset = 0;
+    if (napi_get_typedarray_info(
+            env, value, &ignored_type, &ignored_length, &ignored_data, &view_ab, &ignored_offset) == napi_ok &&
+        view_ab != nullptr) {
+      bool same = false;
+      if (napi_strict_equals(env, view_ab, target_arraybuffer, &same) == napi_ok && same) {
+        return true;
+      }
+    }
+  }
+
+  bool is_dataview = false;
+  if (napi_is_dataview(env, value, &is_dataview) == napi_ok && is_dataview) {
+    void* ignored_data = nullptr;
+    size_t ignored_length = 0;
+    napi_value view_ab = nullptr;
+    size_t ignored_offset = 0;
+    if (napi_get_dataview_info(env, value, &ignored_length, &ignored_data, &view_ab, &ignored_offset) == napi_ok &&
+        view_ab != nullptr) {
+      bool same = false;
+      if (napi_strict_equals(env, view_ab, target_arraybuffer, &same) == napi_ok && same) {
+        return true;
+      }
+    }
+  }
+
+  bool is_array = false;
+  if (napi_is_array(env, value, &is_array) == napi_ok && is_array) {
+    uint32_t length = 0;
+    if (napi_get_array_length(env, value, &length) != napi_ok) return false;
+    for (uint32_t i = 0; i < length; ++i) {
+      napi_value item = nullptr;
+      if (napi_get_element(env, value, i, &item) == napi_ok &&
+          ValueUsesTransferArrayBuffer(env, item, target_arraybuffer, seen)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  if (IsMapValue(env, value)) {
+    napi_value entries = GetNamed(env, value, "entries");
+    napi_value next = nullptr;
+    napi_value iterator = nullptr;
+    if (!IsFunction(env, entries) ||
+        napi_call_function(env, value, entries, 0, nullptr, &iterator) != napi_ok ||
+        iterator == nullptr ||
+        (next = GetNamed(env, iterator, "next")) == nullptr ||
+        !IsFunction(env, next)) {
+      ClearPendingException(env);
+      return false;
+    }
+    for (;;) {
+      napi_value result = nullptr;
+      if (napi_call_function(env, iterator, next, 0, nullptr, &result) != napi_ok || result == nullptr) {
+        ClearPendingException(env);
+        return false;
+      }
+      napi_value done = GetNamed(env, result, "done");
+      bool is_done = false;
+      if (done != nullptr && napi_get_value_bool(env, done, &is_done) == napi_ok && is_done) break;
+      napi_value pair = GetNamed(env, result, "value");
+      if (pair != nullptr && ValueUsesTransferArrayBuffer(env, pair, target_arraybuffer, seen)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  if (IsSetValue(env, value)) {
+    napi_value values_fn = GetNamed(env, value, "values");
+    napi_value next = nullptr;
+    napi_value iterator = nullptr;
+    if (!IsFunction(env, values_fn) ||
+        napi_call_function(env, value, values_fn, 0, nullptr, &iterator) != napi_ok ||
+        iterator == nullptr ||
+        (next = GetNamed(env, iterator, "next")) == nullptr ||
+        !IsFunction(env, next)) {
+      ClearPendingException(env);
+      return false;
+    }
+    for (;;) {
+      napi_value result = nullptr;
+      if (napi_call_function(env, iterator, next, 0, nullptr, &result) != napi_ok || result == nullptr) {
+        ClearPendingException(env);
+        return false;
+      }
+      napi_value done = GetNamed(env, result, "done");
+      bool is_done = false;
+      if (done != nullptr && napi_get_value_bool(env, done, &is_done) == napi_ok && is_done) break;
+      napi_value item = GetNamed(env, result, "value");
+      if (item != nullptr && ValueUsesTransferArrayBuffer(env, item, target_arraybuffer, seen)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  if (!IsPlainObjectContainer(env, value)) return false;
+
+  napi_value keys = nullptr;
+  if (napi_get_property_names(env, value, &keys) != napi_ok || keys == nullptr) return false;
+  uint32_t length = 0;
+  if (napi_get_array_length(env, keys, &length) != napi_ok) return false;
+  for (uint32_t i = 0; i < length; ++i) {
+    napi_value key = nullptr;
+    napi_value item = nullptr;
+    if (napi_get_element(env, keys, i, &key) == napi_ok &&
+        key != nullptr &&
+        napi_get_property(env, value, key, &item) == napi_ok &&
+        ValueUsesTransferArrayBuffer(env, item, target_arraybuffer, seen)) {
+      return true;
+    }
+  }
   return false;
 }
 
@@ -2862,12 +3013,12 @@ void EmitMessageToPort(napi_env env,
                        const char* type = "message",
                        napi_value ports = nullptr);
 
-void ProcessQueuedMessages(MessagePortWrap* wrap, bool force) {
+void ProcessQueuedMessages(MessagePortWrap* wrap, bool force, size_t processing_limit = std::numeric_limits<size_t>::max()) {
   if (wrap == nullptr || wrap->handle_wrap.env == nullptr || wrap->handle_wrap.state != kUbiHandleInitialized) {
     return;
   }
 
-  for (;;) {
+  while (processing_limit-- > 0) {
     QueuedMessage next;
     bool have_message = false;
     {
@@ -2883,9 +3034,6 @@ void ProcessQueuedMessages(MessagePortWrap* wrap, bool force) {
     if (!have_message) break;
 
     if (next.is_close) {
-      if (next.close_source_wrap != nullptr) {
-        next.close_source_wrap->closing_has_ref = false;
-      }
       wrap->closing_has_ref = false;
       if (next.payload_data != nullptr) {
         unofficial_napi_release_serialized_value(next.payload_data);
@@ -2944,6 +3092,17 @@ void ProcessQueuedMessages(MessagePortWrap* wrap, bool force) {
                         "messageerror");
     }
   }
+
+  if (!force && wrap->data) {
+    bool has_queued_messages = false;
+    {
+      std::lock_guard<std::mutex> lock(wrap->data->mutex);
+      has_queued_messages = !wrap->data->queued_messages.empty();
+    }
+    if (has_queued_messages) {
+      TriggerPortAsync(wrap->data);
+    }
+  }
 }
 
 void OnMessagePortClosed(uv_handle_t* handle) {
@@ -2981,7 +3140,12 @@ void OnMessagePortClosed(uv_handle_t* handle) {
 void OnMessagePortAsync(uv_async_t* handle) {
   auto* wrap = static_cast<MessagePortWrap*>(handle != nullptr ? handle->data : nullptr);
   if (wrap == nullptr) return;
-  ProcessQueuedMessages(wrap, false);
+  size_t processing_limit = 1000;
+  if (wrap->data) {
+    std::lock_guard<std::mutex> lock(wrap->data->mutex);
+    processing_limit = std::max<size_t>(wrap->data->queued_messages.size(), 1000);
+  }
+  ProcessQueuedMessages(wrap, false, processing_limit);
 }
 
 void DisentanglePeer(napi_env env, MessagePortWrap* wrap, bool enqueue_close) {
@@ -3190,7 +3354,8 @@ napi_value MessagePortPostMessageCallback(napi_env env, napi_callback_info info)
       !NormalizePostMessageTransferArg(env, argv[1], &normalized_transfer_arg, &transfer_list)) {
     return nullptr;
   }
-  if (transfer_list != nullptr && TransferListContainsMarkedUntransferable(env, transfer_list)) {
+  napi_value payload = (argc >= 1 && argv[0] != nullptr) ? argv[0] : Undefined(env);
+  if (transfer_list != nullptr && TransferListContainsMarkedUntransferable(env, transfer_list, payload)) {
     napi_value err = CreateDataCloneError(env, "An ArrayBuffer is marked as untransferable");
     if (err != nullptr) {
       napi_throw(env, err);
@@ -3216,7 +3381,6 @@ napi_value MessagePortPostMessageCallback(napi_env env, napi_callback_info info)
     return nullptr;
   }
 
-  napi_value payload = (argc >= 1 && argv[0] != nullptr) ? argv[0] : Undefined(env);
   if (!EnsureNoMissingTransferredMessagePorts(env, payload, normalized_transfer_arg)) {
     return nullptr;
   }

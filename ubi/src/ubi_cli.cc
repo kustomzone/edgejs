@@ -92,8 +92,8 @@ int RunWithFreshEnv(const std::function<int(napi_env)>& runner, std::string* err
   }
 
   const int exit_code = runner(env);
-  const napi_status release_status = unofficial_napi_release_env(env_scope);
-  if (release_status != napi_ok) {
+  const napi_status destroy_status = unofficial_napi_destroy_env_instance(env);
+  if (destroy_status != napi_ok) {
     if (error_out != nullptr) {
       *error_out = "Failed to release runtime environment";
     }
@@ -161,6 +161,23 @@ void ApplyEnvUpdates(const std::unordered_map<std::string, std::string>& updates
 
 bool TokenHasInlineValue(const std::string& token) {
   return token.find('=') != std::string::npos;
+}
+
+bool IsSupportedV8ProfilerFlag(const std::string& token) {
+  return token == "--prof" || token.rfind("--logfile=", 0) == 0 ||
+         token.rfind("--prof-sampling-interval=", 0) == 0;
+}
+
+void ApplySupportedV8Flags(const std::vector<std::string>& raw_exec_argv) {
+  std::string flags;
+  for (const auto& token : raw_exec_argv) {
+    if (!IsSupportedV8ProfilerFlag(token)) continue;
+    if (!flags.empty()) flags.push_back(' ');
+    flags += token;
+  }
+  if (!flags.empty()) {
+    (void)unofficial_napi_set_flags_from_string(flags.c_str(), flags.size());
+  }
 }
 
 bool OptionConsumesNextToken(const std::string& token) {
@@ -798,6 +815,7 @@ int UbiRunCli(int argc, const char* const* argv, std::string* error_out) {
   }
 
   UbiSetExecArgv(raw_exec_argv);
+  ApplySupportedV8Flags(raw_exec_argv);
 
   if (force_repl) {
     if (RawExecArgvHasInputType(raw_exec_argv)) {

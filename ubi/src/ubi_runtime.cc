@@ -1049,6 +1049,18 @@ bool DispatchUncaughtException(napi_env env,
   if (effective_exception_line_out != nullptr) *effective_exception_line_out = prior_exception_line;
   if (exception == nullptr) return false;
 
+  if (!UbiWorkerEnvOwnsProcessState(env) &&
+      (UbiWorkerEnvStopRequested(env) || IsProcessExiting(env))) {
+    bool has_pending = false;
+    if (napi_is_exception_pending(env, &has_pending) == napi_ok && has_pending) {
+      napi_value ignored = nullptr;
+      (void)napi_get_and_clear_last_exception(env, &ignored);
+    }
+    (void)unofficial_napi_cancel_terminate_execution(env);
+    if (handled_out != nullptr) *handled_out = true;
+    return true;
+  }
+
   napi_value global = nullptr;
   if (napi_get_global(env, &global) != napi_ok || global == nullptr) return false;
   napi_value process_obj = nullptr;
@@ -1170,12 +1182,15 @@ int HandleExtractedException(napi_env env,
 }
 
 int HandlePendingExceptionAfterLoopStep(napi_env env, std::string* error_out) {
-  PendingExceptionInfo pending = {};
-  if (!TakePendingExceptionInfo(env, &pending) || !pending.has_exception) {
+  if (!UbiWorkerEnvOwnsProcessState(env) && UbiWorkerEnvStopRequested(env)) {
+    PendingExceptionInfo ignored = {};
+    (void)TakePendingExceptionInfo(env, &ignored);
+    (void)unofficial_napi_cancel_terminate_execution(env);
     return -1;
   }
 
-  if (!UbiWorkerEnvOwnsProcessState(env) && UbiWorkerEnvStopRequested(env)) {
+  PendingExceptionInfo pending = {};
+  if (!TakePendingExceptionInfo(env, &pending) || !pending.has_exception) {
     return -1;
   }
 
@@ -1453,6 +1468,9 @@ int WaitForTopLevelPromiseToSettle(napi_env env, napi_value value, std::string* 
     if (loop != nullptr) {
       (void)uv_run(loop, UV_RUN_NOWAIT);
     }
+    if (!UbiWorkerEnvOwnsProcessState(env) && UbiWorkerEnvStopRequested(env)) {
+      break;
+    }
     (void)UbiRuntimePlatformDrainTasks(env);
 
     const int async_status = HandlePendingExceptionAfterLoopStep(env, error_out);
@@ -1659,17 +1677,34 @@ int RunEventLoopUntilQuiescent(napi_env env, std::string* error_out) {
         return 1;
       }
     }
-    if (loop_timeout_ms > 0) {
+    const bool use_polling_loop = loop_timeout_ms > 0;
+    if (use_polling_loop) {
       uv_run(loop, UV_RUN_NOWAIT);
       if (uv_loop_alive(loop) != 0) {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
       }
+    } else if (!UbiWorkerEnvOwnsProcessState(env)) {
+      uv_run(loop, UV_RUN_ONCE);
     } else {
       uv_run(loop, UV_RUN_DEFAULT);
+    }
+    if (!UbiWorkerEnvOwnsProcessState(env) && UbiWorkerEnvStopRequested(env)) {
+      break;
     }
     // Match Node's embedder loop shape: libuv callbacks and callback scopes
     // own nextTick draining; the loop turn itself only drains platform tasks.
     (void)UbiRuntimePlatformDrainTasks(env);
+    // Some cross-thread V8 async wakeups, notably Atomics.waitAsync() used by
+    // worker messaging, can resolve Promises without a JS callback entering the
+    // isolate on that turn. Run a plain microtask checkpoint here so those
+    // promises settle without waiting for an unrelated timer or I/O callback.
+    const napi_status microtask_status = unofficial_napi_process_microtasks(env);
+    if (microtask_status != napi_ok) {
+      if (error_out != nullptr) {
+        *error_out = "Failed to process microtasks";
+      }
+      return 1;
+    }
 
     int async_status = HandlePendingExceptionAfterLoopStep(env, error_out);
     if (async_status >= 0) {
@@ -3175,6 +3210,14 @@ napi_status UbiRunCallbackScopeCheckpoint(napi_env env) {
 bool UbiHandlePendingExceptionNow(napi_env env, bool* handled_out) {
   if (handled_out != nullptr) *handled_out = false;
   if (env == nullptr) return false;
+
+  if (!UbiWorkerEnvOwnsProcessState(env) && UbiWorkerEnvStopRequested(env)) {
+    PendingExceptionInfo ignored = {};
+    (void)TakePendingExceptionInfo(env, &ignored);
+    (void)unofficial_napi_cancel_terminate_execution(env);
+    if (handled_out != nullptr) *handled_out = true;
+    return true;
+  }
 
   PendingExceptionInfo pending = {};
   if (!TakePendingExceptionInfo(env, &pending) || !pending.has_exception || pending.exception == nullptr) {

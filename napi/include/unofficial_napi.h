@@ -25,7 +25,11 @@ NAPI_EXTERN napi_status unofficial_napi_create_env_with_options(
     const unofficial_napi_env_create_options* options,
     napi_env* env_out,
     void** scope_out);
+NAPI_EXTERN napi_status unofficial_napi_destroy_env_instance(napi_env env);
 NAPI_EXTERN napi_status unofficial_napi_release_env(void* scope);
+NAPI_EXTERN napi_status unofficial_napi_set_flags_from_string(
+    const char* flags,
+    size_t length);
 
 // Unofficial/test-only helper. Requests a full GC cycle for testing.
 NAPI_EXTERN napi_status unofficial_napi_request_gc_for_testing(napi_env env);
@@ -38,6 +42,20 @@ NAPI_EXTERN napi_status unofficial_napi_process_microtasks(napi_env env);
 // This is used for worker-style shutdown semantics where the process must
 // survive but the current env must stop executing JS immediately.
 NAPI_EXTERN napi_status unofficial_napi_terminate_execution(napi_env env);
+// Clears a previously requested engine termination on the current env. This is
+// used when embedder code intentionally stops a worker but still needs the
+// current JS stack to unwind normally.
+NAPI_EXTERN napi_status unofficial_napi_cancel_terminate_execution(napi_env env);
+
+using unofficial_napi_interrupt_callback = void (*)(napi_env env, void* data);
+
+// Unofficial helper. Requests execution of a callback on the target env's
+// engine thread at the next interrupt point. The callback runs entered into
+// that env's isolate/context.
+NAPI_EXTERN napi_status unofficial_napi_request_interrupt(
+    napi_env env,
+    unofficial_napi_interrupt_callback callback,
+    void* data);
 
 using unofficial_napi_foreground_task_callback = void (*)(napi_env env, void* data);
 using unofficial_napi_foreground_task_cleanup = void (*)(napi_env env, void* data);
@@ -234,6 +252,16 @@ typedef struct {
   uint64_t cpu_profiler_metadata_size;
 } unofficial_napi_heap_code_statistics;
 
+typedef enum {
+  unofficial_napi_cpu_profile_start_ok = 0,
+  unofficial_napi_cpu_profile_start_too_many = 1,
+} unofficial_napi_cpu_profile_start_result;
+
+typedef struct {
+  bool expose_internals;
+  bool expose_numeric_values;
+} unofficial_napi_heap_snapshot_options;
+
 NAPI_EXTERN napi_status unofficial_napi_get_heap_statistics(
     napi_env env,
     unofficial_napi_heap_statistics* stats_out);
@@ -250,6 +278,39 @@ NAPI_EXTERN napi_status unofficial_napi_get_heap_space_statistics(
 NAPI_EXTERN napi_status unofficial_napi_get_heap_code_statistics(
     napi_env env,
     unofficial_napi_heap_code_statistics* stats_out);
+
+// Unofficial helpers for worker-thread profiling/snapshot support.
+// These must be called on the target env's engine thread, typically from
+// unofficial_napi_request_interrupt().
+NAPI_EXTERN napi_status unofficial_napi_start_cpu_profile(
+    napi_env env,
+    unofficial_napi_cpu_profile_start_result* result_out,
+    uint32_t* profile_id_out);
+
+NAPI_EXTERN napi_status unofficial_napi_stop_cpu_profile(
+    napi_env env,
+    uint32_t profile_id,
+    bool* found_out,
+    char** json_out,
+    size_t* json_len_out);
+
+NAPI_EXTERN napi_status unofficial_napi_start_heap_profile(
+    napi_env env,
+    bool* started_out);
+
+NAPI_EXTERN napi_status unofficial_napi_stop_heap_profile(
+    napi_env env,
+    bool* found_out,
+    char** json_out,
+    size_t* json_len_out);
+
+NAPI_EXTERN napi_status unofficial_napi_take_heap_snapshot(
+    napi_env env,
+    const unofficial_napi_heap_snapshot_options* options,
+    char** json_out,
+    size_t* json_len_out);
+
+NAPI_EXTERN void unofficial_napi_free_buffer(void* data);
 
 // Unofficial helpers for Node's async_context_frame parity. These expose the
 // engine continuation-preserved embedder data used by AsyncContextFrame.

@@ -4,6 +4,9 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <condition_variable>
+#include <cstring>
+#include <deque>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -23,8 +26,10 @@
 #include "ubi_async_wrap.h"
 #include "ubi_env_loop.h"
 #include "ubi_option_helpers.h"
+#include "ubi_process.h"
 #include "ubi_runtime.h"
 #include "ubi_runtime_platform.h"
+#include "ubi_stream_wrap.h"
 #include "ubi_worker_control.h"
 #include "ubi_worker_env.h"
 
@@ -47,11 +52,26 @@ void DebugWorkerLog(const std::string& message) {
 std::atomic<int32_t> g_next_worker_thread_id{1};
 constexpr double kWorkerMb = 1024.0 * 1024.0;
 constexpr size_t kDefaultWorkerStackSize = 4 * 1024 * 1024;
-constexpr size_t kWorkerStackBufferSize = 256 * 1024;
+constexpr size_t kWorkerStackBufferSize = 192 * 1024;
 
 std::mutex g_worker_registry_mu;
 std::unordered_map<napi_env, std::unordered_set<struct WorkerImplWrap*>> g_workers_by_parent_env;
 std::unordered_set<napi_env> g_worker_cleanup_hooks;
+std::unordered_map<napi_env, uv_timer_t*> g_worker_wake_timers;
+std::unordered_map<napi_env, size_t> g_refed_worker_counts;
+
+enum class WorkerTaskType {
+  kCpuUsage,
+  kGetHeapStatistics,
+  kStartCpuProfile,
+  kStopCpuProfile,
+  kStartHeapProfile,
+  kStopHeapProfile,
+  kTakeHeapSnapshot,
+};
+
+struct WorkerTask;
+struct HeapSnapshotHandleWrap;
 
 struct WorkerImplWrap {
   napi_env env = nullptr;
@@ -69,15 +89,17 @@ struct WorkerImplWrap {
   uintptr_t stack_base = 0;
   uv_async_t exit_async{};
   uv_async_t stop_async{};
+  uv_async_t completion_async{};
   std::atomic<bool> exit_async_initialized{false};
   std::atomic<bool> stop_async_initialized{false};
+  std::atomic<bool> completion_async_initialized{false};
   std::atomic<bool> started{false};
   std::atomic<bool> thread_joined{true};
   std::atomic<bool> has_ref{true};
   std::atomic<bool> stop_requested{false};
   std::atomic<bool> parent_env_closing{false};
   std::atomic<bool> reached_heap_limit{false};
-  std::atomic<bool> resource_alive{true};
+  std::atomic<bool> resource_alive{false};
   std::atomic<double> loop_start_time_ms{-1};
   int64_t async_id = 0;
   void* active_handle_token = nullptr;
@@ -85,7 +107,48 @@ struct WorkerImplWrap {
   int32_t exit_code = 0;
   std::string custom_err;
   std::string custom_err_reason;
+  std::mutex task_mutex;
+  std::deque<std::unique_ptr<WorkerTask>> completed_tasks;
 };
+
+struct WorkerTask {
+  WorkerImplWrap* wrap = nullptr;
+  WorkerTaskType type;
+  napi_ref taker_ref = nullptr;
+  uint32_t profile_id = 0;
+  bool success = true;
+  bool found = false;
+  std::string error_code;
+  std::string error_message;
+  uv_rusage_t cpu_usage{};
+  unofficial_napi_heap_statistics heap_statistics{};
+  uint32_t started_profile_id = 0;
+  char* json_data = nullptr;
+  size_t json_len = 0;
+  unofficial_napi_heap_snapshot_options heap_snapshot_options{};
+};
+
+struct HeapSnapshotHandleWrap {
+  napi_env env = nullptr;
+  std::string payload;
+  bool delivered = false;
+};
+
+struct WorkerReportTaskState {
+  std::mutex mutex;
+  std::condition_variable cv;
+  size_t pending = 0;
+  std::vector<UbiWorkerReportEntry> reports;
+};
+
+struct WorkerReportTask {
+  WorkerReportTaskState* state = nullptr;
+  int32_t thread_id = 0;
+  std::string thread_name;
+};
+
+void ClearCompletedWorkerTasks(napi_env env, WorkerImplWrap* wrap);
+void OnWorkerCompletionAsync(uv_async_t* handle);
 
 napi_value GetNamed(napi_env env, napi_value obj, const char* key) {
   napi_value out = nullptr;
@@ -145,6 +208,44 @@ napi_value GetRefValue(napi_env env, napi_ref ref) {
   return out;
 }
 
+void CompleteWorkerReportTask(WorkerReportTask* task, std::string json) {
+  if (task == nullptr || task->state == nullptr) {
+    delete task;
+    return;
+  }
+  {
+    std::lock_guard<std::mutex> lock(task->state->mutex);
+    if (!json.empty()) {
+      task->state->reports.push_back(
+          UbiWorkerReportEntry{task->thread_id, std::move(task->thread_name), std::move(json)});
+    }
+    if (task->state->pending > 0) {
+      task->state->pending -= 1;
+    }
+  }
+  task->state->cv.notify_one();
+  delete task;
+}
+
+void OnWorkerReportInterrupt(napi_env env, void* data) {
+  auto* task = static_cast<WorkerReportTask*>(data);
+  if (env == nullptr || task == nullptr) {
+    CompleteWorkerReportTask(task, {});
+    return;
+  }
+
+  std::string json;
+  napi_value report_binding = UbiGetReportBinding(env);
+  napi_value get_report = GetNamed(env, report_binding, "getReport");
+  napi_value report_string = nullptr;
+  if (IsFunction(env, get_report) &&
+      napi_call_function(env, report_binding, get_report, 0, nullptr, &report_string) == napi_ok &&
+      report_string != nullptr) {
+    json = ValueToUtf8(env, report_string);
+  }
+  CompleteWorkerReportTask(task, std::move(json));
+}
+
 WorkerImplWrap* UnwrapWorkerImpl(napi_env env, napi_value this_arg) {
   if (this_arg == nullptr) return nullptr;
   void* data = nullptr;
@@ -181,6 +282,7 @@ void RequestWorkerStop(WorkerImplWrap* wrap) {
 void OnWorkerParentEnvCleanup(void* data) {
   napi_env env = static_cast<napi_env>(data);
   std::vector<WorkerImplWrap*> wraps;
+  uv_timer_t* wake_timer = nullptr;
   {
     std::lock_guard<std::mutex> lock(g_worker_registry_mu);
     g_worker_cleanup_hooks.erase(env);
@@ -189,6 +291,12 @@ void OnWorkerParentEnvCleanup(void* data) {
       wraps.assign(it->second.begin(), it->second.end());
       g_workers_by_parent_env.erase(it);
     }
+    auto wake_it = g_worker_wake_timers.find(env);
+    if (wake_it != g_worker_wake_timers.end()) {
+      wake_timer = wake_it->second;
+      g_worker_wake_timers.erase(wake_it);
+    }
+    g_refed_worker_counts.erase(env);
   }
 
   for (WorkerImplWrap* wrap : wraps) {
@@ -208,9 +316,25 @@ void OnWorkerParentEnvCleanup(void* data) {
     }
     DeleteRefIfPresent(env, &wrap->message_port_ref);
     DeleteRefIfPresent(env, &wrap->wrapper_ref);
+    ClearCompletedWorkerTasks(env, wrap);
     if (wrap->exit_async_initialized.exchange(false, std::memory_order_acq_rel) &&
         uv_is_closing(reinterpret_cast<uv_handle_t*>(&wrap->exit_async)) == 0) {
       uv_close(reinterpret_cast<uv_handle_t*>(&wrap->exit_async), nullptr);
+    }
+    if (wrap->completion_async_initialized.exchange(false, std::memory_order_acq_rel) &&
+        uv_is_closing(reinterpret_cast<uv_handle_t*>(&wrap->completion_async)) == 0) {
+      uv_close(reinterpret_cast<uv_handle_t*>(&wrap->completion_async), nullptr);
+    }
+  }
+
+  if (wake_timer != nullptr) {
+    if (uv_is_closing(reinterpret_cast<uv_handle_t*>(wake_timer)) == 0) {
+      uv_close(reinterpret_cast<uv_handle_t*>(wake_timer),
+               [](uv_handle_t* handle) {
+                 delete reinterpret_cast<uv_timer_t*>(handle);
+               });
+    } else {
+      delete wake_timer;
     }
   }
 }
@@ -225,11 +349,66 @@ void EnsureWorkerParentEnvCleanupHook(napi_env env) {
   }
 }
 
+void EnsureWorkerWakeTimer(napi_env env) {
+  if (env == nullptr) return;
+  std::lock_guard<std::mutex> lock(g_worker_registry_mu);
+  if (g_worker_wake_timers.find(env) != g_worker_wake_timers.end()) return;
+  uv_loop_t* loop = UbiGetEnvLoop(env);
+  if (loop == nullptr) return;
+  auto* timer = new (std::nothrow) uv_timer_t();
+  if (timer == nullptr) return;
+  const int rc = uv_timer_init(loop, timer);
+  if (rc != 0) {
+    delete timer;
+    return;
+  }
+  timer->data = env;
+  if (uv_timer_start(
+          timer,
+          [](uv_timer_t* handle) {
+            napi_env env = static_cast<napi_env>(handle != nullptr ? handle->data : nullptr);
+            if (env == nullptr) return;
+            (void)UbiRuntimePlatformDrainTasks(env);
+            (void)unofficial_napi_process_microtasks(env);
+            bool handled = false;
+            (void)UbiHandlePendingExceptionNow(env, &handled);
+          },
+          1,
+          1) != 0) {
+    uv_close(reinterpret_cast<uv_handle_t*>(timer),
+             [](uv_handle_t* handle) {
+               delete reinterpret_cast<uv_timer_t*>(handle);
+             });
+    return;
+  }
+  g_worker_wake_timers.emplace(env, timer);
+}
+
+void RefreshWorkerWakeTimerRef(napi_env env) {
+  auto timer_it = g_worker_wake_timers.find(env);
+  if (timer_it == g_worker_wake_timers.end()) return;
+  const size_t refed_count = [&]() -> size_t {
+    auto count_it = g_refed_worker_counts.find(env);
+    return count_it == g_refed_worker_counts.end() ? 0 : count_it->second;
+  }();
+  if (refed_count > 0) {
+    uv_ref(reinterpret_cast<uv_handle_t*>(timer_it->second));
+  } else {
+    uv_unref(reinterpret_cast<uv_handle_t*>(timer_it->second));
+  }
+}
+
 void AddWorkerToRegistry(WorkerImplWrap* wrap) {
   if (wrap == nullptr || wrap->env == nullptr) return;
   EnsureWorkerParentEnvCleanupHook(wrap->env);
+  EnsureWorkerWakeTimer(wrap->env);
   std::lock_guard<std::mutex> lock(g_worker_registry_mu);
-  g_workers_by_parent_env[wrap->env].insert(wrap);
+  auto& workers = g_workers_by_parent_env[wrap->env];
+  workers.insert(wrap);
+  if (wrap->has_ref.load(std::memory_order_acquire)) {
+    g_refed_worker_counts[wrap->env] += 1;
+  }
+  RefreshWorkerWakeTimerRef(wrap->env);
 }
 
 void RemoveWorkerFromRegistry(WorkerImplWrap* wrap) {
@@ -237,8 +416,18 @@ void RemoveWorkerFromRegistry(WorkerImplWrap* wrap) {
   std::lock_guard<std::mutex> lock(g_worker_registry_mu);
   auto it = g_workers_by_parent_env.find(wrap->env);
   if (it == g_workers_by_parent_env.end()) return;
+  if (wrap->has_ref.load(std::memory_order_acquire)) {
+    auto count_it = g_refed_worker_counts.find(wrap->env);
+    if (count_it != g_refed_worker_counts.end()) {
+      if (count_it->second > 0) count_it->second -= 1;
+      if (count_it->second == 0) g_refed_worker_counts.erase(count_it);
+    }
+  }
   it->second.erase(wrap);
-  if (it->second.empty()) g_workers_by_parent_env.erase(it);
+  if (it->second.empty()) {
+    g_workers_by_parent_env.erase(it);
+  }
+  RefreshWorkerWakeTimerRef(wrap->env);
 }
 
 void StopWorkersForEnv(napi_env env) {
@@ -440,6 +629,390 @@ napi_value BuildResourceLimitsArray(napi_env env, const std::array<double, 4>& l
   return typed;
 }
 
+void FreeWorkerTaskPayload(WorkerTask* task) {
+  if (task == nullptr) return;
+  if (task->json_data != nullptr) {
+    unofficial_napi_free_buffer(task->json_data);
+    task->json_data = nullptr;
+    task->json_len = 0;
+  }
+}
+
+void DeleteWorkerTaskRef(napi_env env, WorkerTask* task) {
+  if (env == nullptr || task == nullptr || task->taker_ref == nullptr) return;
+  napi_delete_reference(env, task->taker_ref);
+  task->taker_ref = nullptr;
+}
+
+void ClearCompletedWorkerTasks(napi_env env, WorkerImplWrap* wrap) {
+  if (wrap == nullptr) return;
+  std::deque<std::unique_ptr<WorkerTask>> completed;
+  {
+    std::lock_guard<std::mutex> lock(wrap->task_mutex);
+    completed.swap(wrap->completed_tasks);
+  }
+  for (auto& task : completed) {
+    if (!task) continue;
+    DeleteWorkerTaskRef(env, task.get());
+    FreeWorkerTaskPayload(task.get());
+  }
+}
+
+napi_value CreateNull(napi_env env) {
+  napi_value out = nullptr;
+  napi_get_null(env, &out);
+  return out;
+}
+
+bool SetNamedInt64(napi_env env, napi_value obj, const char* key, int64_t value) {
+  napi_value out = nullptr;
+  return napi_create_int64(env, value, &out) == napi_ok &&
+         out != nullptr &&
+         napi_set_named_property(env, obj, key, out) == napi_ok;
+}
+
+bool SetNamedDouble(napi_env env, napi_value obj, const char* key, double value) {
+  napi_value out = nullptr;
+  return napi_create_double(env, value, &out) == napi_ok &&
+         out != nullptr &&
+         napi_set_named_property(env, obj, key, out) == napi_ok;
+}
+
+napi_value CreateErrorWithCode(napi_env env, const std::string& code, const std::string& message) {
+  napi_value msg = nullptr;
+  napi_value err = nullptr;
+  if (napi_create_string_utf8(env, message.c_str(), NAPI_AUTO_LENGTH, &msg) != napi_ok ||
+      msg == nullptr ||
+      napi_create_error(env, nullptr, msg, &err) != napi_ok ||
+      err == nullptr) {
+    return nullptr;
+  }
+  napi_value code_value = nullptr;
+  if (napi_create_string_utf8(env, code.c_str(), NAPI_AUTO_LENGTH, &code_value) == napi_ok &&
+      code_value != nullptr) {
+    napi_set_named_property(env, err, "code", code_value);
+  }
+  return err;
+}
+
+napi_value CreateTakerObject(napi_env env) {
+  napi_value taker = nullptr;
+  if (napi_create_object(env, &taker) != napi_ok) return nullptr;
+  return taker;
+}
+
+bool WorkerCanAcceptTask(WorkerImplWrap* wrap) {
+  if (wrap == nullptr) return false;
+  if (!wrap->started.load(std::memory_order_acquire) ||
+      !wrap->resource_alive.load(std::memory_order_acquire) ||
+      wrap->stop_requested.load(std::memory_order_acquire) ||
+      !wrap->completion_async_initialized.load(std::memory_order_acquire)) {
+    return false;
+  }
+  std::lock_guard<std::mutex> lock(wrap->mutex);
+  return wrap->worker_env != nullptr;
+}
+
+HeapSnapshotHandleWrap* UnwrapHeapSnapshotHandle(napi_env env, napi_value value) {
+  if (env == nullptr || value == nullptr) return nullptr;
+  void* data = nullptr;
+  if (napi_unwrap(env, value, &data) != napi_ok) return nullptr;
+  return static_cast<HeapSnapshotHandleWrap*>(data);
+}
+
+void HeapSnapshotHandleFinalize(napi_env /*env*/, void* data, void* /*hint*/) {
+  delete static_cast<HeapSnapshotHandleWrap*>(data);
+}
+
+napi_value HeapSnapshotHandleReadStop(napi_env env, napi_callback_info /*info*/) {
+  napi_value zero = nullptr;
+  napi_create_int32(env, 0, &zero);
+  return zero != nullptr ? zero : Undefined(env);
+}
+
+napi_value HeapSnapshotHandleReadStart(napi_env env, napi_callback_info info) {
+  napi_value self = nullptr;
+  size_t argc = 0;
+  if (napi_get_cb_info(env, info, &argc, nullptr, &self, nullptr) != napi_ok || self == nullptr) {
+    return Undefined(env);
+  }
+
+  HeapSnapshotHandleWrap* wrap = UnwrapHeapSnapshotHandle(env, self);
+  napi_value onread = GetNamed(env, self, "onread");
+  if (wrap == nullptr || !IsFunction(env, onread)) return Undefined(env);
+
+  int32_t* state = UbiGetStreamBaseState(env);
+  if (state == nullptr) return Undefined(env);
+
+  auto emit_onread = [&](int32_t nread, const std::string* payload) {
+    state[kUbiReadBytesOrError] = nread;
+    state[kUbiArrayBufferOffset] = 0;
+    napi_value arraybuffer = nullptr;
+    void* data = nullptr;
+    size_t length = payload != nullptr ? payload->size() : 0;
+    if (napi_create_arraybuffer(env, length, &data, &arraybuffer) != napi_ok || arraybuffer == nullptr) {
+      return;
+    }
+    if (payload != nullptr && data != nullptr && !payload->empty()) {
+      std::memcpy(data, payload->data(), payload->size());
+    }
+    napi_value argv[1] = {arraybuffer};
+    napi_value ignored = nullptr;
+    (void)napi_call_function(env, self, onread, 1, argv, &ignored);
+  };
+
+  if (!wrap->delivered) {
+    wrap->delivered = true;
+    emit_onread(static_cast<int32_t>(wrap->payload.size()), &wrap->payload);
+  }
+  emit_onread(UV_EOF, nullptr);
+
+  napi_value zero = nullptr;
+  napi_create_int32(env, 0, &zero);
+  return zero != nullptr ? zero : Undefined(env);
+}
+
+napi_value CreateHeapSnapshotHandle(napi_env env, WorkerTask* task) {
+  if (env == nullptr || task == nullptr || task->json_data == nullptr) return nullptr;
+  napi_value handle = nullptr;
+  if (napi_create_object(env, &handle) != napi_ok || handle == nullptr) return nullptr;
+  auto* wrap = new HeapSnapshotHandleWrap();
+  wrap->env = env;
+  wrap->payload.assign(task->json_data, task->json_len);
+  if (napi_wrap(env, handle, wrap, HeapSnapshotHandleFinalize, nullptr, nullptr) != napi_ok) {
+    delete wrap;
+    return nullptr;
+  }
+  napi_value read_start = nullptr;
+  napi_value read_stop = nullptr;
+  if (napi_create_function(env, "readStart", NAPI_AUTO_LENGTH, HeapSnapshotHandleReadStart, nullptr, &read_start) == napi_ok &&
+      read_start != nullptr) {
+    napi_set_named_property(env, handle, "readStart", read_start);
+  }
+  if (napi_create_function(env, "readStop", NAPI_AUTO_LENGTH, HeapSnapshotHandleReadStop, nullptr, &read_stop) == napi_ok &&
+      read_stop != nullptr) {
+    napi_set_named_property(env, handle, "readStop", read_stop);
+  }
+  return handle;
+}
+
+void CompleteWorkerTaskOnWorkerThread(WorkerTask* task) {
+  if (task == nullptr || task->wrap == nullptr) return;
+  WorkerImplWrap* wrap = task->wrap;
+  {
+    std::lock_guard<std::mutex> lock(wrap->task_mutex);
+    wrap->completed_tasks.emplace_back(task);
+  }
+  if (wrap->completion_async_initialized.load(std::memory_order_acquire)) {
+    uv_async_send(&wrap->completion_async);
+  }
+}
+
+void SetTaskError(WorkerTask* task, const char* code, const std::string& message) {
+  if (task == nullptr) return;
+  task->success = false;
+  task->error_code = code != nullptr ? code : "ERR_WORKER_OPERATION_FAILED";
+  task->error_message = message;
+}
+
+void OnWorkerTaskInterrupt(napi_env worker_env, void* data) {
+  auto* task = static_cast<WorkerTask*>(data);
+  if (task == nullptr || task->wrap == nullptr || worker_env == nullptr) return;
+
+  switch (task->type) {
+    case WorkerTaskType::kCpuUsage: {
+      const int rc = uv_getrusage_thread(&task->cpu_usage);
+      task->found = (rc == 0);
+      if (rc != 0) {
+        SetTaskError(task, "ERR_WORKER_OPERATION_FAILED", uv_strerror(rc));
+      }
+      break;
+    }
+    case WorkerTaskType::kGetHeapStatistics: {
+      if (unofficial_napi_get_heap_statistics(worker_env, &task->heap_statistics) != napi_ok) {
+        SetTaskError(task, "ERR_WORKER_OPERATION_FAILED", "Failed to get heap statistics");
+      } else {
+        task->found = true;
+      }
+      break;
+    }
+    case WorkerTaskType::kStartCpuProfile: {
+      unofficial_napi_cpu_profile_start_result result = unofficial_napi_cpu_profile_start_ok;
+      if (unofficial_napi_start_cpu_profile(worker_env, &result, &task->started_profile_id) != napi_ok) {
+        SetTaskError(task, "ERR_WORKER_OPERATION_FAILED", "Failed to start CPU profile");
+      } else if (result == unofficial_napi_cpu_profile_start_too_many) {
+        SetTaskError(task, "ERR_CPU_PROFILE_TOO_MANY", "There are too many CPU profiles");
+      } else {
+        task->found = true;
+      }
+      break;
+    }
+    case WorkerTaskType::kStopCpuProfile: {
+      if (unofficial_napi_stop_cpu_profile(
+              worker_env, task->profile_id, &task->found, &task->json_data, &task->json_len) != napi_ok) {
+        SetTaskError(task, "ERR_WORKER_OPERATION_FAILED", "Failed to stop CPU profile");
+      } else if (!task->found) {
+        SetTaskError(task, "ERR_CPU_PROFILE_NOT_STARTED", "CPU profile not started");
+      }
+      break;
+    }
+    case WorkerTaskType::kStartHeapProfile: {
+      if (unofficial_napi_start_heap_profile(worker_env, &task->found) != napi_ok) {
+        SetTaskError(task, "ERR_WORKER_OPERATION_FAILED", "Failed to start heap profile");
+      } else if (!task->found) {
+        SetTaskError(task, "ERR_HEAP_PROFILE_HAVE_BEEN_STARTED", "heap profiler have been started");
+      }
+      break;
+    }
+    case WorkerTaskType::kStopHeapProfile: {
+      if (unofficial_napi_stop_heap_profile(
+              worker_env, &task->found, &task->json_data, &task->json_len) != napi_ok) {
+        SetTaskError(task, "ERR_WORKER_OPERATION_FAILED", "Failed to stop heap profile");
+      } else if (!task->found) {
+        SetTaskError(task, "ERR_HEAP_PROFILE_NOT_STARTED", "heap profile not started");
+      }
+      break;
+    }
+    case WorkerTaskType::kTakeHeapSnapshot: {
+      if (unofficial_napi_take_heap_snapshot(
+              worker_env, &task->heap_snapshot_options, &task->json_data, &task->json_len) != napi_ok) {
+        SetTaskError(task, "ERR_WORKER_OPERATION_FAILED", "Failed to take heap snapshot");
+      } else {
+        task->found = true;
+      }
+      break;
+    }
+  }
+
+  CompleteWorkerTaskOnWorkerThread(task);
+}
+
+void OnWorkerCompletionAsync(uv_async_t* handle) {
+  auto* wrap = static_cast<WorkerImplWrap*>(handle != nullptr ? handle->data : nullptr);
+  if (wrap == nullptr || wrap->env == nullptr) return;
+
+  std::deque<std::unique_ptr<WorkerTask>> completed;
+  {
+    std::lock_guard<std::mutex> lock(wrap->task_mutex);
+    completed.swap(wrap->completed_tasks);
+  }
+
+  for (auto& task : completed) {
+    if (!task || task->taker_ref == nullptr) {
+      if (task) FreeWorkerTaskPayload(task.get());
+      continue;
+    }
+    napi_value taker = GetRefValue(wrap->env, task->taker_ref);
+    DeleteWorkerTaskRef(wrap->env, task.get());
+    if (taker == nullptr) {
+      FreeWorkerTaskPayload(task.get());
+      continue;
+    }
+
+    napi_value ondone = GetNamed(wrap->env, taker, "ondone");
+    if (!IsFunction(wrap->env, ondone)) {
+      FreeWorkerTaskPayload(task.get());
+      continue;
+    }
+
+    napi_value argv[2] = {nullptr, nullptr};
+    size_t argc = 0;
+    switch (task->type) {
+      case WorkerTaskType::kCpuUsage: {
+        argc = 2;
+        argv[0] = task->success ? CreateNull(wrap->env)
+                                : CreateErrorWithCode(wrap->env, task->error_code, task->error_message);
+        if (task->success) {
+          napi_create_object(wrap->env, &argv[1]);
+          SetNamedInt64(
+              wrap->env,
+              argv[1],
+              "user",
+              static_cast<int64_t>(1000000ll * task->cpu_usage.ru_utime.tv_sec +
+                                   task->cpu_usage.ru_utime.tv_usec));
+          SetNamedInt64(
+              wrap->env,
+              argv[1],
+              "system",
+              static_cast<int64_t>(1000000ll * task->cpu_usage.ru_stime.tv_sec +
+                                   task->cpu_usage.ru_stime.tv_usec));
+        }
+        break;
+      }
+      case WorkerTaskType::kGetHeapStatistics: {
+        argc = 1;
+        napi_create_object(wrap->env, &argv[0]);
+        SetNamedDouble(wrap->env, argv[0], "total_heap_size", static_cast<double>(task->heap_statistics.total_heap_size));
+        SetNamedDouble(wrap->env, argv[0], "total_heap_size_executable", static_cast<double>(task->heap_statistics.total_heap_size_executable));
+        SetNamedDouble(wrap->env, argv[0], "total_physical_size", static_cast<double>(task->heap_statistics.total_physical_size));
+        SetNamedDouble(wrap->env, argv[0], "total_available_size", static_cast<double>(task->heap_statistics.total_available_size));
+        SetNamedDouble(wrap->env, argv[0], "used_heap_size", static_cast<double>(task->heap_statistics.used_heap_size));
+        SetNamedDouble(wrap->env, argv[0], "heap_size_limit", static_cast<double>(task->heap_statistics.heap_size_limit));
+        SetNamedDouble(wrap->env, argv[0], "malloced_memory", static_cast<double>(task->heap_statistics.malloced_memory));
+        SetNamedDouble(wrap->env, argv[0], "peak_malloced_memory", static_cast<double>(task->heap_statistics.peak_malloced_memory));
+        SetBool(wrap->env, argv[0], "does_zap_garbage", task->heap_statistics.does_zap_garbage);
+        SetNamedDouble(wrap->env, argv[0], "number_of_native_contexts", static_cast<double>(task->heap_statistics.number_of_native_contexts));
+        SetNamedDouble(wrap->env, argv[0], "number_of_detached_contexts", static_cast<double>(task->heap_statistics.number_of_detached_contexts));
+        SetNamedDouble(wrap->env, argv[0], "total_global_handles_size", static_cast<double>(task->heap_statistics.total_global_handles_size));
+        SetNamedDouble(wrap->env, argv[0], "used_global_handles_size", static_cast<double>(task->heap_statistics.used_global_handles_size));
+        SetNamedDouble(wrap->env, argv[0], "external_memory", static_cast<double>(task->heap_statistics.external_memory));
+        break;
+      }
+      case WorkerTaskType::kStartCpuProfile: {
+        argc = 2;
+        argv[0] = task->success ? CreateNull(wrap->env)
+                                : CreateErrorWithCode(wrap->env, task->error_code, task->error_message);
+        if (task->success) napi_create_uint32(wrap->env, task->started_profile_id, &argv[1]);
+        break;
+      }
+      case WorkerTaskType::kStopCpuProfile:
+      case WorkerTaskType::kStopHeapProfile: {
+        argc = 2;
+        argv[0] = task->success ? CreateNull(wrap->env)
+                                : CreateErrorWithCode(wrap->env, task->error_code, task->error_message);
+        if (task->success) {
+          napi_create_string_utf8(wrap->env, task->json_data, task->json_len, &argv[1]);
+        }
+        break;
+      }
+      case WorkerTaskType::kStartHeapProfile: {
+        argc = 1;
+        argv[0] = task->success ? CreateNull(wrap->env)
+                                : CreateErrorWithCode(wrap->env, task->error_code, task->error_message);
+        break;
+      }
+      case WorkerTaskType::kTakeHeapSnapshot: {
+        argc = 1;
+        argv[0] = task->success ? CreateHeapSnapshotHandle(wrap->env, task.get())
+                                : CreateErrorWithCode(wrap->env, task->error_code, task->error_message);
+        break;
+      }
+    }
+
+    napi_value ignored = nullptr;
+    (void)UbiMakeCallback(wrap->env, taker, ondone, argc, argv, &ignored);
+    FreeWorkerTaskPayload(task.get());
+  }
+}
+
+bool QueueWorkerTask(WorkerImplWrap* wrap, std::unique_ptr<WorkerTask> task) {
+  if (wrap == nullptr || task == nullptr || !WorkerCanAcceptTask(wrap)) return false;
+  napi_env worker_env = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(wrap->mutex);
+    worker_env = wrap->worker_env;
+  }
+  if (worker_env == nullptr) return false;
+  WorkerTask* raw_task = task.release();
+  const napi_status status =
+      unofficial_napi_request_interrupt(worker_env, OnWorkerTaskInterrupt, raw_task);
+  if (status != napi_ok) {
+    task.reset(raw_task);
+    return false;
+  }
+  return true;
+}
+
 void CallWorkerOnExit(WorkerImplWrap* wrap) {
   if (wrap == nullptr ||
       wrap->parent_env_closing.load(std::memory_order_acquire) ||
@@ -453,16 +1026,6 @@ void CallWorkerOnExit(WorkerImplWrap* wrap) {
   if (!IsFunction(wrap->env, onexit)) return;
   std::string effective_custom_err = wrap->custom_err;
   std::string effective_custom_err_reason = wrap->custom_err_reason;
-  if (effective_custom_err.empty() && wrap->exit_code == 0) {
-    napi_value was_online_value = GetNamed(wrap->env, self, "wasOnline");
-    bool was_online = false;
-    if (was_online_value != nullptr &&
-        napi_get_value_bool(wrap->env, was_online_value, &was_online) == napi_ok &&
-        !was_online) {
-      effective_custom_err = "ERR_WORKER_INIT_FAILED";
-      effective_custom_err_reason = "Worker exited before becoming online";
-    }
-  }
   napi_value argv[3] = {nullptr, Undefined(wrap->env), Undefined(wrap->env)};
   napi_create_int32(wrap->env, wrap->exit_code, &argv[0]);
   if (!effective_custom_err.empty()) {
@@ -492,9 +1055,14 @@ void OnWorkerExitAsyncClosed(uv_handle_t* handle) {
     wrap->async_id = 0;
   }
   DeleteRefIfPresent(wrap->env, &wrap->message_port_ref);
+  ClearCompletedWorkerTasks(wrap->env, wrap);
   if (wrap->wrapper_ref != nullptr) {
     uint32_t ref_count = 0;
     (void)napi_reference_unref(wrap->env, wrap->wrapper_ref, &ref_count);
+  }
+  if (wrap->completion_async_initialized.exchange(false, std::memory_order_acq_rel) &&
+      uv_is_closing(reinterpret_cast<uv_handle_t*>(&wrap->completion_async)) == 0) {
+    uv_close(reinterpret_cast<uv_handle_t*>(&wrap->completion_async), nullptr);
   }
 }
 
@@ -656,9 +1224,19 @@ void WorkerThreadMain(WorkerImplWrap* wrap, uintptr_t stack_top) {
     if (uv_run(loop, UV_RUN_NOWAIT) == 0) break;
   }
 
+  if (wrap->stop_requested.load(std::memory_order_acquire)) {
+    bool has_pending = false;
+    if (napi_is_exception_pending(worker_env, &has_pending) == napi_ok && has_pending) {
+      napi_value ignored = nullptr;
+      (void)napi_get_and_clear_last_exception(worker_env, &ignored);
+    }
+    (void)unofficial_napi_cancel_terminate_execution(worker_env);
+  }
+
   (void)unofficial_napi_remove_near_heap_limit_callback(worker_env, 0);
   DebugWorkerLog("WorkerThreadMain releasing env thread_id=" + std::to_string(wrap->thread_id));
   (void)unofficial_napi_release_env(worker_scope);
+  UbiWorkerEnvForget(worker_env);
   FinalizeWorkerThread(wrap, exit_code, custom_err, custom_err_reason);
 }
 
@@ -679,6 +1257,11 @@ void WorkerImplFinalize(napi_env env, void* data, void* /*hint*/) {
   }
   DeleteRefIfPresent(env, &wrap->message_port_ref);
   DeleteRefIfPresent(env, &wrap->wrapper_ref);
+  ClearCompletedWorkerTasks(env, wrap);
+  if (wrap->completion_async_initialized.exchange(false, std::memory_order_acq_rel) &&
+      uv_is_closing(reinterpret_cast<uv_handle_t*>(&wrap->completion_async)) == 0) {
+    uv_close(reinterpret_cast<uv_handle_t*>(&wrap->completion_async), nullptr);
+  }
   delete wrap;
 }
 
@@ -723,6 +1306,11 @@ napi_value WorkerImplCtor(napi_env env, napi_callback_info info) {
     }
     wrap->worker_config.is_internal_thread = is_internal_thread;
   }
+  if (argc >= 5 && argv[4] != nullptr && !IsNullOrUndefinedValue(env, argv[4])) {
+    bool tracks_unmanaged_fds = false;
+    (void)napi_get_value_bool(env, argv[4], &tracks_unmanaged_fds);
+    wrap->worker_config.tracks_unmanaged_fds = tracks_unmanaged_fds;
+  }
   if (argc >= 4 && argv[3] != nullptr) {
     wrap->worker_config.resource_limits = ReadResourceLimits(env, argv[3]);
   }
@@ -732,6 +1320,7 @@ napi_value WorkerImplCtor(napi_env env, napi_callback_info info) {
   napi_value process_exec_argv = GetNamed(env, process, "execArgv");
   wrap->exec_argv = explicit_exec_argv ? ReadStringArray(env, argv[2]) : ReadStringArray(env, process_exec_argv);
   const std::vector<std::string> invalid_exec_argv = ValidateExecArgv(env, wrap->exec_argv, explicit_exec_argv);
+  bool has_invalid_node_options = false;
   if (!invalid_exec_argv.empty()) {
     napi_value invalid = nullptr;
     if (napi_create_array_with_length(env, invalid_exec_argv.size(), &invalid) == napi_ok && invalid != nullptr) {
@@ -752,6 +1341,7 @@ napi_value WorkerImplCtor(napi_env env, napi_callback_info info) {
       (void)SnapshotStringMapFromObject(env, argv[1], &wrap->worker_config.env_vars);
       const std::vector<std::string> invalid_node_options = ValidateNodeOptionsEnv(env, wrap->worker_config.env_vars);
       if (!invalid_node_options.empty()) {
+        has_invalid_node_options = true;
         napi_value invalid = nullptr;
         if (napi_create_array_with_length(env, invalid_node_options.size(), &invalid) == napi_ok && invalid != nullptr) {
           for (size_t i = 0; i < invalid_node_options.size(); ++i) {
@@ -774,6 +1364,13 @@ napi_value WorkerImplCtor(napi_env env, napi_callback_info info) {
     wrap->worker_config.env_vars = SnapshotCurrentProcessEnv(env);
   }
 
+  if (!invalid_exec_argv.empty() || has_invalid_node_options) {
+    SetInt32(env, this_arg, "threadId", wrap->thread_id);
+    SetString(env, this_arg, "threadName", wrap->thread_name.c_str());
+    delete wrap;
+    return this_arg;
+  }
+
   napi_value parent_port = nullptr;
   if (CreateMessageChannel(env, &parent_port, &wrap->worker_config.env_message_port_data) == nullptr ||
       parent_port == nullptr) {
@@ -791,17 +1388,24 @@ napi_value WorkerImplCtor(napi_env env, napi_callback_info info) {
   wrap->exit_async_initialized.store(true, std::memory_order_release);
   uv_unref(reinterpret_cast<uv_handle_t*>(&wrap->exit_async));
 
+  if (uv_async_init(loop, &wrap->completion_async, OnWorkerCompletionAsync) != 0) {
+    uv_close(reinterpret_cast<uv_handle_t*>(&wrap->exit_async), nullptr);
+    delete wrap;
+    return nullptr;
+  }
+  wrap->completion_async.data = wrap;
+  wrap->completion_async_initialized.store(true, std::memory_order_release);
+  uv_unref(reinterpret_cast<uv_handle_t*>(&wrap->completion_async));
+
   if (napi_wrap(env, this_arg, wrap, WorkerImplFinalize, nullptr, &wrap->wrapper_ref) != napi_ok) {
     uv_close(reinterpret_cast<uv_handle_t*>(&wrap->exit_async), nullptr);
+    uv_close(reinterpret_cast<uv_handle_t*>(&wrap->completion_async), nullptr);
     delete wrap;
     return nullptr;
   }
 
   wrap->async_id = UbiAsyncWrapNextId(env);
   UbiAsyncWrapEmitInit(env, wrap->async_id, kUbiProviderWorker, UbiAsyncWrapExecutionAsyncId(env), this_arg);
-  wrap->active_handle_token =
-      UbiRegisterActiveHandle(env, this_arg, "WORKER", WorkerImplHasRefActive, WorkerImplGetActiveOwner, wrap);
-  AddWorkerToRegistry(wrap);
 
   napi_set_named_property(env, this_arg, "messagePort", parent_port);
   SetInt32(env, this_arg, "threadId", wrap->thread_id);
@@ -863,6 +1467,13 @@ napi_value WorkerImplStartThread(napi_env env, napi_callback_info info) {
     }
     if (wrap->wrapper_ref != nullptr) (void)napi_reference_unref(env, wrap->wrapper_ref, &ref_count);
     napi_throw_error(env, "ERR_WORKER_INIT_FAILED", uv_strerror(thread_rc));
+  } else {
+    wrap->resource_alive.store(true, std::memory_order_release);
+    if (wrap->active_handle_token == nullptr) {
+      wrap->active_handle_token =
+          UbiRegisterActiveHandle(env, this_arg, "WORKER", WorkerImplHasRefActive, WorkerImplGetActiveOwner, wrap);
+    }
+    AddWorkerToRegistry(wrap);
   }
   return Undefined(env);
 }
@@ -884,8 +1495,13 @@ napi_value WorkerImplRef(napi_env env, napi_callback_info info) {
   napi_get_cb_info(env, info, &argc, nullptr, &this_arg, nullptr);
   WorkerImplWrap* wrap = UnwrapWorkerImpl(env, this_arg);
   if (wrap != nullptr && wrap->exit_async_initialized.load(std::memory_order_acquire)) {
-    wrap->has_ref.store(true, std::memory_order_release);
+    const bool was_refed = wrap->has_ref.exchange(true, std::memory_order_acq_rel);
     uv_ref(reinterpret_cast<uv_handle_t*>(&wrap->exit_async));
+    if (!was_refed) {
+      std::lock_guard<std::mutex> lock(g_worker_registry_mu);
+      g_refed_worker_counts[env] += 1;
+      RefreshWorkerWakeTimerRef(env);
+    }
   }
   return Undefined(env);
 }
@@ -896,8 +1512,17 @@ napi_value WorkerImplUnref(napi_env env, napi_callback_info info) {
   napi_get_cb_info(env, info, &argc, nullptr, &this_arg, nullptr);
   WorkerImplWrap* wrap = UnwrapWorkerImpl(env, this_arg);
   if (wrap != nullptr && wrap->exit_async_initialized.load(std::memory_order_acquire)) {
-    wrap->has_ref.store(false, std::memory_order_release);
+    const bool was_refed = wrap->has_ref.exchange(false, std::memory_order_acq_rel);
     uv_unref(reinterpret_cast<uv_handle_t*>(&wrap->exit_async));
+    if (was_refed) {
+      std::lock_guard<std::mutex> lock(g_worker_registry_mu);
+      auto count_it = g_refed_worker_counts.find(env);
+      if (count_it != g_refed_worker_counts.end()) {
+        if (count_it->second > 0) count_it->second -= 1;
+        if (count_it->second == 0) g_refed_worker_counts.erase(count_it);
+      }
+      RefreshWorkerWakeTimerRef(env);
+    }
   }
   return Undefined(env);
 }
@@ -960,8 +1585,107 @@ napi_value WorkerImplLoopIdleTime(napi_env env, napi_callback_info info) {
   return out != nullptr ? out : Undefined(env);
 }
 
-napi_value WorkerImplNoopTaker(napi_env env, napi_callback_info info) {
-  return Undefined(env);
+std::unique_ptr<WorkerTask> CreateWorkerTask(WorkerImplWrap* wrap, WorkerTaskType type) {
+  auto task = std::make_unique<WorkerTask>();
+  task->wrap = wrap;
+  task->type = type;
+  return task;
+}
+
+napi_value QueueWorkerTakerTask(napi_env env, WorkerImplWrap* wrap, std::unique_ptr<WorkerTask> task) {
+  if (wrap == nullptr || task == nullptr) return Undefined(env);
+  napi_value taker = CreateTakerObject(env);
+  if (taker == nullptr) return Undefined(env);
+  if (napi_create_reference(env, taker, 1, &task->taker_ref) != napi_ok || task->taker_ref == nullptr) {
+    return Undefined(env);
+  }
+  WorkerTask* raw_task = task.get();
+  if (!QueueWorkerTask(wrap, std::move(task))) {
+    DeleteWorkerTaskRef(env, raw_task);
+    return Undefined(env);
+  }
+  return taker;
+}
+
+napi_value WorkerImplCpuUsage(napi_env env, napi_callback_info info) {
+  napi_value this_arg = nullptr;
+  size_t argc = 0;
+  napi_get_cb_info(env, info, &argc, nullptr, &this_arg, nullptr);
+  WorkerImplWrap* wrap = UnwrapWorkerImpl(env, this_arg);
+  return QueueWorkerTakerTask(env, wrap, CreateWorkerTask(wrap, WorkerTaskType::kCpuUsage));
+}
+
+napi_value WorkerImplGetHeapStatistics(napi_env env, napi_callback_info info) {
+  napi_value this_arg = nullptr;
+  size_t argc = 0;
+  napi_get_cb_info(env, info, &argc, nullptr, &this_arg, nullptr);
+  WorkerImplWrap* wrap = UnwrapWorkerImpl(env, this_arg);
+  return QueueWorkerTakerTask(env, wrap, CreateWorkerTask(wrap, WorkerTaskType::kGetHeapStatistics));
+}
+
+napi_value WorkerImplStartCpuProfile(napi_env env, napi_callback_info info) {
+  napi_value this_arg = nullptr;
+  size_t argc = 0;
+  napi_get_cb_info(env, info, &argc, nullptr, &this_arg, nullptr);
+  WorkerImplWrap* wrap = UnwrapWorkerImpl(env, this_arg);
+  return QueueWorkerTakerTask(env, wrap, CreateWorkerTask(wrap, WorkerTaskType::kStartCpuProfile));
+}
+
+napi_value WorkerImplStopCpuProfile(napi_env env, napi_callback_info info) {
+  napi_value this_arg = nullptr;
+  size_t argc = 1;
+  napi_value argv[1] = {nullptr};
+  napi_get_cb_info(env, info, &argc, argv, &this_arg, nullptr);
+  WorkerImplWrap* wrap = UnwrapWorkerImpl(env, this_arg);
+  auto task = CreateWorkerTask(wrap, WorkerTaskType::kStopCpuProfile);
+  if (task && argc >= 1 && argv[0] != nullptr) {
+    (void)napi_get_value_uint32(env, argv[0], &task->profile_id);
+  }
+  return QueueWorkerTakerTask(env, wrap, std::move(task));
+}
+
+napi_value WorkerImplStartHeapProfile(napi_env env, napi_callback_info info) {
+  napi_value this_arg = nullptr;
+  size_t argc = 0;
+  napi_get_cb_info(env, info, &argc, nullptr, &this_arg, nullptr);
+  WorkerImplWrap* wrap = UnwrapWorkerImpl(env, this_arg);
+  return QueueWorkerTakerTask(env, wrap, CreateWorkerTask(wrap, WorkerTaskType::kStartHeapProfile));
+}
+
+napi_value WorkerImplStopHeapProfile(napi_env env, napi_callback_info info) {
+  napi_value this_arg = nullptr;
+  size_t argc = 0;
+  napi_get_cb_info(env, info, &argc, nullptr, &this_arg, nullptr);
+  WorkerImplWrap* wrap = UnwrapWorkerImpl(env, this_arg);
+  return QueueWorkerTakerTask(env, wrap, CreateWorkerTask(wrap, WorkerTaskType::kStopHeapProfile));
+}
+
+napi_value WorkerImplTakeHeapSnapshot(napi_env env, napi_callback_info info) {
+  napi_value this_arg = nullptr;
+  size_t argc = 1;
+  napi_value argv[1] = {nullptr};
+  napi_get_cb_info(env, info, &argc, argv, &this_arg, nullptr);
+  WorkerImplWrap* wrap = UnwrapWorkerImpl(env, this_arg);
+  auto task = CreateWorkerTask(wrap, WorkerTaskType::kTakeHeapSnapshot);
+  if (task && argc >= 1 && argv[0] != nullptr) {
+    bool is_typed_array = false;
+    napi_typedarray_type type = napi_uint8_array;
+    size_t length = 0;
+    void* data = nullptr;
+    napi_value arraybuffer = nullptr;
+    size_t byte_offset = 0;
+    if (napi_is_typedarray(env, argv[0], &is_typed_array) == napi_ok &&
+        is_typed_array &&
+        napi_get_typedarray_info(env, argv[0], &type, &length, &data, &arraybuffer, &byte_offset) == napi_ok &&
+        type == napi_uint8_array &&
+        data != nullptr &&
+        length >= 2) {
+      const uint8_t* values = static_cast<const uint8_t*>(data);
+      task->heap_snapshot_options.expose_internals = values[0] != 0;
+      task->heap_snapshot_options.expose_numeric_values = values[1] != 0;
+    }
+  }
+  return QueueWorkerTakerTask(env, wrap, std::move(task));
 }
 
 napi_value CreateWorkerCtor(napi_env env) {
@@ -974,11 +1698,13 @@ napi_value CreateWorkerCtor(napi_env env) {
       {"getResourceLimits", nullptr, WorkerImplGetResourceLimits, nullptr, nullptr, nullptr, napi_default, nullptr},
       {"loopStartTime", nullptr, WorkerImplLoopStartTime, nullptr, nullptr, nullptr, napi_default, nullptr},
       {"loopIdleTime", nullptr, WorkerImplLoopIdleTime, nullptr, nullptr, nullptr, napi_default, nullptr},
-      {"takeHeapSnapshot", nullptr, WorkerImplNoopTaker, nullptr, nullptr, nullptr, napi_default, nullptr},
-      {"getHeapStatistics", nullptr, WorkerImplNoopTaker, nullptr, nullptr, nullptr, napi_default, nullptr},
-      {"cpuUsage", nullptr, WorkerImplNoopTaker, nullptr, nullptr, nullptr, napi_default, nullptr},
-      {"startCpuProfile", nullptr, WorkerImplNoopTaker, nullptr, nullptr, nullptr, napi_default, nullptr},
-      {"startHeapProfile", nullptr, WorkerImplNoopTaker, nullptr, nullptr, nullptr, napi_default, nullptr},
+      {"takeHeapSnapshot", nullptr, WorkerImplTakeHeapSnapshot, nullptr, nullptr, nullptr, napi_default, nullptr},
+      {"getHeapStatistics", nullptr, WorkerImplGetHeapStatistics, nullptr, nullptr, nullptr, napi_default, nullptr},
+      {"cpuUsage", nullptr, WorkerImplCpuUsage, nullptr, nullptr, nullptr, napi_default, nullptr},
+      {"startCpuProfile", nullptr, WorkerImplStartCpuProfile, nullptr, nullptr, nullptr, napi_default, nullptr},
+      {"stopCpuProfile", nullptr, WorkerImplStopCpuProfile, nullptr, nullptr, nullptr, napi_default, nullptr},
+      {"startHeapProfile", nullptr, WorkerImplStartHeapProfile, nullptr, nullptr, nullptr, napi_default, nullptr},
+      {"stopHeapProfile", nullptr, WorkerImplStopHeapProfile, nullptr, nullptr, nullptr, napi_default, nullptr},
   };
   napi_value ctor = nullptr;
   if (napi_define_class(env,
@@ -1055,7 +1781,56 @@ napi_value ResolveWorker(napi_env env, const ResolveOptions& /*options*/) {
   return out;
 }
 
+std::vector<UbiWorkerReportEntry> UbiWorkerCollectReports(napi_env env) {
+  std::vector<WorkerImplWrap*> wraps;
+  {
+    std::lock_guard<std::mutex> lock(g_worker_registry_mu);
+    auto it = g_workers_by_parent_env.find(env);
+    if (it != g_workers_by_parent_env.end()) {
+      wraps.assign(it->second.begin(), it->second.end());
+    }
+  }
+
+  WorkerReportTaskState state;
+  for (WorkerImplWrap* wrap : wraps) {
+    if (wrap == nullptr || !wrap->started.load(std::memory_order_acquire)) continue;
+
+    napi_env worker_env = nullptr;
+    std::string thread_name;
+    {
+      std::lock_guard<std::mutex> lock(wrap->mutex);
+      worker_env = wrap->worker_env;
+      thread_name = wrap->thread_name;
+    }
+    if (worker_env == nullptr) continue;
+
+    auto* task = new (std::nothrow) WorkerReportTask();
+    if (task == nullptr) continue;
+    task->state = &state;
+    task->thread_id = wrap->thread_id;
+    task->thread_name = std::move(thread_name);
+
+    {
+      std::lock_guard<std::mutex> lock(state.mutex);
+      state.pending += 1;
+    }
+    const napi_status status =
+        unofficial_napi_request_interrupt(worker_env, OnWorkerReportInterrupt, task);
+    if (status != napi_ok) {
+      CompleteWorkerReportTask(task, {});
+    }
+  }
+
+  std::unique_lock<std::mutex> lock(state.mutex);
+  state.cv.wait(lock, [&state]() { return state.pending == 0; });
+  return state.reports;
+}
+
 }  // namespace internal_binding
+
+std::vector<UbiWorkerReportEntry> UbiWorkerCollectReports(napi_env env) {
+  return internal_binding::UbiWorkerCollectReports(env);
+}
 
 void UbiWorkerStopAllForEnv(napi_env env) {
   internal_binding::StopWorkersForEnv(env);

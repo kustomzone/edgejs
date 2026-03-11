@@ -6,6 +6,7 @@
 #include <utility>
 
 #include "unofficial_napi.h"
+#include "ubi_worker_env.h"
 
 namespace {
 
@@ -26,6 +27,13 @@ void DeleteRefIfPresent(napi_env env, napi_ref* ref) {
   if (env == nullptr || ref == nullptr || *ref == nullptr) return;
   napi_delete_reference(env, *ref);
   *ref = nullptr;
+}
+
+bool IsNullOrUndefinedValue(napi_env env, napi_value value) {
+  if (value == nullptr) return true;
+  napi_valuetype type = napi_undefined;
+  return napi_typeof(env, value, &type) == napi_ok &&
+         (type == napi_undefined || type == napi_null);
 }
 
 void OnErrorsEnvCleanup(void* data) {
@@ -286,8 +294,18 @@ napi_value ErrorsTriggerUncaughtException(napi_env env, napi_callback_info info)
     napi_get_value_bool(env, argv[1], &from_promise);
   }
 
+  if (!UbiWorkerEnvOwnsProcessState(env) && UbiWorkerEnvStopRequested(env)) {
+    bool has_pending = false;
+    if (napi_is_exception_pending(env, &has_pending) == napi_ok && has_pending) {
+      napi_value ignored = nullptr;
+      (void)napi_get_and_clear_last_exception(env, &ignored);
+    }
+    (void)unofficial_napi_cancel_terminate_execution(env);
+    return MakeUndefined(env);
+  }
+
   auto invoke_ref_callback = [&](napi_ref ref) {
-    if (ref == nullptr) return;
+    if (ref == nullptr || IsNullOrUndefinedValue(env, exception)) return;
     napi_value cb = nullptr;
     if (napi_get_reference_value(env, ref, &cb) != napi_ok || cb == nullptr) return;
     napi_valuetype cb_type = napi_undefined;
@@ -296,7 +314,13 @@ napi_value ErrorsTriggerUncaughtException(napi_env env, napi_callback_info info)
     if (napi_get_global(env, &global) != napi_ok || global == nullptr) return;
     napi_value cb_argv[1] = {exception};
     napi_value ignored = nullptr;
-    napi_call_function(env, global, cb, 1, cb_argv, &ignored);
+    if (napi_call_function(env, global, cb, 1, cb_argv, &ignored) != napi_ok) {
+      bool has_pending = false;
+      if (napi_is_exception_pending(env, &has_pending) == napi_ok && has_pending) {
+        napi_value thrown = nullptr;
+        (void)napi_get_and_clear_last_exception(env, &thrown);
+      }
+    }
   };
 
   auto st_it = g_errors_states.find(env);
@@ -321,6 +345,19 @@ napi_value ErrorsTriggerUncaughtException(napi_env env, napi_callback_info info)
       napi_value fatal_argv[2] = {exception, from_promise_value};
       napi_value fatal_result = nullptr;
       if (napi_call_function(env, process, fatal_exception, 2, fatal_argv, &fatal_result) != napi_ok) {
+        if (!UbiWorkerEnvOwnsProcessState(env) &&
+            UbiWorkerEnvStopRequested(env)) {
+          bool has_pending = false;
+          if (napi_is_exception_pending(env, &has_pending) == napi_ok && has_pending) {
+            napi_value ignored = nullptr;
+            (void)napi_get_and_clear_last_exception(env, &ignored);
+          }
+          (void)unofficial_napi_cancel_terminate_execution(env);
+          if (st_it != g_errors_states.end()) {
+            invoke_ref_callback(st_it->second.enhance_fatal_stack_after_inspector_ref);
+          }
+          return MakeUndefined(env);
+        }
         return nullptr;
       }
       if (fatal_result != nullptr) {

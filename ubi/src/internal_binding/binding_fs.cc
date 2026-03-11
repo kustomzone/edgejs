@@ -24,6 +24,7 @@
 #include "../ubi_async_wrap.h"
 #include "../ubi_module_loader.h"
 #include "../ubi_path.h"
+#include "../ubi_worker_env.h"
 #include "ubi_active_resource.h"
 #include "ubi_runtime.h"
 
@@ -625,6 +626,10 @@ void DestroyDeferredPromiseSettlement(DeferredPromiseSettlement* settlement) {
 
 void InvokeDeferredReqCompletion(napi_env env, DeferredReqCompletion* completion) {
   if (completion == nullptr || env == nullptr) return;
+  if (UbiWorkerEnvStopRequested(env)) {
+    DestroyDeferredReqCompletion(completion);
+    return;
+  }
   napi_value req = GetRefValue(env, completion->req_ref);
   napi_value oncomplete = GetRefValue(env, completion->oncomplete_ref);
   napi_value err = GetRefValue(env, completion->err_ref);
@@ -670,6 +675,10 @@ napi_value DeferredPromiseSettlementCallback(napi_env env, napi_callback_info in
   napi_get_cb_info(env, info, &argc, nullptr, nullptr, &data);
   auto* settlement = static_cast<DeferredPromiseSettlement*>(data);
   if (settlement == nullptr || env == nullptr) return Undefined(env);
+  if (UbiWorkerEnvStopRequested(env)) {
+    DestroyDeferredPromiseSettlement(settlement);
+    return Undefined(env);
+  }
 
   napi_value value = GetRefValue(env, settlement->value_ref);
   napi_value err = GetRefValue(env, settlement->err_ref);
@@ -963,6 +972,7 @@ struct AsyncFsReq {
   size_t hold_ref_count = 0;
   uv_buf_t* bufs = nullptr;
   size_t nbufs = 0;
+  bool track_unmanaged_fd = false;
 };
 
 void HoldFileHandleRef(FileHandleWrap* wrap) {
@@ -1269,6 +1279,10 @@ void FinishAsyncFsReq(AsyncFsReq* async_req, int result) {
   }
 
   napi_env env = async_req->env;
+  if (UbiWorkerEnvStopRequested(env)) {
+    DestroyAsyncFsReq(async_req);
+    return;
+  }
   napi_value err = nullptr;
   napi_value value = Undefined(env);
   if (result < 0) {
@@ -1281,6 +1295,9 @@ void FinishAsyncFsReq(AsyncFsReq* async_req, int result) {
       err = CreateUvExceptionValue(env, result, async_req->syscall != nullptr ? async_req->syscall : "");
     }
   } else {
+    if (async_req->track_unmanaged_fd) {
+      UbiWorkerEnvAddUnmanagedFd(env, static_cast<int>(result));
+    }
     value = MakeAsyncFsResultValue(async_req, result);
   }
 
@@ -1476,6 +1493,20 @@ void FinishFileHandleClose(FileHandleCloseReq* close_req, int result) {
   if (close_req == nullptr) return;
   FileHandleWrap* wrap = close_req->wrap;
   napi_env env = close_req->env;
+
+  if (env != nullptr && UbiWorkerEnvStopRequested(env)) {
+    if (wrap != nullptr) {
+      wrap->closing = false;
+      wrap->closed = true;
+      wrap->fd = -1;
+      wrap->closing_deferred = nullptr;
+      ResetRef(env, &wrap->closing_promise_ref);
+      ReleaseFileHandleRef(wrap);
+    }
+    uv_fs_req_cleanup(&close_req->req);
+    delete close_req;
+    return;
+  }
 
   if (wrap != nullptr) {
     wrap->closing = false;
@@ -2685,6 +2716,7 @@ napi_value FsOpen(napi_env env, napi_callback_info info) {
     if (async_req != nullptr) {
       async_req->syscall = "open";
       async_req->result_kind = AsyncFsResultKind::kInt64;
+      async_req->track_unmanaged_fd = true;
       async_req->path_storage = std::move(path);
 
       uv_loop_t* loop = UbiGetEnvLoop(env);
@@ -2717,6 +2749,7 @@ napi_value FsOpen(napi_env env, napi_callback_info info) {
     return Undefined(env);
   }
 
+  UbiWorkerEnvAddUnmanagedFd(env, static_cast<int>(GetInt64OrDefault(env, out, -1)));
   if (req_kind == ReqKind::kPromise) return MakeResolvedPromise(env, out);
   if (req_kind == ReqKind::kCallback) {
     CompleteReq(env, req_kind, req, oncomplete, nullptr, out);
@@ -2771,6 +2804,8 @@ napi_value FsClose(napi_env env, napi_callback_info info) {
   napi_value req = argc >= 2 ? argv[1] : nullptr;
   napi_value oncomplete = nullptr;
   ReqKind req_kind = ParseReq(env, req, &oncomplete);
+
+  UbiWorkerEnvRemoveUnmanagedFd(env, fd);
 
   napi_value call_argv[1] = {argc >= 1 ? argv[0] : Undefined(env)};
   napi_value out = nullptr;

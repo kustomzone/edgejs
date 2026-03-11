@@ -7694,6 +7694,19 @@ napi_value SignJobRun(napi_env env, napi_callback_info info) {
     InvokeJobOnDone(env, this_arg, result);
     return Undefined(env);
   }
+  if (job_mode != kSignJobModeSign) {
+    return result;
+  }
+
+  napi_value err = nullptr;
+  napi_value signature = nullptr;
+  if (result != nullptr) {
+    napi_get_element(env, result, 0, &err);
+    napi_get_element(env, result, 1, &signature);
+  }
+  if (err == nullptr || IsUndefined(env, err)) {
+    return BuildArrayBufferJobResult(env, signature);
+  }
   return result;
 }
 

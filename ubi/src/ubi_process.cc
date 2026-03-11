@@ -2005,6 +2005,41 @@ napi_value StringifyReportObject(napi_env env, napi_value report_obj, bool compa
   return json_string;
 }
 
+bool ParseJsonObject(napi_env env, const std::string& json, napi_value* out) {
+  if (out == nullptr) return false;
+  *out = nullptr;
+  napi_value global = nullptr;
+  napi_value json_obj = nullptr;
+  napi_value parse_fn = nullptr;
+  napi_value json_string = nullptr;
+  if (json.empty() ||
+      napi_get_global(env, &global) != napi_ok || global == nullptr ||
+      napi_get_named_property(env, global, "JSON", &json_obj) != napi_ok || json_obj == nullptr ||
+      napi_get_named_property(env, json_obj, "parse", &parse_fn) != napi_ok || parse_fn == nullptr ||
+      napi_create_string_utf8(env, json.c_str(), json.size(), &json_string) != napi_ok ||
+      json_string == nullptr) {
+    return false;
+  }
+  napi_value argv[1] = {json_string};
+  return napi_call_function(env, json_obj, parse_fn, 1, argv, out) == napi_ok && *out != nullptr;
+}
+
+void AppendWorkerReportsToReport(napi_env env, napi_value workers) {
+  if (workers == nullptr) return;
+  const std::vector<UbiWorkerReportEntry> reports = UbiWorkerCollectReports(env);
+  uint32_t index = 0;
+  for (const auto& entry : reports) {
+    napi_value worker_report = nullptr;
+    if (!ParseJsonObject(env, entry.json, &worker_report) || worker_report == nullptr) continue;
+    napi_value header = nullptr;
+    if (napi_get_named_property(env, worker_report, "header", &header) == napi_ok && header != nullptr) {
+      SetNamedString(env, header, "event", "Worker thread subreport [" + entry.thread_name + "]");
+      SetNamedInt32(env, header, "threadId", entry.thread_id);
+    }
+    napi_set_element(env, workers, index++, worker_report);
+  }
+}
+
 napi_value BuildReportObject(napi_env env,
                              const std::string& event_message,
                              const std::string& trigger,
@@ -2050,7 +2085,9 @@ napi_value BuildReportObject(napi_env env,
       "dumpEventTimeStamp",
       std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(now_tp.time_since_epoch()).count()));
   SetNamedInt32(env, header, "processId", static_cast<int32_t>(uv_os_getpid()));
-  SetNamedInt32(env, header, "threadId", static_cast<int32_t>(uv_os_getpid()));
+  const int32_t thread_id =
+      UbiWorkerEnvIsMainThread(env) ? static_cast<int32_t>(uv_os_getpid()) : UbiWorkerEnvThreadId(env);
+  SetNamedInt32(env, header, "threadId", thread_id);
   SetNamedInt32(env, header, "wordSize", static_cast<int32_t>(sizeof(void*) * 8));
 
   napi_value command_line = nullptr;
@@ -2146,6 +2183,7 @@ napi_value BuildReportObject(napi_env env,
 
   napi_value workers = nullptr;
   napi_create_array(env, &workers);
+  AppendWorkerReportsToReport(env, workers);
   SetNamedValue(env, report, "workers", workers);
 
   if (state == nullptr || !state->exclude_env) {
