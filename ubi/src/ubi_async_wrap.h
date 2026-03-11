@@ -26,6 +26,7 @@ enum UbiAsyncProviderType : int32_t {
   kUbiProviderWriteWrap = 52,
   kUbiProviderZlib = 53,
   kUbiProviderWorker = 54,
+  kUbiProviderTlsWrap = 55,
 };
 
 int64_t UbiAsyncWrapNextId(napi_env env);

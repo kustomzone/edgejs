@@ -15,6 +15,7 @@
 #include "ubi_async_wrap.h"
 #include "ubi_runtime.h"
 #include "ubi_pipe_wrap.h"
+#include "ubi_stream_base.h"
 #include "ubi_tcp_wrap.h"
 #include "ubi_stream_listener.h"
 
@@ -63,7 +64,7 @@ struct ConnectionsList {
 struct Parser {
   napi_env env = nullptr;
   napi_ref wrapper_ref = nullptr;
-  uv_stream_t* consumed_stream = nullptr;
+  UbiStreamBase* consumed_stream = nullptr;
   UbiStreamListener consumed_listener{};
   llhttp_t parser{};
   llhttp_settings_t settings{};
@@ -201,12 +202,7 @@ void ParserConsumedListenerOnClose(UbiStreamListener* listener) {
 
 void ClearConsumedStreamBinding(Parser* p) {
   if (p == nullptr || p->consumed_stream == nullptr) return;
-  bool detached =
-      UbiTcpWrapRemoveStreamListener(p->consumed_stream, &p->consumed_listener);
-  if (!detached) {
-    (void)UbiPipeWrapRemoveStreamListener(p->consumed_stream,
-                                          &p->consumed_listener);
-  }
+  (void)UbiStreamBaseRemoveListener(p->consumed_stream, &p->consumed_listener);
   p->consumed_stream = nullptr;
   p->consumed_listener.previous = nullptr;
 }
@@ -889,15 +885,9 @@ napi_value ParserConsume(napi_env env, napi_callback_info info) {
   if (napi_get_cb_info(env, info, &argc, argv, &self, nullptr) == napi_ok) {
     ClearConsumedStreamBinding(p);
     if (argc >= 1 && argv[0] != nullptr && self != nullptr) {
-      uv_stream_t* stream = UbiTcpWrapGetStream(env, argv[0]);
-      if (stream == nullptr) {
-        stream = UbiPipeWrapGetStream(env, argv[0]);
-      }
-      if (stream != nullptr) {
-        if (UbiTcpWrapPushStreamListener(stream, &p->consumed_listener) ||
-            UbiPipeWrapPushStreamListener(stream, &p->consumed_listener)) {
-          p->consumed_stream = stream;
-        }
+      UbiStreamBase* stream = UbiStreamBaseFromValue(env, argv[0]);
+      if (stream != nullptr && UbiStreamBasePushListener(stream, &p->consumed_listener)) {
+        p->consumed_stream = stream;
       }
     }
   }

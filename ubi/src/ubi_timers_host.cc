@@ -295,24 +295,20 @@ void EnsureCheckHandle(TimersHostState* st) {
                          }
                          return;
                        }
-                       do {
-                         (void)UbiRuntimePlatformDrainImmediateTasks(state->env);
-                         if (state->env == nullptr) {
-                           return;
-                         }
-                         bool pending = false;
-                         if (napi_is_exception_pending(state->env, &pending) == napi_ok && pending) {
-                           StopLoopOnJsError(state);
-                           return;
-                         }
-                         if (ImmediateCount(state) == 0) {
-                           continue;
-                         }
+                       (void)UbiRuntimePlatformDrainImmediateTasks(state->env);
+                       if (state->env == nullptr) {
+                         return;
+                       }
+                       bool pending = false;
+                       if (napi_is_exception_pending(state->env, &pending) == napi_ok && pending) {
+                         StopLoopOnJsError(state);
+                         return;
+                       }
+                       if (ImmediateCount(state) != 0) {
                          if (!CallImmediateCallback(state)) {
                            return;
                          }
-                       } while (state->env != nullptr &&
-                                (ImmediateHasOutstanding(state) || HasNativeImmediateTasks(state)));
+                       }
 
                        if (ImmediateRefCount(state) == 0 && !HasRefedNativeImmediateTasks(state)) {
                          ApplyImmediateRefState(state, false);

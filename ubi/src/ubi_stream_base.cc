@@ -60,6 +60,8 @@ const char* ActiveResourceNameForProvider(int32_t provider_type) {
       return "PipeServerWrap";
     case kUbiProviderJsStream:
       return "JSSTREAM";
+    case kUbiProviderTlsWrap:
+      return "TLSWrap";
     default:
       return "STREAM";
   }

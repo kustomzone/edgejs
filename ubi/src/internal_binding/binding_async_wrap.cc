@@ -582,6 +582,7 @@ napi_value CreateProviders(napi_env env) {
   SetNamedUint32(env, out, "UDPWRAP", 44);
   SetNamedUint32(env, out, "WRITEWRAP", 52);
   SetNamedUint32(env, out, "ZLIB", 53);
+  SetNamedUint32(env, out, "TLSWRAP", 55);
   return out;
 }
 
