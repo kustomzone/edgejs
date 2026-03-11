@@ -1,5 +1,6 @@
 #include "internal/napi_v8_env.h"
 #include "node_api_types.h"
+#include "unofficial_napi_error_utils.h"
 
 #include <climits>
 #include <atomic>
@@ -317,20 +318,6 @@ inline bool CheckValue(napi_env env, napi_value value) {
 void ClearLastException(napi_env env) {
   if (env == nullptr) return;
   env->last_exception.Reset();
-  env->last_exception_message.Reset();
-}
-
-void ClearLastClearedException(napi_env env) {
-  if (env == nullptr) return;
-  env->last_cleared_exception.Reset();
-  env->last_cleared_exception_message.Reset();
-}
-
-bool MatchesLastClearedException(napi_env env, v8::Local<v8::Value> exception) {
-  if (env == nullptr || exception.IsEmpty() || env->last_cleared_exception.IsEmpty()) {
-    return false;
-  }
-  return env->last_cleared_exception.Get(env->isolate)->StrictEquals(exception);
 }
 
 void SetLastException(napi_env env,
@@ -338,23 +325,12 @@ void SetLastException(napi_env env,
                       v8::Local<v8::Message> message = v8::Local<v8::Message>()) {
   if (env == nullptr) return;
   env->last_exception.Reset();
-  env->last_exception_message.Reset();
   if (exception.IsEmpty()) return;
 
   env->last_exception.Reset(env->isolate, exception);
   if (!message.IsEmpty()) {
-    env->last_exception_message.Reset(env->isolate, message);
-    ClearLastClearedException(env);
-    return;
-  }
-
-  if (MatchesLastClearedException(env, exception)) {
-    if (!env->last_cleared_exception_message.IsEmpty()) {
-      env->last_exception_message.Reset(
-          env->isolate, env->last_cleared_exception_message.Get(env->isolate));
-    }
-  } else {
-    ClearLastClearedException(env);
+    unofficial_napi_internal::SetArrowMessage(
+        env->isolate, env->context(), exception, message);
   }
 }
 
@@ -2836,12 +2812,6 @@ napi_status NAPI_CDECL napi_get_and_clear_last_exception(napi_env env,
   if (!CheckEnv(env) || result == nullptr) return napi_invalid_arg;
   if (env->last_exception.IsEmpty()) return napi_generic_failure;
   v8::Local<v8::Value> ex = env->last_exception.Get(env->isolate);
-  ClearLastClearedException(env);
-  env->last_cleared_exception.Reset(env->isolate, ex);
-  if (!env->last_exception_message.IsEmpty()) {
-    env->last_cleared_exception_message.Reset(
-        env->isolate, env->last_exception_message.Get(env->isolate));
-  }
   ClearLastException(env);
   *result = napi_v8_wrap_value(env, ex);
   return (*result == nullptr) ? napi_generic_failure : napi_ok;

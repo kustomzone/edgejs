@@ -1,3 +1,7 @@
+#include <algorithm>
+#include <string>
+
+#include "../../src/internal/napi_v8_env.h"
 #include "test_env.h"
 #include "upstream_js_test.h"
 #include "unofficial_napi.h"
@@ -17,6 +21,29 @@ std::string ValueToUtf8(napi_env env, napi_value value) {
   if (napi_get_value_string_utf8(env, value, out.data(), out.size(), &copied) != napi_ok) return {};
   out.resize(copied);
   return out;
+}
+
+std::string GetArrowMessage(napi_env env, napi_value exception) {
+  if (env == nullptr || exception == nullptr) return {};
+
+  v8::Isolate* isolate = env->isolate;
+  v8::HandleScope handle_scope(isolate);
+  v8::Local<v8::Context> context = env->context();
+  v8::Local<v8::Value> raw = napi_v8_unwrap_value(exception);
+  if (raw.IsEmpty() || !raw->IsObject()) return {};
+
+  v8::Local<v8::String> key_name =
+      v8::String::NewFromUtf8(isolate, "node:arrowMessage", v8::NewStringType::kInternalized)
+          .ToLocalChecked();
+  v8::Local<v8::Private> arrow_key = v8::Private::ForApi(isolate, key_name);
+  v8::Local<v8::Value> arrow;
+  if (!raw.As<v8::Object>()->GetPrivate(context, arrow_key).ToLocal(&arrow) || arrow.IsEmpty()) {
+    return {};
+  }
+
+  napi_value wrapped_arrow = napi_v8_wrap_value(env, arrow);
+  if (wrapped_arrow == nullptr) return {};
+  return ValueToUtf8(env, wrapped_arrow);
 }
 
 }  // namespace
@@ -41,17 +68,7 @@ TEST_F(Test14Exception, PortedCoreFlow) {
       s, std::string(NAPI_TESTS_ROOT_PATH) + "/js-native-api/test_exception/test.js"));
 }
 
-TEST_F(Test14Exception, GetAndClearPendingExceptionNoPending) {
-  EnvScope s(runtime_.get());
-
-  unofficial_napi_pending_exception_info info = {};
-  ASSERT_EQ(unofficial_napi_get_and_clear_pending_exception(s.env, &info), napi_ok);
-  EXPECT_FALSE(info.has_exception);
-  EXPECT_EQ(info.exception, nullptr);
-  EXPECT_EQ(info.exception_line, nullptr);
-}
-
-TEST_F(Test14Exception, GetAndClearPendingExceptionCapturesLineAndDecoratesStack) {
+TEST_F(Test14Exception, SetLastExceptionStoresArrowMessageOnThrownError) {
   EnvScope s(runtime_.get());
 
   napi_value script = nullptr;
@@ -62,19 +79,13 @@ TEST_F(Test14Exception, GetAndClearPendingExceptionCapturesLineAndDecoratesStack
   napi_value result = nullptr;
   ASSERT_EQ(napi_run_script(s.env, script, &result), napi_pending_exception);
 
-  unofficial_napi_pending_exception_info info = {};
-  ASSERT_EQ(unofficial_napi_get_and_clear_pending_exception(s.env, &info), napi_ok);
-  ASSERT_TRUE(info.has_exception);
-  ASSERT_NE(info.exception, nullptr);
-  ASSERT_NE(info.exception_line, nullptr);
-  EXPECT_NE(ValueToUtf8(s.env, info.exception_line).find("throw new Error('boom')"), std::string::npos);
-
-  napi_value stack = nullptr;
-  ASSERT_EQ(napi_get_named_property(s.env, info.exception, "stack", &stack), napi_ok);
-  EXPECT_NE(ValueToUtf8(s.env, stack).find("throw new Error('boom')"), std::string::npos);
+  napi_value exception = nullptr;
+  ASSERT_EQ(napi_get_and_clear_last_exception(s.env, &exception), napi_ok);
+  ASSERT_NE(exception, nullptr);
+  EXPECT_NE(GetArrowMessage(s.env, exception).find("throw new Error('boom')"), std::string::npos);
 }
 
-TEST_F(Test14Exception, GetAndClearPendingExceptionPreservesMessageAcrossRethrow) {
+TEST_F(Test14Exception, SetLastExceptionPreservesArrowMessageAcrossSameErrorRethrow) {
   EnvScope s(runtime_.get());
 
   napi_value script = nullptr;
@@ -85,20 +96,16 @@ TEST_F(Test14Exception, GetAndClearPendingExceptionPreservesMessageAcrossRethrow
   napi_value result = nullptr;
   ASSERT_EQ(napi_run_script(s.env, script, &result), napi_pending_exception);
 
-  unofficial_napi_pending_exception_info first = {};
-  ASSERT_EQ(unofficial_napi_get_and_clear_pending_exception(s.env, &first), napi_ok);
-  ASSERT_TRUE(first.has_exception);
-  ASSERT_NE(first.exception, nullptr);
-  ASSERT_NE(first.exception_line, nullptr);
-  const std::string first_line = ValueToUtf8(s.env, first.exception_line);
+  napi_value first = nullptr;
+  ASSERT_EQ(napi_get_and_clear_last_exception(s.env, &first), napi_ok);
+  ASSERT_NE(first, nullptr);
+  const std::string first_line = GetArrowMessage(s.env, first);
   ASSERT_FALSE(first_line.empty());
 
-  ASSERT_EQ(napi_throw(s.env, first.exception), napi_pending_exception);
+  ASSERT_EQ(napi_throw(s.env, first), napi_pending_exception);
 
-  unofficial_napi_pending_exception_info second = {};
-  ASSERT_EQ(unofficial_napi_get_and_clear_pending_exception(s.env, &second), napi_ok);
-  ASSERT_TRUE(second.has_exception);
-  ASSERT_NE(second.exception, nullptr);
-  ASSERT_NE(second.exception_line, nullptr);
-  EXPECT_EQ(ValueToUtf8(s.env, second.exception_line), first_line);
+  napi_value second = nullptr;
+  ASSERT_EQ(napi_get_and_clear_last_exception(s.env, &second), napi_ok);
+  ASSERT_NE(second, nullptr);
+  EXPECT_EQ(GetArrowMessage(s.env, second), first_line);
 }

@@ -111,12 +111,6 @@ typedef struct {
   int32_t end_column;
 } unofficial_napi_error_source_positions;
 
-typedef struct {
-  bool has_exception;
-  napi_value exception;
-  napi_value exception_line;
-} unofficial_napi_pending_exception_info;
-
 // Unofficial helpers for Node-style exception/message parity.
 // These expose engine message/source metadata that is not available in the
 // public Node-API.
@@ -124,10 +118,6 @@ NAPI_EXTERN napi_status unofficial_napi_get_error_source_positions(
     napi_env env,
     napi_value error,
     unofficial_napi_error_source_positions* out);
-
-NAPI_EXTERN napi_status unofficial_napi_get_and_clear_pending_exception(
-    napi_env env,
-    unofficial_napi_pending_exception_info* out);
 
 // Unofficial helper used by module_wrap parity paths to tell the runtime's
 // PromiseReject callback machinery that a rejected promise is being handled

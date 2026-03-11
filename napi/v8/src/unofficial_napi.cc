@@ -60,18 +60,6 @@ std::unordered_map<v8::Isolate*, v8::Global<v8::Function>> g_promise_reject_call
 std::unordered_map<v8::Isolate*, std::array<v8::Global<v8::Function>, 4>> g_promise_hooks;
 std::unordered_map<v8::ArrayBuffer::Allocator*, void*> g_tracking_allocators;
 
-void ClearActiveExceptionState(napi_env env) {
-  if (env == nullptr) return;
-  env->last_exception.Reset();
-  env->last_exception_message.Reset();
-}
-
-void ClearClearedExceptionState(napi_env env) {
-  if (env == nullptr) return;
-  env->last_cleared_exception.Reset();
-  env->last_cleared_exception_message.Reset();
-}
-
 struct FatalErrorCallbacks {
   unofficial_napi_fatal_error_callback fatal = nullptr;
   unofficial_napi_oom_error_callback oom = nullptr;
@@ -1473,57 +1461,6 @@ napi_status NAPI_CDECL unofficial_napi_get_error_source_positions(
     napi_value error,
     unofficial_napi_error_source_positions* out) {
   return unofficial_napi_internal::GetErrorSourcePositions(env, error, out);
-}
-
-napi_status NAPI_CDECL unofficial_napi_get_and_clear_pending_exception(
-    napi_env env,
-    unofficial_napi_pending_exception_info* out) {
-  if (env == nullptr || out == nullptr) return napi_invalid_arg;
-
-  out->has_exception = false;
-  out->exception = nullptr;
-  out->exception_line = nullptr;
-
-  if (env->last_exception.IsEmpty()) {
-    return napi_ok;
-  }
-
-  v8::Isolate* isolate = env->isolate;
-  v8::HandleScope handle_scope(isolate);
-  v8::Local<v8::Context> context = env->context();
-  v8::Local<v8::Value> exception = env->last_exception.Get(isolate);
-  v8::Local<v8::Message> message;
-  if (!env->last_exception_message.IsEmpty()) {
-    message = env->last_exception_message.Get(isolate);
-  } else if (!exception.IsEmpty()) {
-    message = v8::Exception::CreateMessage(isolate, exception);
-  }
-
-  ClearClearedExceptionState(env);
-  env->last_cleared_exception.Reset(isolate, exception);
-  if (!message.IsEmpty()) {
-    env->last_cleared_exception_message.Reset(isolate, message);
-  }
-  ClearActiveExceptionState(env);
-
-  out->has_exception = true;
-  out->exception = napi_v8_wrap_value(env, exception);
-  if (out->exception == nullptr) return napi_generic_failure;
-
-  if (!message.IsEmpty()) {
-    unofficial_napi_internal::AttachSyntaxArrowMessage(isolate, context, exception, message);
-    const std::string line =
-        unofficial_napi_internal::BuildSyntaxArrowMessage(isolate, context, message);
-    if (!line.empty()) {
-      if (napi_create_string_utf8(env, line.c_str(), line.size(), &out->exception_line) != napi_ok ||
-          out->exception_line == nullptr) {
-        return napi_generic_failure;
-      }
-      return napi_ok;
-    }
-  }
-
-  return napi_get_undefined(env, &out->exception_line);
 }
 
 napi_status NAPI_CDECL unofficial_napi_mark_promise_as_handled(

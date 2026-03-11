@@ -12,6 +12,11 @@ std::string BuildSyntaxArrowMessage(v8::Isolate* isolate,
                                     v8::Local<v8::Context> context,
                                     v8::Local<v8::Message> message);
 
+void SetArrowMessage(v8::Isolate* isolate,
+                     v8::Local<v8::Context> context,
+                     v8::Local<v8::Value> exception,
+                     v8::Local<v8::Message> message);
+
 void AttachSyntaxArrowMessage(v8::Isolate* isolate,
                               v8::Local<v8::Context> context,
                               v8::Local<v8::Value> exception,

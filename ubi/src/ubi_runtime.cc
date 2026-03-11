@@ -316,6 +316,8 @@ std::string GetNamedStringProperty(napi_env env, napi_value object, const char* 
   return NapiValueToUtf8(env, value);
 }
 
+napi_value GetRuntimeInternalBinding(napi_env env, napi_value global);
+
 std::string GetAssertThrowsExceptionLineForStderr(napi_env env, napi_value exception) {
   if (env == nullptr || exception == nullptr) return {};
   if (GetNamedStringProperty(env, exception, "code") != "ERR_ASSERTION") {
@@ -386,38 +388,11 @@ struct PendingExceptionInfo {
   std::string exception_line;
 };
 
-bool TakePendingExceptionInfo(napi_env env, PendingExceptionInfo* out) {
-  if (env == nullptr || out == nullptr) return false;
-  *out = {};
-
-  unofficial_napi_pending_exception_info pending = {};
-  if (unofficial_napi_get_and_clear_pending_exception(env, &pending) != napi_ok) {
-    return false;
-  }
-
-  out->has_exception = pending.has_exception;
-  out->exception = pending.exception;
-  if (!pending.has_exception || pending.exception_line == nullptr) {
-    return true;
-  }
-
-  napi_valuetype type = napi_undefined;
-  if (napi_typeof(env, pending.exception_line, &type) != napi_ok || type == napi_undefined) {
-    return true;
-  }
-  out->exception_line = NapiValueToUtf8(env, pending.exception_line);
-  return true;
-}
-
-std::string GetExceptionLineForStderr(napi_env env, napi_value exception) {
-  const std::string internal_assert_line = GetInternalAssertExceptionLineForStderr(env, exception);
-  if (!internal_assert_line.empty()) {
-    return internal_assert_line;
-  }
-
-  const std::string assert_throws_line = GetAssertThrowsExceptionLineForStderr(env, exception);
-  if (!assert_throws_line.empty()) {
-    return assert_throws_line;
+std::string GetErrorSourceLine(napi_env env,
+                               napi_value exception,
+                               bool align_internal_assert = false) {
+  if (env == nullptr || exception == nullptr) {
+    return {};
   }
 
   unofficial_napi_error_source_positions positions = {};
@@ -436,7 +411,7 @@ std::string GetExceptionLineForStderr(napi_env env, napi_value exception) {
 
   int32_t start_column = positions.start_column;
   int32_t end_column = positions.end_column;
-  if (script_resource_name == "node:internal/assert") {
+  if (align_internal_assert && script_resource_name == "node:internal/assert") {
     start_column = 0;
     while (start_column < static_cast<int32_t>(source_line.size()) &&
            (source_line[static_cast<size_t>(start_column)] == ' ' ||
@@ -453,6 +428,108 @@ std::string GetExceptionLineForStderr(napi_env env, napi_value exception) {
   return script_resource_name + ":" + std::to_string(positions.line_number) + "\n" +
          source_line + "\n" +
          underline + "\n";
+}
+
+std::string GetArrowMessageFromError(napi_env env, napi_value exception) {
+  if (env == nullptr || exception == nullptr) return {};
+
+  napi_value global = nullptr;
+  if (napi_get_global(env, &global) != napi_ok || global == nullptr) {
+    return {};
+  }
+
+  napi_value internal_binding = GetRuntimeInternalBinding(env, global);
+  if (internal_binding == nullptr) return {};
+
+  napi_value util_name = nullptr;
+  if (napi_create_string_utf8(env, "util", NAPI_AUTO_LENGTH, &util_name) != napi_ok || util_name == nullptr) {
+    return {};
+  }
+
+  napi_value util_binding = nullptr;
+  napi_value argv[1] = {util_name};
+  if (napi_call_function(env, global, internal_binding, 1, argv, &util_binding) != napi_ok ||
+      util_binding == nullptr) {
+    return {};
+  }
+
+  napi_value private_symbols = nullptr;
+  if (napi_get_named_property(env, util_binding, "privateSymbols", &private_symbols) != napi_ok ||
+      private_symbols == nullptr) {
+    return {};
+  }
+
+  napi_value arrow_symbol = nullptr;
+  if (napi_get_named_property(env,
+                              private_symbols,
+                              "arrow_message_private_symbol",
+                              &arrow_symbol) != napi_ok ||
+      arrow_symbol == nullptr) {
+    return {};
+  }
+
+  napi_value arrow_message = nullptr;
+  if (napi_get_property(env, exception, arrow_symbol, &arrow_message) != napi_ok || arrow_message == nullptr) {
+    return {};
+  }
+
+  napi_valuetype type = napi_undefined;
+  if (napi_typeof(env, arrow_message, &type) != napi_ok ||
+      type == napi_undefined ||
+      type == napi_null) {
+    return {};
+  }
+
+  return NapiValueToUtf8(env, arrow_message);
+}
+
+bool TakePendingExceptionInfo(napi_env env,
+                              PendingExceptionInfo* out,
+                              napi_value prior_exception = nullptr,
+                              const std::string& prior_exception_line = {}) {
+  if (env == nullptr || out == nullptr) return false;
+  *out = {};
+
+  bool has_pending = false;
+  if (napi_is_exception_pending(env, &has_pending) != napi_ok) {
+    return false;
+  }
+  if (!has_pending) {
+    return true;
+  }
+
+  if (napi_get_and_clear_last_exception(env, &out->exception) != napi_ok || out->exception == nullptr) {
+    return false;
+  }
+
+  out->has_exception = true;
+  if (prior_exception != nullptr && !prior_exception_line.empty()) {
+    bool same_exception = false;
+    if (napi_strict_equals(env, out->exception, prior_exception, &same_exception) == napi_ok &&
+        same_exception) {
+      out->exception_line = prior_exception_line;
+      return true;
+    }
+  }
+
+  out->exception_line = GetArrowMessageFromError(env, out->exception);
+  if (out->exception_line.empty()) {
+    out->exception_line = GetErrorSourceLine(env, out->exception);
+  }
+  return true;
+}
+
+std::string GetExceptionLineForStderr(napi_env env, napi_value exception) {
+  const std::string internal_assert_line = GetInternalAssertExceptionLineForStderr(env, exception);
+  if (!internal_assert_line.empty()) {
+    return internal_assert_line;
+  }
+
+  const std::string assert_throws_line = GetAssertThrowsExceptionLineForStderr(env, exception);
+  if (!assert_throws_line.empty()) {
+    return assert_throws_line;
+  }
+  return GetErrorSourceLine(env, exception, true);
 }
 
 void StripBuiltinModuleCompileFrame(std::string* message) {
@@ -964,10 +1041,12 @@ bool DispatchUncaughtException(napi_env env,
                                napi_value* effective_exception_out = nullptr,
                                int* fatal_exit_code_out = nullptr,
                                std::string* effective_exception_line_out = nullptr) {
+  const std::string prior_exception_line =
+      effective_exception_line_out != nullptr ? *effective_exception_line_out : "";
   if (handled_out != nullptr) *handled_out = false;
   if (effective_exception_out != nullptr) *effective_exception_out = exception;
   if (fatal_exit_code_out != nullptr) *fatal_exit_code_out = -1;
-  if (effective_exception_line_out != nullptr) effective_exception_line_out->clear();
+  if (effective_exception_line_out != nullptr) *effective_exception_line_out = prior_exception_line;
   if (exception == nullptr) return false;
 
   napi_value global = nullptr;
@@ -1011,7 +1090,9 @@ bool DispatchUncaughtException(napi_env env,
     }
 
     PendingExceptionInfo pending = {};
-    if (TakePendingExceptionInfo(env, &pending) && pending.has_exception && pending.exception != nullptr) {
+    if (TakePendingExceptionInfo(env, &pending, exception, prior_exception_line) &&
+        pending.has_exception &&
+        pending.exception != nullptr) {
       if (effective_exception_out != nullptr) {
         *effective_exception_out = pending.exception;
       }

@@ -58,9 +58,6 @@ struct napi_env__ {
   napi_extended_error_info last_error{};
   std::string last_error_message;
   v8::Global<v8::Value> last_exception;
-  v8::Global<v8::Message> last_exception_message;
-  v8::Global<v8::Value> last_cleared_exception;
-  v8::Global<v8::Message> last_cleared_exception_message;
   v8::Global<v8::Private> wrap_private_key;
   v8::Global<v8::Private> wrap_ref_private_key;
   v8::Global<v8::Private> wrap_finalizer_private_key;

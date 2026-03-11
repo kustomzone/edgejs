@@ -85,6 +85,39 @@ void AttachSyntaxArrowMessage(v8::Isolate* isolate,
   v8::Local<v8::Private> arrow_key = ApiPrivate(isolate, "node:arrowMessage");
   v8::Local<v8::Private> decorated_key = ApiPrivate(isolate, "node:decorated");
 
+  SetArrowMessage(isolate, context, exception, message);
+
+  v8::Local<v8::Value> decorated;
+  const bool already_decorated =
+      err_obj->GetPrivate(context, decorated_key).ToLocal(&decorated) && decorated->IsTrue();
+  if (already_decorated) return;
+
+  v8::Local<v8::Value> existing_arrow;
+  if (!err_obj->GetPrivate(context, arrow_key).ToLocal(&existing_arrow) || !existing_arrow->IsString()) {
+    return;
+  }
+
+  v8::Local<v8::Value> stack_value;
+  if (!err_obj->Get(context, OneByteString(isolate, "stack")).ToLocal(&stack_value) || !stack_value->IsString()) {
+    return;
+  }
+
+  v8::Local<v8::String> decorated_stack =
+      v8::String::Concat(isolate, existing_arrow.As<v8::String>(), stack_value.As<v8::String>());
+  if (!err_obj->Set(context, OneByteString(isolate, "stack"), decorated_stack).FromMaybe(false)) {
+    return;
+  }
+  (void)err_obj->SetPrivate(context, decorated_key, v8::True(isolate));
+}
+
+void SetArrowMessage(v8::Isolate* isolate,
+                     v8::Local<v8::Context> context,
+                     v8::Local<v8::Value> exception,
+                     v8::Local<v8::Message> message) {
+  if (exception.IsEmpty() || !exception->IsObject() || message.IsEmpty()) return;
+
+  v8::Local<v8::Object> err_obj = exception.As<v8::Object>();
+  v8::Local<v8::Private> arrow_key = ApiPrivate(isolate, "node:arrowMessage");
   v8::Local<v8::Value> existing_arrow;
   if (err_obj->GetPrivate(context, arrow_key).ToLocal(&existing_arrow) && existing_arrow->IsString()) {
     return;
@@ -98,23 +131,6 @@ void AttachSyntaxArrowMessage(v8::Isolate* isolate,
     return;
   }
   (void)err_obj->SetPrivate(context, arrow_key, arrow_v8);
-
-  v8::Local<v8::Value> decorated;
-  const bool already_decorated =
-      err_obj->GetPrivate(context, decorated_key).ToLocal(&decorated) && decorated->IsTrue();
-  if (already_decorated) return;
-
-  v8::Local<v8::Value> stack_value;
-  if (!err_obj->Get(context, OneByteString(isolate, "stack")).ToLocal(&stack_value) || !stack_value->IsString()) {
-    return;
-  }
-
-  v8::Local<v8::String> decorated_stack =
-      v8::String::Concat(isolate, arrow_v8, stack_value.As<v8::String>());
-  if (!err_obj->Set(context, OneByteString(isolate, "stack"), decorated_stack).FromMaybe(false)) {
-    return;
-  }
-  (void)err_obj->SetPrivate(context, decorated_key, v8::True(isolate));
 }
 
 napi_status GetErrorSourcePositions(napi_env env,
