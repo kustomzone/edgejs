@@ -42,12 +42,15 @@ struct UbiStreamBase {
   bool delete_on_close = false;
   bool destroy_notified = false;
   bool async_init_emitted = false;
+  bool attached = false;
   uint64_t bytes_read = 0;
   uint64_t bytes_written = 0;
   int64_t async_id = -1;
   int32_t provider_type = 0;
   void* active_handle_token = nullptr;
   const UbiStreamBaseOps* ops = nullptr;
+  UbiStreamBase* prev = nullptr;
+  UbiStreamBase* next = nullptr;
 };
 
 void UbiStreamBaseInit(UbiStreamBase* base,
@@ -78,6 +81,8 @@ void UbiStreamBaseSetCloseCallback(UbiStreamBase* base, napi_value close_callbac
 bool UbiStreamBaseHasRef(UbiStreamBase* base);
 void UbiStreamBaseRef(UbiStreamBase* base);
 void UbiStreamBaseUnref(UbiStreamBase* base);
+bool UbiStreamBaseEnvCleanupStarted(napi_env env);
+void UbiStreamBaseRunEnvCleanup(napi_env env);
 
 napi_value UbiStreamBaseGetOnRead(UbiStreamBase* base);
 napi_value UbiStreamBaseSetOnRead(UbiStreamBase* base, napi_value value);

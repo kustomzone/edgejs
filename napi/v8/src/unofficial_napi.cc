@@ -1454,12 +1454,12 @@ napi_status NAPI_CDECL unofficial_napi_create_env_with_options(
 
   auto* scope = new (std::nothrow) UnofficialEnvScope(isolate, allocator);
   if (scope == nullptr) {
+    isolate->Dispose();
     {
       std::lock_guard<std::mutex> lock(g_runtime_mu);
       g_tracking_allocators.erase(allocator);
+      platform->UnregisterIsolate(isolate);
     }
-    platform->UnregisterIsolate(isolate);
-    isolate->Dispose();
     delete allocator;
     ReleaseRuntime();
     return napi_generic_failure;
@@ -1471,12 +1471,12 @@ napi_status NAPI_CDECL unofficial_napi_create_env_with_options(
   status = unofficial_napi_create_env_from_context(context, module_api_version, &scope->env);
   if (status != napi_ok || scope->env == nullptr) {
     delete scope;
+    isolate->Dispose();
     {
       std::lock_guard<std::mutex> lock(g_runtime_mu);
       g_tracking_allocators.erase(allocator);
+      platform->UnregisterIsolate(isolate);
     }
-    platform->UnregisterIsolate(isolate);
-    isolate->Dispose();
     delete allocator;
     ReleaseRuntime();
     return (status == napi_ok) ? napi_generic_failure : status;
@@ -1501,6 +1501,9 @@ napi_status NAPI_CDECL unofficial_napi_release_env(void* scope_ptr) {
   TrackingArrayBufferAllocator* allocator = scope->allocator;
   delete scope;
 
+  if (isolate != nullptr) {
+    isolate->Dispose();
+  }
   {
     std::lock_guard<std::mutex> lock(g_runtime_mu);
     if (g_runtime.platform != nullptr && isolate != nullptr) {
@@ -1509,9 +1512,6 @@ napi_status NAPI_CDECL unofficial_napi_release_env(void* scope_ptr) {
     if (allocator != nullptr) {
       g_tracking_allocators.erase(allocator);
     }
-  }
-  if (isolate != nullptr) {
-    isolate->Dispose();
   }
   delete allocator;
   ReleaseRuntime();
@@ -1888,6 +1888,30 @@ napi_status NAPI_CDECL unofficial_napi_get_error_source_positions(
     napi_value error,
     unofficial_napi_error_source_positions* out) {
   return unofficial_napi_internal::GetErrorSourcePositions(env, error, out);
+}
+
+napi_status NAPI_CDECL unofficial_napi_preserve_error_source_message(
+    napi_env env,
+    napi_value error) {
+  if (env == nullptr || env->isolate == nullptr || error == nullptr) {
+    return napi_invalid_arg;
+  }
+
+  v8::HandleScope scope(env->isolate);
+  v8::Local<v8::Context> context = env->context();
+  v8::Local<v8::Value> raw = napi_v8_unwrap_value(error);
+  if (raw.IsEmpty() || !raw->IsObject()) {
+    return napi_invalid_arg;
+  }
+
+  v8::Local<v8::Message> message = v8::Exception::CreateMessage(env->isolate, raw);
+  if (message.IsEmpty()) {
+    return napi_generic_failure;
+  }
+
+  unofficial_napi_internal::SetArrowMessage(
+      env->isolate, context, raw, message);
+  return napi_ok;
 }
 
 napi_status NAPI_CDECL unofficial_napi_mark_promise_as_handled(

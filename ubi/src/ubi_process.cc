@@ -167,6 +167,7 @@ struct ProcessMethodsBindingState {
   napi_ref binding_ref = nullptr;
   napi_ref hrtime_buffer_ref = nullptr;
   napi_ref emit_warning_sync_ref = nullptr;
+  bool emit_env_nonstring_warning = true;
 };
 
 struct ReportBindingState {
@@ -191,6 +192,22 @@ std::map<napi_env, ReportBindingState> g_report_states;
 constexpr const char kUvwasiVersion[] = "0.0.23";
 
 std::string ReadTextFileIfExists(const std::filesystem::path& path);
+
+std::optional<std::filesystem::path> TryGetCurrentPath() {
+  std::error_code ec;
+  std::filesystem::path cwd = std::filesystem::current_path(ec);
+  if (ec) return std::nullopt;
+  return cwd.lexically_normal();
+}
+
+void AppendCwdCandidates(const std::filesystem::path& relative_path,
+                         std::vector<std::filesystem::path>* out) {
+  if (out == nullptr) return;
+  const std::optional<std::filesystem::path> cwd = TryGetCurrentPath();
+  if (!cwd.has_value()) return;
+  out->push_back((*cwd / relative_path).lexically_normal());
+  out->push_back((cwd->parent_path() / relative_path).lexically_normal());
+}
 
 std::string GetOpenSslVersion() {
   // Matches Node behavior: trim the "OpenSSL " prefix and keep the version
@@ -261,17 +278,17 @@ std::string GetIcuTzVersion() {
   static const std::string version = []() {
     namespace fs = std::filesystem;
     const fs::path source_root = fs::absolute(fs::path(__FILE__).parent_path() / ".." / "..").lexically_normal();
-    std::string resolved = ReadTrimmedTextFromCandidates({
+    std::vector<fs::path> text_candidates = {
         source_root / "node-test" / "fixtures" / "tz-version.txt",
-        fs::current_path() / "node-test" / "fixtures" / "tz-version.txt",
-        fs::current_path().parent_path() / "node-test" / "fixtures" / "tz-version.txt",
-    });
+    };
+    AppendCwdCandidates(fs::path("node-test") / "fixtures" / "tz-version.txt", &text_candidates);
+    std::string resolved = ReadTrimmedTextFromCandidates(text_candidates);
     if (!resolved.empty()) return resolved;
-    resolved = ReadTraceVersionFromCandidates("tz", {
+    std::vector<fs::path> trace_candidates = {
         source_root / "node-test" / "node_trace.1.log",
-        fs::current_path() / "node-test" / "node_trace.1.log",
-        fs::current_path().parent_path() / "node-test" / "node_trace.1.log",
-    });
+    };
+    AppendCwdCandidates(fs::path("node-test") / "node_trace.1.log", &trace_candidates);
+    resolved = ReadTraceVersionFromCandidates("tz", trace_candidates);
     if (!resolved.empty()) return resolved;
     return std::string("2025c");
   }();
@@ -283,11 +300,11 @@ std::string GetIcuCldrVersion() {
   static const std::string version = []() {
     namespace fs = std::filesystem;
     const fs::path source_root = fs::absolute(fs::path(__FILE__).parent_path() / ".." / "..").lexically_normal();
-    std::string resolved = ReadTraceVersionFromCandidates("cldr", {
+    std::vector<fs::path> trace_candidates = {
         source_root / "node-test" / "node_trace.1.log",
-        fs::current_path() / "node-test" / "node_trace.1.log",
-        fs::current_path().parent_path() / "node-test" / "node_trace.1.log",
-    });
+    };
+    AppendCwdCandidates(fs::path("node-test") / "node_trace.1.log", &trace_candidates);
+    std::string resolved = ReadTraceVersionFromCandidates("cldr", trace_candidates);
     if (!resolved.empty()) return resolved;
     return std::string("48.0");
   }();
@@ -324,22 +341,26 @@ std::string ReadPackageVersionFromCandidates(const std::vector<std::filesystem::
 std::string GetUndiciVersion() {
   namespace fs = std::filesystem;
   const fs::path source_root = fs::absolute(fs::path(__FILE__).parent_path() / ".." / "..").lexically_normal();
-  static const std::string version = ReadPackageVersionFromCandidates({
-      source_root / "node" / "deps" / "undici" / "src" / "package.json",
-      fs::current_path() / "node" / "deps" / "undici" / "src" / "package.json",
-      fs::current_path().parent_path() / "node" / "deps" / "undici" / "src" / "package.json",
-  });
+  static const std::string version = [source_root]() {
+    std::vector<fs::path> candidates = {
+        source_root / "node" / "deps" / "undici" / "src" / "package.json",
+    };
+    AppendCwdCandidates(fs::path("node") / "deps" / "undici" / "src" / "package.json", &candidates);
+    return ReadPackageVersionFromCandidates(candidates);
+  }();
   return version;
 }
 
 std::string GetAmaroVersion() {
   namespace fs = std::filesystem;
   const fs::path source_root = fs::absolute(fs::path(__FILE__).parent_path() / ".." / "..").lexically_normal();
-  static const std::string version = ReadPackageVersionFromCandidates({
-      source_root / "node" / "deps" / "amaro" / "package.json",
-      fs::current_path() / "node" / "deps" / "amaro" / "package.json",
-      fs::current_path().parent_path() / "node" / "deps" / "amaro" / "package.json",
-  });
+  static const std::string version = [source_root]() {
+    std::vector<fs::path> candidates = {
+        source_root / "node" / "deps" / "amaro" / "package.json",
+    };
+    AppendCwdCandidates(fs::path("node") / "deps" / "amaro" / "package.json", &candidates);
+    return ReadPackageVersionFromCandidates(candidates);
+  }();
   return version;
 }
 
@@ -464,11 +485,10 @@ std::string FindNodeConfigGypiText() {
   namespace fs = std::filesystem;
   std::error_code ec;
   const fs::path source_root = fs::absolute(fs::path(__FILE__).parent_path() / ".." / "..").lexically_normal();
-  const std::vector<fs::path> candidates = {
+  std::vector<fs::path> candidates = {
       source_root / "node" / "config.gypi",
-      fs::current_path() / "node" / "config.gypi",
-      fs::current_path().parent_path() / "node" / "config.gypi",
   };
+  AppendCwdCandidates(fs::path("node") / "config.gypi", &candidates);
   for (const fs::path& candidate : candidates) {
     if (!candidate.empty()) {
       const std::string text = ReadTextFileIfExists(candidate);
@@ -872,7 +892,31 @@ std::string FormatNodeNumber(double value) {
 
 std::string NapiValueToUtf8(napi_env env, napi_value value) {
   napi_value string_value = nullptr;
-  if (napi_coerce_to_string(env, value, &string_value) != napi_ok || string_value == nullptr) return "";
+  if (napi_coerce_to_string(env, value, &string_value) != napi_ok || string_value == nullptr) {
+    bool has_pending_exception = false;
+    if (napi_is_exception_pending(env, &has_pending_exception) == napi_ok && has_pending_exception) {
+      napi_value ignored = nullptr;
+      (void)napi_get_and_clear_last_exception(env, &ignored);
+    }
+
+    napi_value global = nullptr;
+    napi_value string_ctor = nullptr;
+    if (napi_get_global(env, &global) != napi_ok || global == nullptr ||
+        napi_get_named_property(env, global, "String", &string_ctor) != napi_ok ||
+        string_ctor == nullptr) {
+      return "";
+    }
+
+    napi_value argv[1] = {value};
+    if (napi_call_function(env, global, string_ctor, 1, argv, &string_value) != napi_ok ||
+        string_value == nullptr) {
+      if (napi_is_exception_pending(env, &has_pending_exception) == napi_ok && has_pending_exception) {
+        napi_value ignored = nullptr;
+        (void)napi_get_and_clear_last_exception(env, &ignored);
+      }
+      return "";
+    }
+  }
   size_t length = 0;
   if (napi_get_value_string_utf8(env, string_value, nullptr, 0, &length) != napi_ok) return "";
   std::string out(length + 1, '\0');
@@ -886,6 +930,65 @@ ProcessMethodsBindingState* GetProcessMethodsState(napi_env env) {
   auto it = g_process_methods_states.find(env);
   if (it == g_process_methods_states.end()) return nullptr;
   return &it->second;
+}
+
+bool ProcessEnvValueNeedsDeprecationWarning(napi_env env, napi_value value) {
+  if (env == nullptr || value == nullptr) return false;
+  napi_valuetype type = napi_undefined;
+  if (napi_typeof(env, value, &type) != napi_ok) return false;
+  return type != napi_string && type != napi_number && type != napi_boolean;
+}
+
+void EmitProcessMethodsWarningSync(napi_env env,
+                                   const char* message,
+                                   const char* type,
+                                   const char* code) {
+  if (env == nullptr || message == nullptr || type == nullptr || code == nullptr) return;
+  ProcessMethodsBindingState* state = GetProcessMethodsState(env);
+  if (state == nullptr || state->emit_warning_sync_ref == nullptr) return;
+
+  napi_value emit_warning_sync = nullptr;
+  if (napi_get_reference_value(env, state->emit_warning_sync_ref, &emit_warning_sync) != napi_ok ||
+      emit_warning_sync == nullptr) {
+    return;
+  }
+
+  napi_value global = nullptr;
+  napi_value message_value = nullptr;
+  napi_value type_value = nullptr;
+  napi_value code_value = nullptr;
+  if (napi_get_global(env, &global) != napi_ok || global == nullptr ||
+      napi_create_string_utf8(env, message, NAPI_AUTO_LENGTH, &message_value) != napi_ok ||
+      message_value == nullptr ||
+      napi_create_string_utf8(env, type, NAPI_AUTO_LENGTH, &type_value) != napi_ok ||
+      type_value == nullptr ||
+      napi_create_string_utf8(env, code, NAPI_AUTO_LENGTH, &code_value) != napi_ok ||
+      code_value == nullptr) {
+    return;
+  }
+
+  napi_value argv[3] = {message_value, type_value, code_value};
+  napi_value ignored = nullptr;
+  (void)napi_call_function(env, global, emit_warning_sync, 3, argv, &ignored);
+}
+
+void MaybeEmitProcessEnvDeprecationWarning(napi_env env, napi_value value) {
+  if (!UbiExecArgvHasFlag("--pending-deprecation") || UbiExecArgvHasFlag("--no-deprecation")) {
+    return;
+  }
+  ProcessMethodsBindingState* state = GetProcessMethodsState(env);
+  if (state == nullptr || !state->emit_env_nonstring_warning ||
+      !ProcessEnvValueNeedsDeprecationWarning(env, value)) {
+    return;
+  }
+  state->emit_env_nonstring_warning = false;
+  EmitProcessMethodsWarningSync(
+      env,
+      "Assigning any value other than a string, number, or boolean to a process.env property "
+      "is deprecated. Please make sure to convert the value to a string before setting "
+      "process.env with it.",
+      "DeprecationWarning",
+      "DEP0104");
 }
 
 ReportBindingState* GetReportState(napi_env env) {
@@ -1041,6 +1144,13 @@ bool GetNamedPropertyIfPresent(napi_env env, napi_value obj, const char* key, na
   return napi_get_named_property(env, obj, key, out) == napi_ok && *out != nullptr;
 }
 
+bool IsNullOrUndefinedValue(napi_env env, napi_value value) {
+  if (value == nullptr) return true;
+  napi_valuetype type = napi_undefined;
+  return napi_typeof(env, value, &type) == napi_ok &&
+         (type == napi_null || type == napi_undefined);
+}
+
 uint64_t ReadReportHeapLimitFromExecArgv(const std::vector<std::string>& exec_argv) {
   static constexpr const char* kMaxHeapSizePrefix = "--max-heap-size=";
   for (const auto& arg : exec_argv) {
@@ -1075,7 +1185,6 @@ std::vector<ProcessVersionEntry> BuildProcessVersionEntries(bool has_intl) {
       {"simdjson", SIMDJSON_VERSION},
       {"simdutf", SIMDUTF_VERSION},
       {"undici", GetUndiciVersion()},
-      {"ubi", UBI_VERSION_STRING},
       {"uv", uv_version_string()},
       {"uvwasi", kUvwasiVersion},
       {"v8", UBI_EMBEDDED_V8_VERSION},
@@ -1539,8 +1648,19 @@ bool BuildJavascriptStack(napi_env env,
     napi_value stack_value = nullptr;
     if (GetNamedPropertyIfPresent(env, error, "stack", &stack_value)) {
       stack_text = NapiValueToUtf8(env, stack_value);
-      if (!stack_text.empty() && message.empty()) message = stack_text;
+      if (!stack_text.empty()) {
+        const size_t newline = stack_text.find('\n');
+        const std::string first_line = stack_text.substr(0, newline);
+        if (!first_line.empty()) {
+          message = first_line;
+        } else if (message.empty()) {
+          message = stack_text;
+        }
+      }
     }
+  } else if (error != nullptr) {
+    const std::string primitive_message = NapiValueToUtf8(env, error);
+    if (!primitive_message.empty()) message = primitive_message;
   }
 
   uint32_t index = 0;
@@ -2991,6 +3111,7 @@ napi_value ProcessEnvProxySetTrap(napi_env env, napi_callback_info info) {
     return true_value;
   }
 
+  MaybeEmitProcessEnvDeprecationWarning(env, argv[2]);
   napi_value coerced = nullptr;
   if (napi_coerce_to_string(env, argv[2], &coerced) != napi_ok || coerced == nullptr) {
     return nullptr;
@@ -3105,6 +3226,7 @@ napi_value ProcessEnvProxyDefinePropertyTrap(napi_env env, napi_callback_info in
   napi_has_named_property(env, argv[2], "value", &has_value);
   napi_value value = nullptr;
   if (has_value && napi_get_named_property(env, argv[2], "value", &value) == napi_ok && value != nullptr) {
+    MaybeEmitProcessEnvDeprecationWarning(env, value);
     napi_value coerced = nullptr;
     if (napi_coerce_to_string(env, value, &coerced) != napi_ok || coerced == nullptr) return nullptr;
     const std::string text = NapiValueToUtf8(env, coerced);
@@ -4468,6 +4590,51 @@ void ProcessMethodsBindingFinalize(napi_env env, void* data, void* hint) {
   g_process_methods_states.erase(it);
 }
 
+bool WriteReportForUncaughtExceptionImpl(napi_env env, napi_value exception) {
+  ReportBindingState* state = GetReportState(env);
+  if (state == nullptr || !state->report_on_uncaught_exception) return false;
+
+  const std::string filename = ResolveReportFilename(state, "");
+  std::string event_message = "Exception";
+  napi_valuetype error_type = napi_undefined;
+  if (exception != nullptr && napi_typeof(env, exception, &error_type) == napi_ok &&
+      (error_type == napi_object || error_type == napi_function)) {
+    napi_value stack_value = nullptr;
+    bool has_stack = GetNamedPropertyIfPresent(env, exception, "stack", &stack_value) &&
+                     stack_value != nullptr;
+    bool stack_is_defined = false;
+    if (has_stack) {
+      napi_valuetype stack_type = napi_undefined;
+      stack_is_defined = napi_typeof(env, stack_value, &stack_type) == napi_ok && stack_type != napi_undefined;
+    }
+
+    if (!stack_is_defined) {
+      napi_value message_value = nullptr;
+      napi_value name_value = nullptr;
+      const bool has_message = GetNamedPropertyIfPresent(env, exception, "message", &message_value) &&
+                               message_value != nullptr &&
+                               !IsNullOrUndefinedValue(env, message_value);
+      const bool has_name = GetNamedPropertyIfPresent(env, exception, "name", &name_value) &&
+                            name_value != nullptr &&
+                            !IsNullOrUndefinedValue(env, name_value);
+      if (has_message && has_name) {
+        const std::string message_text = NapiValueToUtf8(env, message_value);
+        if (!message_text.empty()) event_message = message_text;
+      }
+    }
+  }
+
+  napi_value report_obj = BuildReportObject(env, event_message, "Exception", filename, exception);
+  if (report_obj == nullptr) return false;
+
+  napi_value json_string = StringifyReportObject(env, report_obj, state->compact);
+  if (json_string == nullptr) return false;
+
+  std::string payload = NapiValueToUtf8(env, json_string);
+  payload.push_back('\n');
+  return WriteReportPayload(state, filename, payload);
+}
+
 napi_value ReportWriteReportCallback(napi_env env, napi_callback_info info) {
   size_t argc = 4;
   napi_value argv[4] = {nullptr, nullptr, nullptr, nullptr};
@@ -5225,4 +5392,8 @@ napi_value UbiGetReportBinding(napi_env env) {
   napi_value binding = nullptr;
   if (napi_get_reference_value(env, state->binding_ref, &binding) != napi_ok || binding == nullptr) return nullptr;
   return binding;
+}
+
+bool UbiWriteReportForUncaughtException(napi_env env, napi_value exception) {
+  return WriteReportForUncaughtExceptionImpl(env, exception);
 }

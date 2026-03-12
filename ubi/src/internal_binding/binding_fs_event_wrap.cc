@@ -128,9 +128,14 @@ void OnClosed(uv_handle_t* handle) {
   auto* wrap = static_cast<FsEventWrap*>(handle != nullptr ? handle->data : nullptr);
   if (wrap == nullptr) return;
   wrap->handle_wrap.state = kUbiHandleClosed;
+  UbiHandleWrapDetach(&wrap->handle_wrap);
   UbiHandleWrapReleaseWrapperRef(&wrap->handle_wrap);
   UbiHandleWrapMaybeCallOnClose(&wrap->handle_wrap);
-  if (wrap->handle_wrap.finalized || wrap->handle_wrap.delete_on_close) {
+  bool can_delete = wrap->handle_wrap.finalized;
+  if (!can_delete && wrap->handle_wrap.delete_on_close) {
+    can_delete = UbiHandleWrapCancelFinalizer(&wrap->handle_wrap, wrap);
+  }
+  if (can_delete) {
     UbiHandleWrapDeleteRefIfPresent(wrap->handle_wrap.env, &wrap->owner_ref);
     UbiHandleWrapDeleteRefIfPresent(wrap->handle_wrap.env, &wrap->handle_wrap.wrapper_ref);
     delete wrap;
@@ -143,12 +148,17 @@ void CloseFsEvent(FsEventWrap* wrap) {
   uv_close(reinterpret_cast<uv_handle_t*>(&wrap->handle), OnClosed);
 }
 
+void CloseFsEventForCleanup(void* data) {
+  CloseFsEvent(static_cast<FsEventWrap*>(data));
+}
+
 void FsEventFinalize(napi_env env, void* data, void* /*hint*/) {
   auto* wrap = static_cast<FsEventWrap*>(data);
   if (wrap == nullptr) return;
   wrap->handle_wrap.finalized = true;
   UbiHandleWrapDeleteRefIfPresent(env, &wrap->handle_wrap.wrapper_ref);
   if (wrap->handle_wrap.state == kUbiHandleUninitialized || wrap->handle_wrap.state == kUbiHandleClosed) {
+    UbiHandleWrapDetach(&wrap->handle_wrap);
     UbiHandleWrapDeleteRefIfPresent(env, &wrap->owner_ref);
     delete wrap;
     return;
@@ -249,6 +259,10 @@ napi_value FsEventStart(napi_env env, napi_callback_info info) {
   if (rc != 0) return MakeInt32(env, rc);
 
   wrap->handle.data = wrap;
+  UbiHandleWrapAttach(&wrap->handle_wrap,
+                      wrap,
+                      reinterpret_cast<uv_handle_t*>(&wrap->handle),
+                      CloseFsEventForCleanup);
   rc = uv_fs_event_start(&wrap->handle, OnEvent, path.c_str(), flags);
   if (rc != 0) {
     wrap->handle_wrap.state = kUbiHandleClosing;

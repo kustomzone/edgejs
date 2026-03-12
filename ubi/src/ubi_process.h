@@ -16,5 +16,6 @@ void UbiSetProcessArgv0(const std::string& argv0);
 
 napi_value UbiGetProcessMethodsBinding(napi_env env);
 napi_value UbiGetReportBinding(napi_env env);
+bool UbiWriteReportForUncaughtException(napi_env env, napi_value exception);
 
 #endif  // UBI_PROCESS_H_

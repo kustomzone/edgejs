@@ -11,3 +11,6 @@
 v8-*.tar.xz
 /deps/libuv-wasix
 /deps/openssl-wasix
+/dist
+/v8-custom-builds
+/.vscode

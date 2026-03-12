@@ -5,9 +5,6 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#include <unordered_map>
-#include <unordered_set>
-
 #include "brotli/decode.h"
 #include "brotli/encode.h"
 #include <openssl/ec.h>
@@ -43,34 +40,6 @@ namespace {
   "DHE-RSA-AES256-SHA256:"                                                     \
   "HIGH:!aNULL:!eNULL:!EXPORT:!DES:!RC4:!MD5:!PSK:!SRP:!CAMELLIA"
 #endif
-
-std::unordered_map<napi_env, napi_ref> g_constants_refs;
-std::unordered_set<napi_env> g_constants_cleanup_hook_registered;
-
-void DeleteRefIfPresent(napi_env env, napi_ref* ref) {
-  if (env == nullptr || ref == nullptr || *ref == nullptr) return;
-  napi_delete_reference(env, *ref);
-  *ref = nullptr;
-}
-
-void OnConstantsEnvCleanup(void* data) {
-  napi_env env = static_cast<napi_env>(data);
-  g_constants_cleanup_hook_registered.erase(env);
-
-  auto it = g_constants_refs.find(env);
-  if (it == g_constants_refs.end()) return;
-  DeleteRefIfPresent(env, &it->second);
-  g_constants_refs.erase(it);
-}
-
-void EnsureConstantsCleanupHook(napi_env env) {
-  if (env == nullptr) return;
-  auto [it, inserted] = g_constants_cleanup_hook_registered.emplace(env);
-  if (!inserted) return;
-  if (napi_add_env_cleanup_hook(env, OnConstantsEnvCleanup, env) != napi_ok) {
-    g_constants_cleanup_hook_registered.erase(it);
-  }
-}
 
 constexpr int32_t kZlibModeDeflate = 1;
 constexpr int32_t kZlibModeInflate = 2;
@@ -744,15 +713,7 @@ void NormalizeConstantsShape(napi_env env, napi_value constants) {
 }  // namespace
 
 napi_value ResolveConstants(napi_env env, const ResolveOptions& options) {
-  EnsureConstantsCleanupHook(env);
   const napi_value undefined = Undefined(env);
-  auto cached_it = g_constants_refs.find(env);
-  if (cached_it != g_constants_refs.end() && cached_it->second != nullptr) {
-    napi_value cached = nullptr;
-    if (napi_get_reference_value(env, cached_it->second, &cached) == napi_ok && cached != nullptr) {
-      return cached;
-    }
-  }
 
   napi_value out = nullptr;
   if (napi_create_object(env, &out) != napi_ok || out == nullptr) return undefined;
@@ -786,10 +747,6 @@ napi_value ResolveConstants(napi_env env, const ResolveOptions& options) {
   SetNamedObjectIfValid(env, out, "internal", CreateInternalConstants(env));
   SetNamedObjectIfValid(env, out, "trace", CreateTraceConstants(env));
   NormalizeConstantsShape(env, out);
-
-  auto& ref = g_constants_refs[env];
-  DeleteRefIfPresent(env, &ref);
-  napi_create_reference(env, out, 1, &ref);
 
   return out;
 }

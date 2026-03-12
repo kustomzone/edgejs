@@ -3,8 +3,6 @@
 #include <cctype>
 #include <cstdlib>
 #include <string>
-#include <unordered_map>
-#include <unordered_set>
 
 #include "internal_binding/helpers.h"
 #include "ncrypto/ncrypto.h"
@@ -12,34 +10,6 @@
 namespace internal_binding {
 
 namespace {
-
-std::unordered_map<napi_env, napi_ref> g_config_refs;
-std::unordered_set<napi_env> g_config_cleanup_hook_registered;
-
-void DeleteRefIfPresent(napi_env env, napi_ref* ref) {
-  if (env == nullptr || ref == nullptr || *ref == nullptr) return;
-  napi_delete_reference(env, *ref);
-  *ref = nullptr;
-}
-
-void OnConfigEnvCleanup(void* data) {
-  napi_env env = static_cast<napi_env>(data);
-  g_config_cleanup_hook_registered.erase(env);
-
-  auto it = g_config_refs.find(env);
-  if (it == g_config_refs.end()) return;
-  DeleteRefIfPresent(env, &it->second);
-  g_config_refs.erase(it);
-}
-
-void EnsureConfigCleanupHook(napi_env env) {
-  if (env == nullptr) return;
-  auto [it, inserted] = g_config_cleanup_hook_registered.emplace(env);
-  if (!inserted) return;
-  if (napi_add_env_cleanup_hook(env, OnConfigEnvCleanup, env) != napi_ok) {
-    g_config_cleanup_hook_registered.erase(it);
-  }
-}
 
 napi_value GetNamed(napi_env env, napi_value obj, const char* key) {
   napi_value out = nullptr;
@@ -111,15 +81,6 @@ napi_value ConfigGetDefaultLocale(napi_env env, napi_callback_info /*info*/) {
 }  // namespace
 
 napi_value ResolveConfig(napi_env env, const ResolveOptions& /*options*/) {
-  EnsureConfigCleanupHook(env);
-  auto cached_it = g_config_refs.find(env);
-  if (cached_it != g_config_refs.end() && cached_it->second != nullptr) {
-    napi_value cached = nullptr;
-    if (napi_get_reference_value(env, cached_it->second, &cached) == napi_ok && cached != nullptr) {
-      return cached;
-    }
-  }
-
   napi_value out = nullptr;
   if (napi_create_object(env, &out) != napi_ok || out == nullptr) return Undefined(env);
 
@@ -168,10 +129,6 @@ napi_value ResolveConfig(napi_env env, const ResolveOptions& /*options*/) {
       get_default_locale != nullptr) {
     napi_set_named_property(env, out, "getDefaultLocale", get_default_locale);
   }
-
-  auto& ref = g_config_refs[env];
-  DeleteRefIfPresent(env, &ref);
-  napi_create_reference(env, out, 1, &ref);
 
   return out;
 }

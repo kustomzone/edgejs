@@ -2,13 +2,16 @@
 
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 #include "internal_binding/helpers.h"
 #include "ubi_active_resource.h"
 #include "ubi_async_wrap.h"
+#include "ubi_env_loop.h"
 #include "ubi_module_loader.h"
 #include "ubi_pipe_wrap.h"
 #include "ubi_runtime.h"
@@ -90,6 +93,126 @@ struct LibuvShutdownReq {
 
 std::unordered_map<napi_env, StreamSymbolCache> g_stream_symbols;
 std::unordered_set<napi_env> g_stream_symbol_cleanup_hook_registered;
+
+struct StreamBaseEnvState {
+  UbiStreamBase* head = nullptr;
+  bool cleanup_hook_registered = false;
+  bool cleanup_started = false;
+};
+
+std::mutex g_stream_base_env_states_mutex;
+std::unordered_map<napi_env, StreamBaseEnvState> g_stream_base_env_states;
+
+void MaybeEraseStreamBaseStateLocked(napi_env env) {
+  auto it = g_stream_base_env_states.find(env);
+  if (it == g_stream_base_env_states.end()) return;
+  if (it->second.head != nullptr || it->second.cleanup_hook_registered) return;
+  g_stream_base_env_states.erase(it);
+}
+
+void UnlinkStreamBaseLocked(StreamBaseEnvState* state, UbiStreamBase* base) {
+  if (state == nullptr || base == nullptr || !base->attached) return;
+  if (base->prev != nullptr) {
+    base->prev->next = base->next;
+  } else if (state->head == base) {
+    state->head = base->next;
+  }
+  if (base->next != nullptr) {
+    base->next->prev = base->prev;
+  }
+  base->prev = nullptr;
+  base->next = nullptr;
+  base->attached = false;
+}
+
+void StreamBaseDetach(UbiStreamBase* base) {
+  if (base == nullptr || base->env == nullptr || !base->attached) return;
+  std::lock_guard<std::mutex> lock(g_stream_base_env_states_mutex);
+  auto it = g_stream_base_env_states.find(base->env);
+  if (it == g_stream_base_env_states.end()) {
+    base->prev = nullptr;
+    base->next = nullptr;
+    base->attached = false;
+    return;
+  }
+  UnlinkStreamBaseLocked(&it->second, base);
+  MaybeEraseStreamBaseStateLocked(base->env);
+}
+
+void RunStreamBaseEnvCleanup(napi_env env);
+
+void OnStreamBaseEnvCleanup(void* data) {
+  RunStreamBaseEnvCleanup(static_cast<napi_env>(data));
+}
+
+void EnsureStreamBaseCleanupHook(napi_env env) {
+  if (env == nullptr) return;
+  std::lock_guard<std::mutex> lock(g_stream_base_env_states_mutex);
+  auto& state = g_stream_base_env_states[env];
+  if (state.cleanup_hook_registered || state.cleanup_started) return;
+  if (napi_add_env_cleanup_hook(env, OnStreamBaseEnvCleanup, env) == napi_ok) {
+    state.cleanup_hook_registered = true;
+  }
+}
+
+void StreamBaseMaybeAttach(UbiStreamBase* base) {
+  if (base == nullptr || base->env == nullptr || base->attached) return;
+  if (base->ops == nullptr || base->ops->get_handle == nullptr || base->ops->on_close == nullptr) return;
+  uv_handle_t* handle = base->ops->get_handle(base);
+  if (handle == nullptr) return;
+  EnsureStreamBaseCleanupHook(base->env);
+  std::lock_guard<std::mutex> lock(g_stream_base_env_states_mutex);
+  auto& state = g_stream_base_env_states[base->env];
+  if (state.cleanup_started) return;
+  base->prev = nullptr;
+  base->next = state.head;
+  if (state.head != nullptr) {
+    state.head->prev = base;
+  }
+  state.head = base;
+  base->attached = true;
+}
+
+void RunStreamBaseEnvCleanup(napi_env env) {
+  if (env == nullptr) return;
+  std::vector<UbiStreamBase*> bases_to_close;
+  {
+    std::lock_guard<std::mutex> lock(g_stream_base_env_states_mutex);
+    auto it = g_stream_base_env_states.find(env);
+    if (it == g_stream_base_env_states.end()) return;
+    it->second.cleanup_hook_registered = false;
+    it->second.cleanup_started = true;
+    for (UbiStreamBase* base = it->second.head; base != nullptr; base = base->next) {
+      bases_to_close.push_back(base);
+    }
+  }
+
+  for (UbiStreamBase* base : bases_to_close) {
+    if (base == nullptr || base->ops == nullptr || base->ops->get_handle == nullptr ||
+        base->ops->on_close == nullptr || base->closed || base->closing) {
+      continue;
+    }
+    uv_handle_t* handle = base->ops->get_handle(base);
+    if (handle == nullptr || uv_is_closing(handle) != 0) continue;
+    base->closing = true;
+    uv_close(handle, base->ops->on_close);
+  }
+
+  uv_loop_t* loop = UbiGetExistingEnvLoop(env);
+  while (loop != nullptr) {
+    bool empty = false;
+    {
+      std::lock_guard<std::mutex> lock(g_stream_base_env_states_mutex);
+      auto it = g_stream_base_env_states.find(env);
+      empty = (it == g_stream_base_env_states.end()) || (it->second.head == nullptr);
+      if (empty) {
+        MaybeEraseStreamBaseStateLocked(env);
+      }
+    }
+    if (empty) break;
+    (void)uv_run(loop, UV_RUN_ONCE);
+  }
+}
 
 void OnStreamSymbolsEnvCleanup(void* data) {
   napi_env env = static_cast<napi_env>(data);
@@ -510,7 +633,10 @@ void DeleteOnReadRefs(UbiStreamBase* base) {
 }
 
 void MaybeCallHandleOnClose(UbiStreamBase* base) {
-  if (base == nullptr || base->env == nullptr || base->finalized) return;
+  if (base == nullptr || base->env == nullptr || base->finalized ||
+      UbiStreamBaseEnvCleanupStarted(base->env)) {
+    return;
+  }
   napi_value self = UbiStreamBaseGetWrapper(base);
   if (self == nullptr) return;
   napi_value symbol = GetHandleOnCloseSymbol(base->env);
@@ -589,6 +715,9 @@ void UbiStreamBaseInit(UbiStreamBase* base,
   base->ops = ops;
   base->provider_type = provider_type;
   base->async_id = UbiAsyncWrapNextId(env);
+  base->attached = false;
+  base->prev = nullptr;
+  base->next = nullptr;
 
   base->default_listener.on_alloc = DefaultOnAlloc;
   base->default_listener.on_read = DefaultOnRead;
@@ -607,6 +736,7 @@ void UbiStreamBaseSetWrapperRef(UbiStreamBase* base, napi_ref wrapper_ref) {
   if (base == nullptr) return;
   base->wrapper_ref = wrapper_ref;
   if (base->env == nullptr || wrapper_ref == nullptr) return;
+  StreamBaseMaybeAttach(base);
   napi_value owner = UbiStreamBaseGetWrapper(base);
   if (owner == nullptr) return;
   if (base->active_handle_token == nullptr && base->provider_type != kUbiProviderJsStream) {
@@ -677,6 +807,7 @@ void UbiStreamBaseFinalize(UbiStreamBase* base) {
                             ? base->ops->get_handle(base)
                             : nullptr;
   if (handle == nullptr) {
+    StreamBaseDetach(base);
     if (base->active_handle_token != nullptr) {
       UbiUnregisterActiveHandle(base->env, base->active_handle_token);
       base->active_handle_token = nullptr;
@@ -694,6 +825,7 @@ void UbiStreamBaseFinalize(UbiStreamBase* base) {
     return;
   }
 
+  StreamBaseDetach(base);
   DestroyBase(base);
 }
 
@@ -701,6 +833,7 @@ void UbiStreamBaseOnClosed(UbiStreamBase* base) {
   if (base == nullptr || base->env == nullptr) return;
   base->closing = false;
   base->closed = true;
+  StreamBaseDetach(base);
 
   if (!base->destroy_notified) {
     base->destroy_notified = true;
@@ -859,6 +992,27 @@ void UbiStreamBaseUnref(UbiStreamBase* base) {
   if (base == nullptr || base->ops == nullptr || base->ops->get_handle == nullptr) return;
   uv_handle_t* handle = base->ops->get_handle(base);
   if (handle != nullptr && !base->closed) uv_unref(handle);
+}
+
+bool UbiStreamBaseEnvCleanupStarted(napi_env env) {
+  if (env == nullptr) return false;
+  std::lock_guard<std::mutex> lock(g_stream_base_env_states_mutex);
+  auto it = g_stream_base_env_states.find(env);
+  return it != g_stream_base_env_states.end() && it->second.cleanup_started;
+}
+
+void UbiStreamBaseRunEnvCleanup(napi_env env) {
+  if (env == nullptr) return;
+  {
+    std::lock_guard<std::mutex> lock(g_stream_base_env_states_mutex);
+    auto it = g_stream_base_env_states.find(env);
+    if (it == g_stream_base_env_states.end()) return;
+    if (it->second.cleanup_hook_registered) {
+      (void)napi_remove_env_cleanup_hook(env, OnStreamBaseEnvCleanup, env);
+      it->second.cleanup_hook_registered = false;
+    }
+  }
+  RunStreamBaseEnvCleanup(env);
 }
 
 napi_value UbiStreamBaseGetOnRead(UbiStreamBase* base) {

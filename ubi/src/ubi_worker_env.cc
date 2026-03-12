@@ -12,6 +12,7 @@ namespace {
 
 struct WorkerEnvState {
   bool cleanup_hook_registered = false;
+  bool cleanup_started = false;
   bool stop_requested = false;
   UbiWorkerEnvConfig config;
   napi_ref binding_ref = nullptr;
@@ -68,16 +69,23 @@ void CleanupWorkerEnvState(void* data) {
   if (env == nullptr) return;
 
   std::unordered_set<int> unmanaged_fds;
+  napi_ref binding_ref = nullptr;
+  napi_ref env_message_port_ref = nullptr;
   {
     std::lock_guard<std::mutex> lock(g_worker_env_mu);
     auto it = g_worker_env_states.find(env);
     if (it == g_worker_env_states.end()) return;
-    it->second.cleanup_hook_registered = false;
+    it->second.cleanup_started = true;
     it->second.stop_requested = true;
     unmanaged_fds.swap(it->second.unmanaged_fds);
-    DeleteRefIfPresent(env, &it->second.binding_ref);
-    DeleteRefIfPresent(env, &it->second.env_message_port_ref);
+    binding_ref = it->second.binding_ref;
+    env_message_port_ref = it->second.env_message_port_ref;
+    it->second.binding_ref = nullptr;
+    it->second.env_message_port_ref = nullptr;
   }
+
+  DeleteRefIfPresent(env, &binding_ref);
+  DeleteRefIfPresent(env, &env_message_port_ref);
 
   for (const int fd : unmanaged_fds) {
     if (fd < 0) continue;
@@ -89,12 +97,17 @@ void CleanupWorkerEnvState(void* data) {
 
 WorkerEnvState& EnsureWorkerEnvState(napi_env env) {
   auto& state = g_worker_env_states[env];
-  if (!state.cleanup_hook_registered) {
+  if (!state.cleanup_hook_registered && !state.cleanup_started) {
     if (napi_add_env_cleanup_hook(env, CleanupWorkerEnvState, env) == napi_ok) {
       state.cleanup_hook_registered = true;
     }
   }
   return state;
+}
+
+WorkerEnvState* FindWorkerEnvState(napi_env env) {
+  auto it = g_worker_env_states.find(env);
+  return it == g_worker_env_states.end() ? nullptr : &it->second;
 }
 
 }  // namespace
@@ -110,8 +123,12 @@ void UbiWorkerEnvConfigure(napi_env env, const UbiWorkerEnvConfig& config) {
 bool UbiWorkerEnvGetConfig(napi_env env, UbiWorkerEnvConfig* out) {
   if (env == nullptr || out == nullptr) return false;
   std::lock_guard<std::mutex> lock(g_worker_env_mu);
-  auto& state = EnsureWorkerEnvState(env);
-  *out = state.config;
+  WorkerEnvState* state = FindWorkerEnvState(env);
+  if (state == nullptr) {
+    *out = UbiWorkerEnvConfig();
+    return false;
+  }
+  *out = state->config;
   return true;
 }
 
@@ -178,8 +195,8 @@ void UbiWorkerEnvRemoveUnmanagedFd(napi_env env, int fd) {
 bool UbiWorkerEnvStopRequested(napi_env env) {
   if (env == nullptr) return false;
   std::lock_guard<std::mutex> lock(g_worker_env_mu);
-  auto& state = EnsureWorkerEnvState(env);
-  return state.stop_requested;
+  WorkerEnvState* state = FindWorkerEnvState(env);
+  return state != nullptr && state->stop_requested;
 }
 
 int32_t UbiWorkerEnvThreadId(napi_env env) {
@@ -229,8 +246,8 @@ void UbiWorkerEnvSetDebugPort(napi_env env, uint32_t port) {
 std::map<std::string, std::string> UbiWorkerEnvSnapshotEnvVars(napi_env env) {
   if (env == nullptr) return {};
   std::lock_guard<std::mutex> lock(g_worker_env_mu);
-  auto& state = EnsureWorkerEnvState(env);
-  return state.config.env_vars;
+  WorkerEnvState* state = FindWorkerEnvState(env);
+  return state != nullptr ? state->config.env_vars : std::map<std::string, std::string>{};
 }
 
 void UbiWorkerEnvSetLocalEnvVar(napi_env env, const std::string& key, const std::string& value) {
@@ -254,6 +271,20 @@ void UbiWorkerEnvRequestStop(napi_env env) {
   state.stop_requested = true;
 }
 
+void UbiWorkerEnvRunCleanup(napi_env env) {
+  if (env == nullptr) return;
+  {
+    std::lock_guard<std::mutex> lock(g_worker_env_mu);
+    WorkerEnvState* state = FindWorkerEnvState(env);
+    if (state == nullptr) return;
+    if (state->cleanup_hook_registered) {
+      (void)napi_remove_env_cleanup_hook(env, CleanupWorkerEnvState, env);
+      state->cleanup_hook_registered = false;
+    }
+  }
+  CleanupWorkerEnvState(env);
+}
+
 void UbiWorkerEnvForget(napi_env env) {
   if (env == nullptr) return;
   std::lock_guard<std::mutex> lock(g_worker_env_mu);
@@ -263,8 +294,8 @@ void UbiWorkerEnvForget(napi_env env) {
 napi_value UbiWorkerEnvGetBinding(napi_env env) {
   if (env == nullptr) return nullptr;
   std::lock_guard<std::mutex> lock(g_worker_env_mu);
-  auto& state = EnsureWorkerEnvState(env);
-  return GetRefValue(env, state.binding_ref);
+  WorkerEnvState* state = FindWorkerEnvState(env);
+  return state != nullptr ? GetRefValue(env, state->binding_ref) : nullptr;
 }
 
 void UbiWorkerEnvSetBinding(napi_env env, napi_value binding) {
@@ -277,8 +308,8 @@ void UbiWorkerEnvSetBinding(napi_env env, napi_value binding) {
 napi_value UbiWorkerEnvGetEnvMessagePort(napi_env env) {
   if (env == nullptr) return nullptr;
   std::lock_guard<std::mutex> lock(g_worker_env_mu);
-  auto& state = EnsureWorkerEnvState(env);
-  return GetRefValue(env, state.env_message_port_ref);
+  WorkerEnvState* state = FindWorkerEnvState(env);
+  return state != nullptr ? GetRefValue(env, state->env_message_port_ref) : nullptr;
 }
 
 void UbiWorkerEnvSetEnvMessagePort(napi_env env, napi_value port) {

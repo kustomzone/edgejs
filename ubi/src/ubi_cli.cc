@@ -25,11 +25,17 @@
 
 #include "node_version.h"
 #include "unofficial_napi.h"
+#include "ubi_env_loop.h"
+#include "ubi_handle_wrap.h"
 #include "ubi_option_helpers.h"
 #include "ubi_compat_exec.h"
 #include "ubi_process.h"
+#include "ubi_stream_base.h"
+#include "ubi_timers_host.h"
 #include "ubi_runtime_platform.h"
 #include "ubi_runtime.h"
+#include "ubi_worker_control.h"
+#include "ubi_worker_env.h"
 
 namespace {
 
@@ -99,8 +105,19 @@ int RunWithFreshEnv(const std::function<int(napi_env)>& runner, std::string* err
   }
 
   const int exit_code = runner(env);
-  const napi_status destroy_status = unofficial_napi_destroy_env_instance(env);
-  if (destroy_status != napi_ok) {
+  UbiWorkerStopAllForEnv(env);
+  UbiRunTimersHostEnvCleanup(env);
+  UbiRunRuntimePlatformEnvCleanup(env);
+  UbiHandleWrapRunEnvCleanup(env);
+  UbiStreamBaseRunEnvCleanup(env);
+  UbiWorkerEnvRunCleanup(env);
+  if (uv_loop_t* loop = UbiGetEnvLoop(env); loop != nullptr) {
+    for (size_t guard = 0; guard < 1024 && uv_loop_alive(loop) != 0; ++guard) {
+      (void)uv_run(loop, UV_RUN_NOWAIT);
+    }
+  }
+  const napi_status release_status = unofficial_napi_release_env(env_scope);
+  if (release_status != napi_ok) {
     if (error_out != nullptr) {
       *error_out = "Failed to release runtime environment";
     }
@@ -798,8 +815,10 @@ class CliPackageScriptRunner {
 int RunCliPackageScript(const std::string& script_name,
                         const std::vector<std::string>& positional_args,
                         std::string* error_out) {
-  const std::string current_working_directory = std::filesystem::current_path().string();
-  const auto package_json = FindCliPackageJson(std::filesystem::path(current_working_directory));
+  std::error_code ec;
+  const std::filesystem::path cwd = std::filesystem::current_path(ec);
+  const std::string current_working_directory = ec ? std::string("<cwd unavailable>") : cwd.string();
+  const auto package_json = ec ? std::optional<CliPackageJsonInfo>{} : FindCliPackageJson(cwd);
   if (!package_json.has_value()) {
     if (error_out != nullptr) {
       *error_out = "Can't find package.json for directory " + current_working_directory + "\n";
@@ -1220,38 +1239,20 @@ int UbiRunCli(int argc, const char* const* argv, std::string* error_out) {
       }
     }
     UbiSetScriptArgv(script_argv);
-    static constexpr const char kCheckSyntaxModuleStdinMain[] =
-        "/*__ubi_skip_pre_execution__*/"
-        "const { prepareMainThreadExecution, markBootstrapComplete } = "
-        "require('internal/process/pre_execution');"
-        "const { readStdin } = require('internal/process/execution');"
-        "prepareMainThreadExecution(true);"
-        "markBootstrapComplete();"
-        "readStdin((code) => {"
-        "  try {"
-        "    const { ModuleWrap } = internalBinding('module_wrap');"
-        "    new ModuleWrap('[stdin]', undefined, code, 0, 0);"
-        "  } catch (err) {"
-        "    if (err && typeof err.stack === 'string' && !err.stack.startsWith('[stdin]')) {"
-        "      err.stack = '[stdin]\\n' + err.stack;"
-        "    }"
-        "    throw err;"
-        "  }"
-        "});";
     if (mode == CliMode::kCheck) {
-      if (RawExecArgvHasInputType(raw_exec_argv)) {
-        return RunCliBuiltin(kCheckSyntaxModuleStdinMain, nullptr, error_out);
-      }
       return RunCliBuiltin(";", "internal/main/check_syntax", error_out);
     }
     return RunCliBuiltin(";", StdinIsTTY() ? "internal/main/repl" : "internal/main/eval_stdin", error_out);
   }
 
-  script_argv.reserve(static_cast<size_t>(argc - (script_index + 1)));
-  for (int argi = script_index + 1; argi < argc; ++argi) {
+  script_argv.reserve(static_cast<size_t>(argc - (mode == CliMode::kCheck ? script_index : (script_index + 1))));
+  for (int argi = (mode == CliMode::kCheck ? script_index : (script_index + 1)); argi < argc; ++argi) {
     if (argv[argi] != nullptr) script_argv.emplace_back(argv[argi]);
   }
   UbiSetScriptArgv(script_argv);
+  if (mode == CliMode::kCheck) {
+    return RunCliBuiltin(";", "internal/main/check_syntax", error_out);
+  }
   return UbiRunCliScript(argv[script_index], error_out);
 }
 

@@ -1,9 +1,12 @@
 #include "ubi_handle_wrap.h"
 
+#include <mutex>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 #include "internal_binding/helpers.h"
+#include "ubi_env_loop.h"
 #include "ubi_module_loader.h"
 #include "ubi_runtime.h"
 
@@ -18,10 +21,95 @@ struct HandleSymbolCache {
 std::unordered_map<napi_env, HandleSymbolCache> g_handle_symbols;
 std::unordered_set<napi_env> g_handle_symbol_cleanup_hook_registered;
 
+struct HandleWrapEnvState {
+  UbiHandleWrap* head = nullptr;
+  bool cleanup_hook_registered = false;
+  bool cleanup_started = false;
+};
+
+std::mutex g_handle_wrap_env_states_mutex;
+std::unordered_map<napi_env, HandleWrapEnvState> g_handle_wrap_env_states;
+
 void DeleteRefIfPresent(napi_env env, napi_ref* ref) {
   if (env == nullptr || ref == nullptr || *ref == nullptr) return;
   napi_delete_reference(env, *ref);
   *ref = nullptr;
+}
+
+void UnlinkHandleWrapLocked(HandleWrapEnvState* state, UbiHandleWrap* wrap) {
+  if (state == nullptr || wrap == nullptr || !wrap->attached) return;
+  if (wrap->prev != nullptr) {
+    wrap->prev->next = wrap->next;
+  } else if (state->head == wrap) {
+    state->head = wrap->next;
+  }
+  if (wrap->next != nullptr) {
+    wrap->next->prev = wrap->prev;
+  }
+  wrap->prev = nullptr;
+  wrap->next = nullptr;
+  wrap->attached = false;
+}
+
+void MaybeEraseHandleWrapStateLocked(napi_env env) {
+  auto it = g_handle_wrap_env_states.find(env);
+  if (it == g_handle_wrap_env_states.end()) return;
+  if (it->second.head != nullptr || it->second.cleanup_hook_registered) return;
+  g_handle_wrap_env_states.erase(it);
+}
+
+void RunHandleWrapEnvCleanup(napi_env env) {
+  if (env == nullptr) return;
+  std::vector<UbiHandleWrap*> wraps_to_close;
+  {
+    std::lock_guard<std::mutex> lock(g_handle_wrap_env_states_mutex);
+    auto it = g_handle_wrap_env_states.find(env);
+    if (it == g_handle_wrap_env_states.end()) return;
+    it->second.cleanup_hook_registered = false;
+    it->second.cleanup_started = true;
+    for (UbiHandleWrap* wrap = it->second.head; wrap != nullptr; wrap = wrap->next) {
+      wraps_to_close.push_back(wrap);
+    }
+  }
+
+  for (UbiHandleWrap* wrap : wraps_to_close) {
+    if (wrap == nullptr ||
+        !wrap->attached ||
+        wrap->state != kUbiHandleInitialized ||
+        wrap->close_callback == nullptr) {
+      continue;
+    }
+    wrap->close_callback(wrap->close_data);
+  }
+
+  uv_loop_t* loop = UbiGetExistingEnvLoop(env);
+  while (loop != nullptr) {
+    bool empty = false;
+    {
+      std::lock_guard<std::mutex> lock(g_handle_wrap_env_states_mutex);
+      auto it = g_handle_wrap_env_states.find(env);
+      empty = (it == g_handle_wrap_env_states.end()) || (it->second.head == nullptr);
+      if (empty) {
+        MaybeEraseHandleWrapStateLocked(env);
+      }
+    }
+    if (empty) break;
+    (void)uv_run(loop, UV_RUN_ONCE);
+  }
+}
+
+void OnHandleWrapEnvCleanup(void* data) {
+  RunHandleWrapEnvCleanup(static_cast<napi_env>(data));
+}
+
+void EnsureHandleWrapCleanupHook(napi_env env) {
+  if (env == nullptr) return;
+  std::lock_guard<std::mutex> lock(g_handle_wrap_env_states_mutex);
+  auto& state = g_handle_wrap_env_states[env];
+  if (state.cleanup_hook_registered || state.cleanup_started) return;
+  if (napi_add_env_cleanup_hook(env, OnHandleWrapEnvCleanup, env) == napi_ok) {
+    state.cleanup_hook_registered = true;
+  }
 }
 
 void OnHandleSymbolsEnvCleanup(void* data) {
@@ -140,10 +228,60 @@ void UbiHandleWrapInit(UbiHandleWrap* wrap, napi_env env) {
   wrap->env = env;
   wrap->wrapper_ref = nullptr;
   wrap->active_handle_token = nullptr;
+  wrap->close_data = nullptr;
+  wrap->uv_handle = nullptr;
+  wrap->close_callback = nullptr;
+  wrap->prev = nullptr;
+  wrap->next = nullptr;
+  wrap->attached = false;
   wrap->finalized = false;
   wrap->delete_on_close = false;
   wrap->wrapper_ref_held = false;
   wrap->state = kUbiHandleUninitialized;
+}
+
+void UbiHandleWrapAttach(UbiHandleWrap* wrap,
+                         void* close_data,
+                         uv_handle_t* handle,
+                         UbiHandleWrapCloseCallback close_callback) {
+  if (wrap == nullptr || wrap->env == nullptr || handle == nullptr || close_callback == nullptr) return;
+  EnsureHandleWrapCleanupHook(wrap->env);
+  std::lock_guard<std::mutex> lock(g_handle_wrap_env_states_mutex);
+  auto& state = g_handle_wrap_env_states[wrap->env];
+  if (state.cleanup_started) return;
+  if (wrap->attached) {
+    UnlinkHandleWrapLocked(&state, wrap);
+  }
+  wrap->close_data = close_data;
+  wrap->uv_handle = handle;
+  wrap->close_callback = close_callback;
+  wrap->prev = nullptr;
+  wrap->next = state.head;
+  if (state.head != nullptr) {
+    state.head->prev = wrap;
+  }
+  state.head = wrap;
+  wrap->attached = true;
+}
+
+void UbiHandleWrapDetach(UbiHandleWrap* wrap) {
+  if (wrap == nullptr || wrap->env == nullptr || !wrap->attached) return;
+  std::lock_guard<std::mutex> lock(g_handle_wrap_env_states_mutex);
+  auto it = g_handle_wrap_env_states.find(wrap->env);
+  if (it == g_handle_wrap_env_states.end()) {
+    wrap->close_data = nullptr;
+    wrap->uv_handle = nullptr;
+    wrap->close_callback = nullptr;
+    wrap->prev = nullptr;
+    wrap->next = nullptr;
+    wrap->attached = false;
+    return;
+  }
+  UnlinkHandleWrapLocked(&it->second, wrap);
+  wrap->close_data = nullptr;
+  wrap->uv_handle = nullptr;
+  wrap->close_callback = nullptr;
+  MaybeEraseHandleWrapStateLocked(wrap->env);
 }
 
 napi_value UbiHandleWrapGetRefValue(napi_env env, napi_ref ref) {
@@ -177,6 +315,28 @@ void UbiHandleWrapReleaseWrapperRef(UbiHandleWrap* wrap) {
   }
 }
 
+bool UbiHandleWrapCancelFinalizer(UbiHandleWrap* wrap, void* native_object) {
+  if (wrap == nullptr ||
+      wrap->env == nullptr ||
+      wrap->wrapper_ref == nullptr ||
+      native_object == nullptr ||
+      wrap->finalized) {
+    return false;
+  }
+
+  napi_value self = UbiHandleWrapGetRefValue(wrap->env, wrap->wrapper_ref);
+  if (self == nullptr) return false;
+
+  void* removed = nullptr;
+  if (napi_remove_wrap(wrap->env, self, &removed) != napi_ok || removed != native_object) {
+    return false;
+  }
+
+  UbiHandleWrapDeleteRefIfPresent(wrap->env, &wrap->wrapper_ref);
+  wrap->wrapper_ref_held = false;
+  return true;
+}
+
 napi_value UbiHandleWrapGetActiveOwner(napi_env env, napi_ref wrapper_ref) {
   napi_value wrapper = UbiHandleWrapGetRefValue(env, wrapper_ref);
   if (wrapper == nullptr) return nullptr;
@@ -204,7 +364,12 @@ void UbiHandleWrapSetOnCloseCallback(napi_env env, napi_value wrapper, napi_valu
 }
 
 void UbiHandleWrapMaybeCallOnClose(UbiHandleWrap* wrap) {
-  if (wrap == nullptr || wrap->env == nullptr || wrap->finalized) return;
+  if (wrap == nullptr ||
+      wrap->env == nullptr ||
+      wrap->finalized ||
+      UbiHandleWrapEnvCleanupStarted(wrap->env)) {
+    return;
+  }
   napi_value self = UbiHandleWrapGetRefValue(wrap->env, wrap->wrapper_ref);
   if (self == nullptr) return;
 
@@ -232,4 +397,25 @@ void UbiHandleWrapMaybeCallOnClose(UbiHandleWrap* wrap) {
 bool UbiHandleWrapHasRef(const UbiHandleWrap* wrap, const uv_handle_t* handle) {
   if (wrap == nullptr || handle == nullptr || wrap->state != kUbiHandleInitialized) return false;
   return uv_has_ref(handle) != 0;
+}
+
+bool UbiHandleWrapEnvCleanupStarted(napi_env env) {
+  if (env == nullptr) return false;
+  std::lock_guard<std::mutex> lock(g_handle_wrap_env_states_mutex);
+  auto it = g_handle_wrap_env_states.find(env);
+  return it != g_handle_wrap_env_states.end() && it->second.cleanup_started;
+}
+
+void UbiHandleWrapRunEnvCleanup(napi_env env) {
+  if (env == nullptr) return;
+  {
+    std::lock_guard<std::mutex> lock(g_handle_wrap_env_states_mutex);
+    auto it = g_handle_wrap_env_states.find(env);
+    if (it == g_handle_wrap_env_states.end()) return;
+    if (it->second.cleanup_hook_registered) {
+      (void)napi_remove_env_cleanup_hook(env, OnHandleWrapEnvCleanup, env);
+      it->second.cleanup_hook_registered = false;
+    }
+  }
+  RunHandleWrapEnvCleanup(env);
 }

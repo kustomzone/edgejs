@@ -140,6 +140,12 @@ NAPI_EXTERN napi_status unofficial_napi_get_error_source_positions(
     napi_value error,
     unofficial_napi_error_source_positions* out);
 
+// Preserve the current engine-generated source arrow/message for an Error
+// object so later rethrows do not overwrite it with the rethrow callsite.
+NAPI_EXTERN napi_status unofficial_napi_preserve_error_source_message(
+    napi_env env,
+    napi_value error);
+
 // Unofficial helper used by module_wrap parity paths to tell the runtime's
 // PromiseReject callback machinery that a rejected promise is being handled
 // synchronously, matching Node's native ThrowIfPromiseRejected() helper.

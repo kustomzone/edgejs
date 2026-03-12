@@ -86,6 +86,17 @@ void QueueDestroy(SignalWrap* wrap) {
   // UbiAsyncWrapQueueDestroy(wrap->env, static_cast<double>(wrap->async_id));
 }
 
+void UnregisterActiveHandleIfPresent(SignalWrap* wrap, napi_env env_override = nullptr) {
+  if (wrap == nullptr || wrap->handle_wrap.active_handle_token == nullptr) return;
+  napi_env env = env_override != nullptr ? env_override : wrap->handle_wrap.env;
+  if (env != nullptr) {
+    UbiUnregisterActiveHandle(env, wrap->handle_wrap.active_handle_token);
+  }
+  wrap->handle_wrap.active_handle_token = nullptr;
+}
+
+void OnClosed(uv_handle_t* handle);
+
 void OnSignal(uv_signal_t* handle, int signum) {
   auto* wrap = static_cast<SignalWrap*>(handle->data);
   if (wrap == nullptr) return;
@@ -104,20 +115,38 @@ void OnSignal(uv_signal_t* handle, int signum) {
   UbiMakeCallback(wrap->handle_wrap.env, self, onsignal, 1, argv, &ignored);
 }
 
+void CloseSignalWrapHandle(SignalWrap* wrap) {
+  if (wrap == nullptr || wrap->handle_wrap.state != kUbiHandleInitialized) return;
+  if (wrap->active) {
+    DecreaseSignalHandlerCount(wrap->handle.signum);
+    wrap->active = false;
+  }
+  uv_handle_t* handle = reinterpret_cast<uv_handle_t*>(&wrap->handle);
+  if (!uv_is_closing(handle)) {
+    wrap->handle_wrap.state = kUbiHandleClosing;
+    uv_close(handle, OnClosed);
+  }
+}
+
+void CloseSignalWrapForCleanup(void* data) {
+  CloseSignalWrapHandle(static_cast<SignalWrap*>(data));
+}
+
 void OnClosed(uv_handle_t* handle) {
   auto* wrap = static_cast<SignalWrap*>(handle->data);
   if (wrap == nullptr) return;
   wrap->handle_wrap.state = kUbiHandleClosed;
   QueueDestroy(wrap);
 
+  UbiHandleWrapDetach(&wrap->handle_wrap);
+  UnregisterActiveHandleIfPresent(wrap);
   UbiHandleWrapMaybeCallOnClose(&wrap->handle_wrap);
 
-  if (wrap->handle_wrap.active_handle_token != nullptr) {
-    UbiUnregisterActiveHandle(wrap->handle_wrap.env, wrap->handle_wrap.active_handle_token);
-    wrap->handle_wrap.active_handle_token = nullptr;
+  bool can_delete = wrap->handle_wrap.finalized;
+  if (!can_delete && wrap->handle_wrap.delete_on_close) {
+    can_delete = UbiHandleWrapCancelFinalizer(&wrap->handle_wrap, wrap);
   }
-
-  if (wrap->handle_wrap.delete_on_close || wrap->handle_wrap.finalized) {
+  if (can_delete) {
     delete wrap;
   }
 }
@@ -128,24 +157,14 @@ void SignalFinalize(napi_env env, void* data, void* /*hint*/) {
   wrap->handle_wrap.finalized = true;
   UbiHandleWrapDeleteRefIfPresent(env, &wrap->handle_wrap.wrapper_ref);
   if (wrap->handle_wrap.state == kUbiHandleUninitialized || wrap->handle_wrap.state == kUbiHandleClosed) {
-    if (wrap->handle_wrap.active_handle_token != nullptr) {
-      UbiUnregisterActiveHandle(env, wrap->handle_wrap.active_handle_token);
-      wrap->handle_wrap.active_handle_token = nullptr;
-    }
+    UbiHandleWrapDetach(&wrap->handle_wrap);
+    UnregisterActiveHandleIfPresent(wrap, env);
     QueueDestroy(wrap);
     delete wrap;
     return;
   }
-  if (wrap->active) {
-    DecreaseSignalHandlerCount(wrap->handle.signum);
-    wrap->active = false;
-  }
   wrap->handle_wrap.delete_on_close = true;
-  uv_handle_t* handle = reinterpret_cast<uv_handle_t*>(&wrap->handle);
-  if (!uv_is_closing(handle)) {
-    wrap->handle_wrap.state = kUbiHandleClosing;
-    uv_close(handle, OnClosed);
-  }
+  CloseSignalWrapHandle(wrap);
   return;
 }
 
@@ -163,6 +182,10 @@ napi_value SignalCtor(napi_env env, napi_callback_info info) {
   if (rc == 0) {
     wrap->handle_wrap.state = kUbiHandleInitialized;
     wrap->handle.data = wrap;
+    UbiHandleWrapAttach(&wrap->handle_wrap,
+                        wrap,
+                        reinterpret_cast<uv_handle_t*>(&wrap->handle),
+                        CloseSignalWrapForCleanup);
   }
   napi_wrap(env, self, wrap, SignalFinalize, nullptr, &wrap->handle_wrap.wrapper_ref);
   wrap->handle_wrap.active_handle_token =
@@ -239,17 +262,8 @@ napi_value SignalClose(napi_env env, napi_callback_info info) {
     }
   }
 
-  if (wrap->active) {
-    DecreaseSignalHandlerCount(wrap->handle.signum);
-    wrap->active = false;
-  }
-
   if (wrap->handle_wrap.state == kUbiHandleInitialized) {
-    uv_handle_t* handle = reinterpret_cast<uv_handle_t*>(&wrap->handle);
-    if (!uv_is_closing(handle)) {
-      wrap->handle_wrap.state = kUbiHandleClosing;
-      uv_close(handle, OnClosed);
-    }
+    CloseSignalWrapHandle(wrap);
   } else {
     QueueDestroy(wrap);
   }

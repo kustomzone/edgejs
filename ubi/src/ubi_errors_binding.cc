@@ -381,6 +381,9 @@ napi_value ErrorsTriggerUncaughtException(napi_env env, napi_callback_info info)
     invoke_ref_callback(st_it->second.enhance_fatal_stack_after_inspector_ref);
   }
 
+  // Match Node's native fatal path by preserving the original engine-provided
+  // source arrow before the exception crosses back through JS.
+  (void)unofficial_napi_preserve_error_source_message(env, exception);
   napi_throw(env, exception);
   return MakeUndefined(env);
 }

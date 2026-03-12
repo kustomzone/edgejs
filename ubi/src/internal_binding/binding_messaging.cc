@@ -10,6 +10,7 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include <uv.h>
@@ -90,6 +91,7 @@ constexpr napi_type_tag kMessagePortTypeTag = {
 
 std::unordered_map<napi_env, MessagingState> g_messaging_states;
 std::unordered_set<napi_env> g_messaging_cleanup_hook_registered;
+std::mutex g_messaging_mu;
 std::mutex g_broadcast_groups_mutex;
 std::unordered_map<std::string, std::weak_ptr<BroadcastChannelGroup>> g_broadcast_groups;
 
@@ -118,6 +120,9 @@ bool ValueUsesTransferArrayBuffer(napi_env env,
                                   napi_value value,
                                   napi_value target_arraybuffer,
                                   std::vector<napi_value>* seen);
+void OnMessagingEnvCleanup(void* data);
+napi_value GetRefValue(napi_env env, napi_ref ref);
+void SetRefToValue(napi_env env, napi_ref* slot, napi_value value);
 
 napi_value GetNamed(napi_env env, napi_value obj, const char* key) {
   napi_value out = nullptr;
@@ -191,8 +196,104 @@ void DeleteTransferredPortRefs(napi_env env,
   }
 }
 
+void EnsureMessagingCleanupHookLocked(napi_env env) {
+  if (env == nullptr) return;
+  auto [it, inserted] = g_messaging_cleanup_hook_registered.emplace(env);
+  if (!inserted) return;
+  if (napi_add_env_cleanup_hook(env, OnMessagingEnvCleanup, env) != napi_ok) {
+    g_messaging_cleanup_hook_registered.erase(it);
+  }
+}
+
+MessagingState& EnsureMessagingStateLocked(napi_env env) {
+  EnsureMessagingCleanupHookLocked(env);
+  return g_messaging_states[env];
+}
+
+MessagingState* FindMessagingStateLocked(napi_env env) {
+  auto it = g_messaging_states.find(env);
+  return it == g_messaging_states.end() ? nullptr : &it->second;
+}
+
+template <typename Callback>
+auto WithMessagingState(napi_env env, Callback&& callback)
+    -> decltype(std::forward<Callback>(callback)(std::declval<MessagingState&>())) {
+  std::lock_guard<std::mutex> lock(g_messaging_mu);
+  return std::forward<Callback>(callback)(EnsureMessagingStateLocked(env));
+}
+
+template <typename Callback>
+auto WithExistingMessagingState(napi_env env, Callback&& callback)
+    -> decltype(std::forward<Callback>(callback)(static_cast<MessagingState*>(nullptr))) {
+  std::lock_guard<std::mutex> lock(g_messaging_mu);
+  return std::forward<Callback>(callback)(FindMessagingStateLocked(env));
+}
+
+template <typename Callback>
+auto WithMessagingStateRefValue(napi_env env, napi_ref MessagingState::*slot, Callback&& callback)
+    -> decltype(std::forward<Callback>(callback)(static_cast<napi_value>(nullptr))) {
+  return WithExistingMessagingState(
+      env,
+      [&](MessagingState* state) {
+        if (state == nullptr) {
+          return std::forward<Callback>(callback)(nullptr);
+        }
+        return std::forward<Callback>(callback)(GetRefValue(env, state->*slot));
+      });
+}
+
+void SetMessagingStateRefValue(napi_env env, napi_ref MessagingState::*slot, napi_value value) {
+  if (env == nullptr) return;
+  std::lock_guard<std::mutex> lock(g_messaging_mu);
+  MessagingState& state = EnsureMessagingStateLocked(env);
+  SetRefToValue(env, &(state.*slot), value);
+}
+
+napi_value ResolveMessagingRegisteredSymbol(napi_env env,
+                                           napi_ref MessagingState::*slot,
+                                           const char* name) {
+  napi_value cached = WithMessagingStateRefValue(
+      env,
+      slot,
+      [](napi_value value) { return value; });
+  if (cached != nullptr && !IsUndefinedValue(env, cached)) return cached;
+
+  napi_value global = GetGlobal(env);
+  napi_value symbol_ctor = GetNamed(env, global, "Symbol");
+  napi_value for_fn = GetNamed(env, symbol_ctor, "for");
+  if (!IsFunction(env, for_fn)) return nullptr;
+
+  napi_value name_value = nullptr;
+  if (napi_create_string_utf8(env, name, NAPI_AUTO_LENGTH, &name_value) != napi_ok ||
+      name_value == nullptr) {
+    return nullptr;
+  }
+
+  napi_value symbol = nullptr;
+  napi_value argv[1] = {name_value};
+  if (napi_call_function(env, symbol_ctor, for_fn, 1, argv, &symbol) != napi_ok || symbol == nullptr) {
+    ClearPendingException(env);
+    return nullptr;
+  }
+
+  SetMessagingStateRefValue(env, slot, symbol);
+  return symbol;
+}
+
+napi_value GetSharedHandleValue(napi_env env, uint32_t handle_id) {
+  return WithExistingMessagingState(
+      env,
+      [&](MessagingState* state) -> napi_value {
+        if (state == nullptr) return nullptr;
+        auto ref_it = state->shared_handle_refs.find(handle_id);
+        if (ref_it == state->shared_handle_refs.end()) return nullptr;
+        return GetRefValue(env, ref_it->second);
+      });
+}
+
 void OnMessagingEnvCleanup(void* data) {
   napi_env env = static_cast<napi_env>(data);
+  std::lock_guard<std::mutex> lock(g_messaging_mu);
   g_messaging_cleanup_hook_registered.erase(env);
 
   auto it = g_messaging_states.find(env);
@@ -215,17 +316,8 @@ void OnMessagingEnvCleanup(void* data) {
 }
 
 void EnsureMessagingCleanupHook(napi_env env) {
-  if (env == nullptr) return;
-  auto [it, inserted] = g_messaging_cleanup_hook_registered.emplace(env);
-  if (!inserted) return;
-  if (napi_add_env_cleanup_hook(env, OnMessagingEnvCleanup, env) != napi_ok) {
-    g_messaging_cleanup_hook_registered.erase(it);
-  }
-}
-
-MessagingState& EnsureMessagingState(napi_env env) {
-  EnsureMessagingCleanupHook(env);
-  return g_messaging_states[env];
+  std::lock_guard<std::mutex> lock(g_messaging_mu);
+  EnsureMessagingCleanupHookLocked(env);
 }
 
 void ThrowTypeErrorWithCode(napi_env env, const char* code, const char* message) {
@@ -466,23 +558,24 @@ bool ThrowDirectCloneFailureIfDetected(napi_env env, napi_value value) {
 }
 
 napi_value ResolveHybridDispatchSymbol(napi_env env) {
-  auto& state = EnsureMessagingState(env);
-  return ResolveRegisteredSymbol(env,
-                                 &state.hybrid_dispatch_symbol_ref,
-                                 "nodejs.internal.kHybridDispatch");
+  return ResolveMessagingRegisteredSymbol(
+      env,
+      &MessagingState::hybrid_dispatch_symbol_ref,
+      "nodejs.internal.kHybridDispatch");
 }
 
 napi_value ResolveCurrentlyReceivingPortsSymbol(napi_env env) {
-  auto& state = EnsureMessagingState(env);
-  return ResolveRegisteredSymbol(env,
-                                 &state.currently_receiving_ports_symbol_ref,
-                                 "nodejs.internal.kCurrentlyReceivingPorts");
+  return ResolveMessagingRegisteredSymbol(
+      env,
+      &MessagingState::currently_receiving_ports_symbol_ref,
+      "nodejs.internal.kCurrentlyReceivingPorts");
 }
 
 napi_value GetMessagePortCtorToken(napi_env env) {
-  auto it = g_messaging_states.find(env);
-  if (it == g_messaging_states.end()) return nullptr;
-  return GetRefValue(env, it->second.message_port_ctor_token_ref);
+  return WithMessagingStateRefValue(
+      env,
+      &MessagingState::message_port_ctor_token_ref,
+      [](napi_value value) { return value; });
 }
 
 bool IsInternalMessagePortCtorCall(napi_env env, size_t argc, napi_value* argv) {
@@ -685,20 +778,25 @@ bool IsSocketAddressHandleCloneMarker(napi_env env, napi_value value, napi_value
 }
 
 napi_value CreateBlockListHandleCloneMarker(napi_env env, napi_value handle) {
-  auto it = g_messaging_states.find(env);
-  if (it == g_messaging_states.end()) return nullptr;
-
-  const uint32_t id = it->second.next_shared_handle_id++;
+  uint32_t id = 0;
   napi_ref handle_ref = nullptr;
-  if (napi_create_reference(env, handle, 1, &handle_ref) != napi_ok || handle_ref == nullptr) {
-    return nullptr;
+  {
+    std::lock_guard<std::mutex> lock(g_messaging_mu);
+    MessagingState& state = EnsureMessagingStateLocked(env);
+    id = state.next_shared_handle_id++;
+    if (napi_create_reference(env, handle, 1, &handle_ref) != napi_ok || handle_ref == nullptr) {
+      return nullptr;
+    }
+    state.shared_handle_refs[id] = handle_ref;
   }
-  it->second.shared_handle_refs[id] = handle_ref;
 
   napi_value id_value = nullptr;
   if (napi_create_uint32(env, id, &id_value) != napi_ok || id_value == nullptr) {
+    std::lock_guard<std::mutex> lock(g_messaging_mu);
     napi_delete_reference(env, handle_ref);
-    it->second.shared_handle_refs.erase(id);
+    if (MessagingState* state = FindMessagingStateLocked(env)) {
+      state->shared_handle_refs.erase(id);
+    }
     return nullptr;
   }
 
@@ -1044,14 +1142,7 @@ napi_value ExtractHandleFromTransferableClone(napi_env env, napi_value value) {
 napi_value CreateBlockListHandleFromCloneData(napi_env env, napi_value rules) {
   uint32_t handle_id = 0;
   if (rules != nullptr && napi_get_value_uint32(env, rules, &handle_id) == napi_ok) {
-    auto it = g_messaging_states.find(env);
-    if (it != g_messaging_states.end()) {
-      auto ref_it = it->second.shared_handle_refs.find(handle_id);
-      if (ref_it != it->second.shared_handle_refs.end()) {
-        return GetRefValue(env, ref_it->second);
-      }
-    }
-    return nullptr;
+    return GetSharedHandleValue(env, handle_id);
   }
 
   napi_value blocklist_module = TryRequireModule(env, "internal/blocklist");
@@ -1209,10 +1300,10 @@ napi_value RestoreTransferableDataAfterStructuredClone(napi_env env, napi_value 
 napi_value DeserializeJSTransferableCloneMarker(napi_env env, napi_value data, napi_value deserialize_info) {
   if (data == nullptr || deserialize_info == nullptr) return nullptr;
 
-  auto it = g_messaging_states.find(env);
-  if (it == g_messaging_states.end() || it->second.deserializer_create_object_ref == nullptr) return nullptr;
-
-  napi_value deserializer_factory = GetRefValue(env, it->second.deserializer_create_object_ref);
+  napi_value deserializer_factory = WithMessagingStateRefValue(
+      env,
+      &MessagingState::deserializer_create_object_ref,
+      [](napi_value value) { return value; });
   if (!IsFunction(env, deserializer_factory)) return nullptr;
 
   napi_value receiver = Undefined(env);
@@ -1675,9 +1766,10 @@ bool IsMessagePortValue(napi_env env, napi_value value) {
   if (value == nullptr) return false;
   napi_valuetype type = napi_undefined;
   if (napi_typeof(env, value, &type) != napi_ok || type != napi_object) return false;
-  auto it = g_messaging_states.find(env);
-  if (it == g_messaging_states.end()) return false;
-  napi_value ctor = GetRefValue(env, it->second.message_port_ctor_ref);
+  napi_value ctor = WithMessagingStateRefValue(
+      env,
+      &MessagingState::message_port_ctor_ref,
+      [](napi_value value) { return value; });
   if (!IsFunction(env, ctor)) return false;
   bool is_instance = false;
   if (napi_instanceof(env, value, ctor, &is_instance) != napi_ok || !is_instance) {
@@ -1989,15 +2081,17 @@ bool EnsureNoMissingTransferredMessagePorts(napi_env env, napi_value value, napi
 }
 
 napi_value GetNoMessageSymbol(napi_env env) {
-  const auto it = g_messaging_states.find(env);
-  if (it == g_messaging_states.end()) return nullptr;
-  return GetRefValue(env, it->second.no_message_symbol_ref);
+  return WithMessagingStateRefValue(
+      env,
+      &MessagingState::no_message_symbol_ref,
+      [](napi_value value) { return value; });
 }
 
 napi_value GetOnInitSymbol(napi_env env) {
-  const auto it = g_messaging_states.find(env);
-  if (it == g_messaging_states.end()) return nullptr;
-  return GetRefValue(env, it->second.oninit_symbol_ref);
+  return WithMessagingStateRefValue(
+      env,
+      &MessagingState::oninit_symbol_ref,
+      [](napi_value value) { return value; });
 }
 
 void ThrowIllegalInvocation(napi_env env) {
@@ -3006,6 +3100,7 @@ void EnqueueMessageToPort(napi_env env,
 }
 
 void BeginClosePort(napi_env env, MessagePortWrap* wrap, bool notify_peer);
+void DisentanglePeer(napi_env env, MessagePortWrap* wrap, bool enqueue_close);
 void OnMessagePortClosed(uv_handle_t* handle);
 void EmitMessageToPort(napi_env env,
                        napi_value port,
@@ -3109,19 +3204,28 @@ void OnMessagePortClosed(uv_handle_t* handle) {
   auto* wrap = static_cast<MessagePortWrap*>(handle != nullptr ? handle->data : nullptr);
   if (wrap == nullptr) return;
   wrap->handle_wrap.state = kUbiHandleClosed;
+  if (UbiHandleWrapEnvCleanupStarted(wrap->handle_wrap.env)) {
+    wrap->handle_wrap.delete_on_close = true;
+  }
+  DisentanglePeer(wrap->handle_wrap.env, wrap, true);
+  UbiHandleWrapDetach(&wrap->handle_wrap);
   UbiHandleWrapReleaseWrapperRef(&wrap->handle_wrap);
-  UbiHandleWrapMaybeCallOnClose(&wrap->handle_wrap);
   if (wrap->handle_wrap.active_handle_token != nullptr) {
     UbiUnregisterActiveHandle(wrap->handle_wrap.env, wrap->handle_wrap.active_handle_token);
     wrap->handle_wrap.active_handle_token = nullptr;
   }
+  UbiHandleWrapMaybeCallOnClose(&wrap->handle_wrap);
   if (wrap->data) {
     std::lock_guard<std::mutex> lock(wrap->data->mutex);
     if (wrap->data->attached_wrap == wrap) {
       wrap->data->attached_wrap = nullptr;
     }
   }
-  if (wrap->handle_wrap.finalized || wrap->handle_wrap.delete_on_close) {
+  bool can_delete = wrap->handle_wrap.finalized;
+  if (!can_delete && wrap->handle_wrap.delete_on_close) {
+    can_delete = UbiHandleWrapCancelFinalizer(&wrap->handle_wrap, wrap);
+  }
+  if (can_delete) {
     if (wrap->async_id > 0) {
       UbiAsyncWrapQueueDestroyId(wrap->handle_wrap.env, wrap->async_id);
       wrap->async_id = 0;
@@ -3180,13 +3284,25 @@ void BeginClosePort(napi_env env, MessagePortWrap* wrap, bool notify_peer) {
   uv_close(reinterpret_cast<uv_handle_t*>(&wrap->async), OnMessagePortClosed);
 }
 
+void CloseMessagePortForCleanup(void* data) {
+  auto* wrap = static_cast<MessagePortWrap*>(data);
+  if (wrap == nullptr) return;
+  wrap->handle_wrap.delete_on_close = true;
+  BeginClosePort(wrap->handle_wrap.env, wrap, false);
+}
+
 void MessagePortFinalize(napi_env env, void* data, void* /*hint*/) {
   auto* wrap = static_cast<MessagePortWrap*>(data);
   if (wrap == nullptr) return;
   wrap->handle_wrap.finalized = true;
   UbiHandleWrapDeleteRefIfPresent(env, &wrap->handle_wrap.wrapper_ref);
   if (wrap->handle_wrap.state == kUbiHandleUninitialized || wrap->handle_wrap.state == kUbiHandleClosed) {
+    UbiHandleWrapDetach(&wrap->handle_wrap);
     DeleteQueuedMessages(env, wrap);
+    if (wrap->async_id > 0) {
+      UbiAsyncWrapQueueDestroyId(env, wrap->async_id);
+      wrap->async_id = 0;
+    }
     if (wrap->handle_wrap.active_handle_token != nullptr) {
       UbiUnregisterActiveHandle(env, wrap->handle_wrap.active_handle_token);
       wrap->handle_wrap.active_handle_token = nullptr;
@@ -3195,7 +3311,6 @@ void MessagePortFinalize(napi_env env, void* data, void* /*hint*/) {
     return;
   }
   wrap->handle_wrap.delete_on_close = true;
-  DisentanglePeer(env, wrap, true);
   if (wrap->handle_wrap.state == kUbiHandleInitialized &&
       !uv_is_closing(reinterpret_cast<uv_handle_t*>(&wrap->async))) {
     wrap->handle_wrap.state = kUbiHandleClosing;
@@ -3257,9 +3372,14 @@ void ConnectPorts(napi_env env, napi_value first, napi_value second) {
 }
 
 bool EnsureMessagingSymbols(napi_env env, const ResolveOptions& options) {
-  auto& state = EnsureMessagingState(env);
-  if (state.no_message_symbol_ref != nullptr &&
-      state.oninit_symbol_ref != nullptr) {
+  const bool already_cached = WithExistingMessagingState(
+      env,
+      [](MessagingState* state) {
+        return state != nullptr &&
+               state->no_message_symbol_ref != nullptr &&
+               state->oninit_symbol_ref != nullptr;
+      });
+  if (already_cached) {
     return true;
   }
   napi_value symbols = nullptr;
@@ -3282,10 +3402,14 @@ bool EnsureMessagingSymbols(napi_env env, const ResolveOptions& options) {
   }
   if (symbols == nullptr || IsUndefined(env, symbols)) return false;
 
-  SetRefToValue(env, &state.no_message_symbol_ref, GetNamed(env, symbols, "no_message_symbol"));
-  SetRefToValue(env, &state.oninit_symbol_ref, GetNamed(env, symbols, "oninit"));
+  SetMessagingStateRefValue(env, &MessagingState::no_message_symbol_ref, GetNamed(env, symbols, "no_message_symbol"));
+  SetMessagingStateRefValue(env, &MessagingState::oninit_symbol_ref, GetNamed(env, symbols, "oninit"));
 
-  return state.no_message_symbol_ref != nullptr;
+  return WithExistingMessagingState(
+      env,
+      [](MessagingState* state) {
+        return state != nullptr && state->no_message_symbol_ref != nullptr;
+      });
 }
 
 napi_value MessagePortConstructorCallback(napi_env env, napi_callback_info info) {
@@ -3319,6 +3443,10 @@ napi_value MessagePortConstructorCallback(napi_env env, napi_callback_info info)
   if (rc == 0) {
     wrap->async.data = wrap;
     wrap->handle_wrap.state = kUbiHandleInitialized;
+    UbiHandleWrapAttach(&wrap->handle_wrap,
+                        wrap,
+                        reinterpret_cast<uv_handle_t*>(&wrap->async),
+                        CloseMessagePortForCleanup);
     UbiHandleWrapHoldWrapperRef(&wrap->handle_wrap);
     wrap->async_id = UbiAsyncWrapNextId(env);
     UbiAsyncWrapEmitInit(
@@ -3444,7 +3572,7 @@ napi_value MessagePortPostMessageCallback(napi_env env, napi_callback_info info)
     if (target_in_transfer_list) {
       DetachTransferredPorts(env, &transferred_ports);
       EmitProcessWarning(env, "The target port was posted to itself, and the communication channel was lost");
-      BeginClosePort(env, wrap, true);
+      BeginClosePort(env, wrap, false);
       napi_value true_value = nullptr;
       napi_get_boolean(env, true, &true_value);
       return true_value;
@@ -3509,7 +3637,7 @@ napi_value MessagePortCloseCallback(napi_env env, napi_callback_info info) {
   }
   MessagePortWrap* wrap = UnwrapMessagePortThisOrThrow(env, this_arg);
   if (wrap == nullptr) return nullptr;
-  BeginClosePort(env, wrap, true);
+  BeginClosePort(env, wrap, false);
   return Undefined(env);
 }
 
@@ -3556,11 +3684,14 @@ napi_value MessagePortHasRefCallback(napi_env env, napi_callback_info info) {
 }
 
 napi_value CreateInternalMessagePortInstance(napi_env env) {
-  auto it = g_messaging_states.find(env);
-  if (it == g_messaging_states.end()) return nullptr;
-
-  napi_value ctor = GetRefValue(env, it->second.message_port_ctor_ref);
-  napi_value token = GetRefValue(env, it->second.message_port_ctor_token_ref);
+  napi_value ctor = WithMessagingStateRefValue(
+      env,
+      &MessagingState::message_port_ctor_ref,
+      [](napi_value value) { return value; });
+  napi_value token = WithMessagingStateRefValue(
+      env,
+      &MessagingState::message_port_ctor_token_ref,
+      [](napi_value value) { return value; });
   if (!IsFunction(env, ctor) || token == nullptr) return nullptr;
 
   napi_value port = nullptr;
@@ -3583,9 +3714,6 @@ napi_value MessageChannelConstructorCallback(napi_env env, napi_callback_info in
     return nullptr;
   }
 
-  auto it = g_messaging_states.find(env);
-  if (it == g_messaging_states.end()) return this_arg;
-
   napi_value port1 = CreateInternalMessagePortInstance(env);
   napi_value port2 = CreateInternalMessagePortInstance(env);
   if (port1 == nullptr || port2 == nullptr) return this_arg;
@@ -3605,17 +3733,24 @@ napi_value ExposeLazyDOMExceptionPropertyCallback(napi_env env, napi_callback_in
   napi_valuetype target_type = napi_undefined;
   if (napi_typeof(env, argv[0], &target_type) != napi_ok || target_type != napi_object) return Undefined(env);
 
-  napi_value global = GetGlobal(env);
-  napi_value dom_exception = GetNamed(env, global, "DOMException");
-  if (dom_exception == nullptr || IsUndefined(env, dom_exception)) {
-    dom_exception = ResolveDOMExceptionValue(env);
-  }
-  if (dom_exception == nullptr || IsUndefined(env, dom_exception)) return Undefined(env);
-
   napi_property_descriptor desc = {};
   desc.utf8name = "DOMException";
-  desc.value = dom_exception;
-  desc.attributes = static_cast<napi_property_attributes>(napi_writable | napi_configurable);
+  desc.getter = [](napi_env env, napi_callback_info info) -> napi_value {
+    napi_value this_arg = nullptr;
+    if (napi_get_cb_info(env, info, nullptr, nullptr, &this_arg, nullptr) != napi_ok || this_arg == nullptr) {
+      return Undefined(env);
+    }
+    napi_value dom_exception = ResolveDOMExceptionValue(env);
+    if (dom_exception == nullptr || IsUndefined(env, dom_exception)) return Undefined(env);
+
+    napi_property_descriptor value_desc = {};
+    value_desc.utf8name = "DOMException";
+    value_desc.value = dom_exception;
+    value_desc.attributes = static_cast<napi_property_attributes>(napi_writable | napi_configurable);
+    (void)napi_define_properties(env, this_arg, 1, &value_desc);
+    return dom_exception;
+  };
+  desc.attributes = napi_configurable;
   napi_define_properties(env, argv[0], 1, &desc);
   return Undefined(env);
 }
@@ -3625,11 +3760,10 @@ napi_value SetDeserializerCreateObjectFunctionCallback(napi_env env, napi_callba
   napi_value argv[1] = {nullptr};
   if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok) return nullptr;
 
-  auto& state = EnsureMessagingState(env);
-  DeleteRefIfPresent(env, &state.deserializer_create_object_ref);
-  if (argc >= 1 && IsFunction(env, argv[0])) {
-    napi_create_reference(env, argv[0], 1, &state.deserializer_create_object_ref);
-  }
+  SetMessagingStateRefValue(
+      env,
+      &MessagingState::deserializer_create_object_ref,
+      argc >= 1 && IsFunction(env, argv[0]) ? argv[0] : nullptr);
   return Undefined(env);
 }
 
@@ -3723,9 +3857,6 @@ napi_value BroadcastChannelCallback(napi_env env, napi_callback_info info) {
   if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok) return Undefined(env);
 
   const std::string name = (argc >= 1 && argv[0] != nullptr) ? ValueToUtf8(env, argv[0]) : std::string();
-  auto it = g_messaging_states.find(env);
-  if (it == g_messaging_states.end()) return Undefined(env);
-
   napi_value handle = CreateInternalMessagePortInstance(env);
   if (handle == nullptr) return Undefined(env);
 
@@ -3917,7 +4048,6 @@ napi_value CreateMovedMessagePortWrapperInContext(napi_env env,
                                                   napi_value native_port) {
   if (env == nullptr || contextified_object == nullptr || native_port == nullptr) return nullptr;
 
-  auto& state = EnsureMessagingState(env);
   napi_value native_move_fn = nullptr;
   napi_value native_post_message_fn = nullptr;
   if (napi_create_function(env,
@@ -3937,7 +4067,10 @@ napi_value CreateMovedMessagePortWrapperInContext(napi_env env,
     return nullptr;
   }
 
-  napi_value native_ctor = GetRefValue(env, state.message_port_ctor_ref);
+  napi_value native_ctor = WithMessagingStateRefValue(
+      env,
+      &MessagingState::message_port_ctor_ref,
+      [](napi_value value) { return value; });
   napi_value native_key_object_ctor = GetCryptoModuleCtor(env, "KeyObject");
   napi_value private_symbols = UbiGetPrivateSymbols(env);
   napi_value transfer_mode_symbol =
@@ -4389,100 +4522,40 @@ napi_value StopMessagePortCallback(napi_env env, napi_callback_info info) {
   return Undefined(env);
 }
 
-napi_value FallbackDOMExceptionConstructorCallback(napi_env env, napi_callback_info info) {
-  size_t argc = 2;
-  napi_value argv[2] = {nullptr, nullptr};
-  napi_value this_arg = nullptr;
-  if (napi_get_cb_info(env, info, &argc, argv, &this_arg, nullptr) != napi_ok || this_arg == nullptr) {
-    return nullptr;
-  }
-
-  const std::string message =
-      (argc >= 1 && argv[0] != nullptr) ? ValueToUtf8(env, argv[0]) : std::string();
-  const std::string name =
-      (argc >= 2 && argv[1] != nullptr) ? ValueToUtf8(env, argv[1]) : std::string("Error");
-
-  napi_value message_value = nullptr;
-  napi_value name_value = nullptr;
-  napi_create_string_utf8(env, message.c_str(), NAPI_AUTO_LENGTH, &message_value);
-  napi_create_string_utf8(env, name.c_str(), NAPI_AUTO_LENGTH, &name_value);
-  if (message_value != nullptr) napi_set_named_property(env, this_arg, "message", message_value);
-  if (name_value != nullptr) napi_set_named_property(env, this_arg, "name", name_value);
-  SetInt32(env, this_arg, "code", 0);
-  return this_arg;
-}
-
-napi_value CreateFallbackDOMExceptionConstructor(napi_env env) {
-  napi_value ctor = nullptr;
-  if (napi_define_class(env,
-                        "DOMException",
-                        NAPI_AUTO_LENGTH,
-                        FallbackDOMExceptionConstructorCallback,
-                        nullptr,
-                        0,
-                        nullptr,
-                        &ctor) != napi_ok ||
-      ctor == nullptr) {
-    return nullptr;
-  }
-
-  napi_value global = GetGlobal(env);
-  napi_value object_ctor = GetNamed(env, global, "Object");
-  napi_value set_prototype_of = GetNamed(env, object_ctor, "setPrototypeOf");
-  napi_value error_ctor = GetNamed(env, global, "Error");
-  napi_value error_prototype = GetNamed(env, error_ctor, "prototype");
-  napi_value dom_prototype = GetNamed(env, ctor, "prototype");
-  if (IsFunction(env, set_prototype_of) && dom_prototype != nullptr && error_prototype != nullptr) {
-    napi_value argv[2] = {dom_prototype, error_prototype};
-    napi_value ignored = nullptr;
-    if (napi_call_function(env, object_ctor, set_prototype_of, 2, argv, &ignored) != napi_ok) {
-      ClearPendingException(env);
-    }
-  }
-  return ctor;
-}
-
 napi_value ResolveDOMExceptionValue(napi_env env) {
+  napi_value per_context_exports = UbiGetPerContextExports(env);
+  if (per_context_exports != nullptr && !IsUndefined(env, per_context_exports)) {
+    napi_value dom_exception = GetNamed(env, per_context_exports, "DOMException");
+    if (IsFunction(env, dom_exception)) return dom_exception;
+  }
+
   napi_value global = GetGlobal(env);
   napi_value dom_exception = GetNamed(env, global, "DOMException");
-  if (dom_exception != nullptr && !IsUndefined(env, dom_exception)) return dom_exception;
-
-  napi_value dom_module = TryRequireModule(env, "internal/per_context/domexception");
-  if (dom_module != nullptr && !IsUndefined(env, dom_module)) {
-    dom_exception = GetNamed(env, dom_module, "DOMException");
-    if (dom_exception != nullptr && !IsUndefined(env, dom_exception)) return dom_exception;
-    dom_exception = GetNamed(env, dom_module, "default");
-    if (dom_exception != nullptr && !IsUndefined(env, dom_exception)) return dom_exception;
-  }
-
-  dom_exception = CreateFallbackDOMExceptionConstructor(env);
-  if (dom_exception != nullptr && !IsUndefined(env, dom_exception)) {
-    napi_set_named_property(env, global, "DOMException", dom_exception);
-    return dom_exception;
-  }
-
-  return Undefined(env);
+  return IsFunction(env, dom_exception) ? dom_exception : Undefined(env);
 }
 
 napi_value ResolveEmitMessageValue(napi_env env) {
-  auto& state = EnsureMessagingState(env);
-  napi_value cached = GetRefValue(env, state.emit_message_ref);
+  napi_value cached = WithMessagingStateRefValue(
+      env,
+      &MessagingState::emit_message_ref,
+      [](napi_value value) { return value; });
   if (IsFunction(env, cached)) return cached;
 
-  napi_value messageport_module = TryRequireModule(env, "internal/per_context/messageport");
-  if (messageport_module == nullptr || IsUndefined(env, messageport_module)) return nullptr;
+  napi_value per_context_exports = UbiGetPerContextExports(env);
+  if (per_context_exports == nullptr || IsUndefined(env, per_context_exports)) return nullptr;
 
-  napi_value emit_message = GetNamed(env, messageport_module, "emitMessage");
+  napi_value emit_message = GetNamed(env, per_context_exports, "emitMessage");
   if (!IsFunction(env, emit_message)) return nullptr;
 
-  SetRefToValue(env, &state.emit_message_ref, emit_message);
+  SetMessagingStateRefValue(env, &MessagingState::emit_message_ref, emit_message);
   return emit_message;
 }
 
 napi_value GetCachedMessaging(napi_env env) {
-  auto it = g_messaging_states.find(env);
-  if (it == g_messaging_states.end() || it->second.binding_ref == nullptr) return nullptr;
-  return GetRefValue(env, it->second.binding_ref);
+  return WithMessagingStateRefValue(
+      env,
+      &MessagingState::binding_ref,
+      [](napi_value value) { return value; });
 }
 
 }  // namespace
@@ -4504,8 +4577,6 @@ UbiMessagePortDataPtr UbiGetMessagePortData(napi_env env, napi_value value) {
 
 napi_value UbiCreateMessagePortForData(napi_env env, const UbiMessagePortDataPtr& data) {
   if (!data) return Undefined(env);
-  auto it = g_messaging_states.find(env);
-  if (it == g_messaging_states.end()) return Undefined(env);
 
   napi_value port = CreateInternalMessagePortInstance(env);
   if (port == nullptr) return Undefined(env);
@@ -4539,7 +4610,7 @@ napi_value ResolveMessaging(napi_env env, const ResolveOptions& options) {
   napi_value cached = GetCachedMessaging(env);
   if (cached != nullptr) return cached;
 
-  auto& state = EnsureMessagingState(env);
+  EnsureMessagingCleanupHook(env);
   EnsureMessagingSymbols(env, options);
 
   napi_value out = nullptr;
@@ -4547,7 +4618,7 @@ napi_value ResolveMessaging(napi_env env, const ResolveOptions& options) {
 
   napi_value message_port_ctor_token = nullptr;
   if (napi_create_object(env, &message_port_ctor_token) == napi_ok && message_port_ctor_token != nullptr) {
-    SetRefToValue(env, &state.message_port_ctor_token_ref, message_port_ctor_token);
+    SetMessagingStateRefValue(env, &MessagingState::message_port_ctor_token_ref, message_port_ctor_token);
   }
 
   napi_value message_port_ctor = nullptr;
@@ -4575,7 +4646,7 @@ napi_value ResolveMessaging(napi_env env, const ResolveOptions& options) {
       napi_define_properties(env, prototype, sizeof(methods) / sizeof(methods[0]), methods);
     }
     napi_set_named_property(env, out, "MessagePort", message_port_ctor);
-    SetRefToValue(env, &state.message_port_ctor_ref, message_port_ctor);
+    SetMessagingStateRefValue(env, &MessagingState::message_port_ctor_ref, message_port_ctor);
   }
 
   napi_value message_channel_ctor = nullptr;
@@ -4684,7 +4755,7 @@ napi_value ResolveMessaging(napi_env env, const ResolveOptions& options) {
     napi_set_named_property(env, out, "DOMException", dom_exception);
   }
 
-  SetRefToValue(env, &state.binding_ref, out);
+  SetMessagingStateRefValue(env, &MessagingState::binding_ref, out);
   return out;
 }
 

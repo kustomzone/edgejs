@@ -1842,9 +1842,14 @@ void OnStatWatcherClosed(uv_handle_t* handle) {
   auto* wrap = static_cast<StatWatcherWrap*>(handle != nullptr ? handle->data : nullptr);
   if (wrap == nullptr) return;
   wrap->handle_wrap.state = kUbiHandleClosed;
+  UbiHandleWrapDetach(&wrap->handle_wrap);
   UbiHandleWrapReleaseWrapperRef(&wrap->handle_wrap);
   UbiHandleWrapMaybeCallOnClose(&wrap->handle_wrap);
-  if (wrap->handle_wrap.finalized || wrap->handle_wrap.delete_on_close) {
+  bool can_delete = wrap->handle_wrap.finalized;
+  if (!can_delete && wrap->handle_wrap.delete_on_close) {
+    can_delete = UbiHandleWrapCancelFinalizer(&wrap->handle_wrap, wrap);
+  }
+  if (can_delete) {
     UbiHandleWrapDeleteRefIfPresent(wrap->handle_wrap.env, &wrap->handle_wrap.wrapper_ref);
     delete wrap;
   }
@@ -1854,6 +1859,10 @@ void CloseStatWatcher(StatWatcherWrap* wrap) {
   if (wrap == nullptr || wrap->handle_wrap.state != kUbiHandleInitialized) return;
   wrap->handle_wrap.state = kUbiHandleClosing;
   uv_close(reinterpret_cast<uv_handle_t*>(&wrap->handle), OnStatWatcherClosed);
+}
+
+void CloseStatWatcherForCleanup(void* data) {
+  CloseStatWatcher(static_cast<StatWatcherWrap*>(data));
 }
 
 void OnStatWatcherChange(uv_fs_poll_t* handle, int status, const uv_stat_t* prev, const uv_stat_t* curr) {
@@ -1890,6 +1899,7 @@ void StatWatcherFinalize(napi_env env, void* data, void* /*hint*/) {
   wrap->handle_wrap.finalized = true;
   UbiHandleWrapDeleteRefIfPresent(env, &wrap->handle_wrap.wrapper_ref);
   if (wrap->handle_wrap.state == kUbiHandleUninitialized || wrap->handle_wrap.state == kUbiHandleClosed) {
+    UbiHandleWrapDetach(&wrap->handle_wrap);
     delete wrap;
     return;
   }
@@ -1938,6 +1948,10 @@ napi_value StatWatcherStart(napi_env env, napi_callback_info info) {
   if (rc != 0) return MakeInt32(env, rc);
 
   wrap->handle.data = wrap;
+  UbiHandleWrapAttach(&wrap->handle_wrap,
+                      wrap,
+                      reinterpret_cast<uv_handle_t*>(&wrap->handle),
+                      CloseStatWatcherForCleanup);
   rc = uv_fs_poll_start(&wrap->handle, OnStatWatcherChange, path.c_str(), interval);
   if (rc != 0) {
     wrap->handle_wrap.state = kUbiHandleClosing;

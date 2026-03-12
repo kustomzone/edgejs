@@ -46,6 +46,7 @@ void UbiWorkerEnvSetLocalEnvVar(napi_env env, const std::string& key, const std:
 void UbiWorkerEnvUnsetLocalEnvVar(napi_env env, const std::string& key);
 void UbiWorkerEnvRequestStop(napi_env env);
 void UbiWorkerEnvForget(napi_env env);
+void UbiWorkerEnvRunCleanup(napi_env env);
 
 napi_value UbiWorkerEnvGetBinding(napi_env env);
 void UbiWorkerEnvSetBinding(napi_env env, napi_value binding);

@@ -37,7 +37,11 @@ napi_status UbiRuntimePlatformEnqueueForegroundTask(napi_env env,
                                                     UbiRuntimePlatformTaskCleanup cleanup,
                                                     uint64_t delay_millis = 0);
 
+napi_status UbiRuntimePlatformAddRef(napi_env env);
+napi_status UbiRuntimePlatformReleaseRef(napi_env env);
+
 // Drain Ubi-owned foreground tasks that were posted by the engine adapter.
 napi_status UbiRuntimePlatformDrainTasks(napi_env env);
+void UbiRunRuntimePlatformEnvCleanup(napi_env env);
 
 #endif  // UBI_RUNTIME_PLATFORM_H_

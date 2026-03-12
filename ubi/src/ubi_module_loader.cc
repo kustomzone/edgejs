@@ -26,6 +26,7 @@
 #include "ubi_udp_wrap.h"
 #include "ubi_url.h"
 #include "ubi_util.h"
+#include "ubi_worker_env.h"
 #include "ubi_option_helpers.h"
 #include "internal_binding/dispatch.h"
 #include "builtin_catalog.h"
@@ -74,11 +75,14 @@ namespace {
 
 namespace fs = std::filesystem;
 
+struct RequireContext;
+
 struct ModuleLoaderState {
   std::unordered_map<std::string, napi_ref> module_cache;
   std::unordered_map<std::string, napi_ref> binding_cache;
   std::unordered_map<std::string, napi_ref> internal_binding_cache;
   napi_ref cache_object_ref = nullptr;
+  napi_ref per_context_exports_ref = nullptr;
   napi_ref primordials_ref = nullptr;
   napi_ref internal_binding_ref = nullptr;
   napi_ref private_symbols_ref = nullptr;
@@ -87,44 +91,32 @@ struct ModuleLoaderState {
   napi_ref native_builtins_binding_ref = nullptr;
   napi_ref internal_binding_loader_ref = nullptr;
   napi_ref require_builtin_loader_ref = nullptr;
+  napi_ref contextify_binding_ref = nullptr;
+  struct TraceEventsBindingState {
+    napi_ref binding_ref = nullptr;
+    napi_ref state_update_handler_ref = nullptr;
+    struct CategoryBufferState {
+      napi_ref typed_array_ref = nullptr;
+      uint8_t* data = nullptr;
+    };
+    std::unordered_map<std::string, int32_t> category_refcounts;
+    std::unordered_map<std::string, CategoryBufferState> category_buffers;
+  } trace_events_state;
+  std::vector<RequireContext*> require_contexts;
   std::string entry_dir;
+  bool cleanup_hook_registered = false;
+  bool finalized = false;
 };
 
 struct RequireContext {
   ModuleLoaderState* state;
   std::string base_dir;
 };
+using TraceEventsBindingState = ModuleLoaderState::TraceEventsBindingState;
 
-struct TraceEventsBindingState {
-  napi_ref binding_ref = nullptr;
-  napi_ref state_update_handler_ref = nullptr;
-  struct CategoryBufferState {
-    napi_ref typed_array_ref = nullptr;
-    uint8_t* data = nullptr;
-  };
-  std::unordered_map<std::string, int32_t> category_refcounts;
-  std::unordered_map<std::string, CategoryBufferState> category_buffers;
-};
+constexpr char kModuleLoaderStateHolderSymbol[] = "node:module_loader_state_holder";
 
-std::unordered_map<napi_env, ModuleLoaderState> g_loader_states;
-std::unordered_map<napi_env, TraceEventsBindingState> g_trace_events_states;
-std::unordered_map<napi_env, napi_ref> g_contextify_binding_refs;
-std::vector<RequireContext*> g_require_contexts;
-std::unordered_set<napi_env> g_loader_cleanup_hook_registered;
-
-void RemoveRequireContextsForState(ModuleLoaderState* state) {
-  if (state == nullptr) return;
-  auto it = g_require_contexts.begin();
-  while (it != g_require_contexts.end()) {
-    RequireContext* ctx = *it;
-    if (ctx != nullptr && ctx->state == state) {
-      delete ctx;
-      it = g_require_contexts.erase(it);
-      continue;
-    }
-    ++it;
-  }
-}
+static bool IsUndefinedValue(napi_env env, napi_value value);
 
 void DeleteRefIfPresent(napi_env env, napi_ref* ref) {
   if (env == nullptr || ref == nullptr || *ref == nullptr) return;
@@ -132,11 +124,82 @@ void DeleteRefIfPresent(napi_env env, napi_ref* ref) {
   *ref = nullptr;
 }
 
-void FinalizeTraceEventsState(napi_env env) {
-  auto it = g_trace_events_states.find(env);
-  if (it == g_trace_events_states.end()) return;
+static napi_value GetGlobalObject(napi_env env) {
+  napi_value global = nullptr;
+  if (env == nullptr || napi_get_global(env, &global) != napi_ok || global == nullptr) {
+    return nullptr;
+  }
+  return global;
+}
 
-  TraceEventsBindingState& state = it->second;
+static napi_value GetModuleLoaderStateHolderKey(napi_env env) {
+  napi_value key = nullptr;
+  if (unofficial_napi_create_private_symbol(
+          env, kModuleLoaderStateHolderSymbol, NAPI_AUTO_LENGTH, &key) != napi_ok ||
+      key == nullptr) {
+    return nullptr;
+  }
+  return key;
+}
+
+static ModuleLoaderState* GetModuleLoaderState(napi_env env) {
+  napi_value global = GetGlobalObject(env);
+  napi_value key = GetModuleLoaderStateHolderKey(env);
+  if (global == nullptr || key == nullptr) return nullptr;
+
+  napi_value holder = nullptr;
+  if (napi_get_property(env, global, key, &holder) != napi_ok ||
+      holder == nullptr ||
+      IsUndefinedValue(env, holder)) {
+    return nullptr;
+  }
+
+  void* data = nullptr;
+  if (napi_unwrap(env, holder, &data) != napi_ok || data == nullptr) {
+    return nullptr;
+  }
+  return static_cast<ModuleLoaderState*>(data);
+}
+
+static bool SetModuleLoaderState(napi_env env, ModuleLoaderState* state) {
+  napi_value global = GetGlobalObject(env);
+  napi_value key = GetModuleLoaderStateHolderKey(env);
+  if (global == nullptr || key == nullptr || state == nullptr) return false;
+
+  napi_value holder = nullptr;
+  if (napi_create_object(env, &holder) != napi_ok || holder == nullptr) return false;
+  if (napi_wrap(env, holder, state, nullptr, nullptr, nullptr) != napi_ok) return false;
+  return napi_set_property(env, global, key, holder) == napi_ok;
+}
+
+static void ClearModuleLoaderStateHolder(napi_env env) {
+  napi_value global = GetGlobalObject(env);
+  napi_value key = GetModuleLoaderStateHolderKey(env);
+  if (global == nullptr || key == nullptr) return;
+
+  napi_value holder = nullptr;
+  if (napi_get_property(env, global, key, &holder) == napi_ok &&
+      holder != nullptr &&
+      !IsUndefinedValue(env, holder)) {
+    void* removed = nullptr;
+    (void)napi_remove_wrap(env, holder, &removed);
+  }
+  bool ignored = false;
+  (void)napi_delete_property(env, global, key, &ignored);
+}
+
+static RequireContext* AddRequireContext(ModuleLoaderState* state, std::string base_dir) {
+  if (state == nullptr) return nullptr;
+  auto* context = new RequireContext();
+  context->state = state;
+  context->base_dir = std::move(base_dir);
+  state->require_contexts.push_back(context);
+  return context;
+}
+
+static void FinalizeTraceEventsState(napi_env env, ModuleLoaderState* loader_state) {
+  if (loader_state == nullptr) return;
+  TraceEventsBindingState& state = loader_state->trace_events_state;
   DeleteRefIfPresent(env, &state.binding_ref);
   DeleteRefIfPresent(env, &state.state_update_handler_ref);
   for (auto& kv : state.category_buffers) {
@@ -145,66 +208,69 @@ void FinalizeTraceEventsState(napi_env env) {
   }
   state.category_buffers.clear();
   state.category_refcounts.clear();
-  g_trace_events_states.erase(it);
 }
 
-void FinalizeContextifyBindingRef(napi_env env) {
-  auto it = g_contextify_binding_refs.find(env);
-  if (it == g_contextify_binding_refs.end()) return;
-  DeleteRefIfPresent(env, &it->second);
-  g_contextify_binding_refs.erase(it);
+static void FinalizeContextifyBindingRef(napi_env env, ModuleLoaderState* state) {
+  if (state == nullptr) return;
+  DeleteRefIfPresent(env, &state->contextify_binding_ref);
 }
 
-void FinalizeModuleLoaderState(napi_env env) {
-  auto loader_it = g_loader_states.find(env);
-  if (loader_it != g_loader_states.end()) {
-    ModuleLoaderState* state = &loader_it->second;
-    RemoveRequireContextsForState(state);
+static void ResetModuleLoaderState(napi_env env, ModuleLoaderState* state) {
+  if (state == nullptr) return;
 
-    for (auto& kv : state->module_cache) {
-      DeleteRefIfPresent(env, &kv.second);
-    }
-    state->module_cache.clear();
-
-    for (auto& kv : state->binding_cache) {
-      DeleteRefIfPresent(env, &kv.second);
-    }
-    state->binding_cache.clear();
-
-    for (auto& kv : state->internal_binding_cache) {
-      DeleteRefIfPresent(env, &kv.second);
-    }
-    state->internal_binding_cache.clear();
-
-    DeleteRefIfPresent(env, &state->cache_object_ref);
-    DeleteRefIfPresent(env, &state->primordials_ref);
-    DeleteRefIfPresent(env, &state->internal_binding_ref);
-    DeleteRefIfPresent(env, &state->private_symbols_ref);
-    DeleteRefIfPresent(env, &state->per_isolate_symbols_ref);
-    DeleteRefIfPresent(env, &state->require_ref);
-    DeleteRefIfPresent(env, &state->native_builtins_binding_ref);
-    DeleteRefIfPresent(env, &state->internal_binding_loader_ref);
-    DeleteRefIfPresent(env, &state->require_builtin_loader_ref);
-    state->entry_dir.clear();
-
-    g_loader_states.erase(loader_it);
+  for (RequireContext* context : state->require_contexts) {
+    delete context;
   }
+  state->require_contexts.clear();
 
-  FinalizeTraceEventsState(env);
-  FinalizeContextifyBindingRef(env);
+  for (auto& kv : state->module_cache) {
+    DeleteRefIfPresent(env, &kv.second);
+  }
+  state->module_cache.clear();
+
+  for (auto& kv : state->binding_cache) {
+    DeleteRefIfPresent(env, &kv.second);
+  }
+  state->binding_cache.clear();
+
+  for (auto& kv : state->internal_binding_cache) {
+    DeleteRefIfPresent(env, &kv.second);
+  }
+  state->internal_binding_cache.clear();
+
+  DeleteRefIfPresent(env, &state->cache_object_ref);
+  DeleteRefIfPresent(env, &state->per_context_exports_ref);
+  DeleteRefIfPresent(env, &state->primordials_ref);
+  DeleteRefIfPresent(env, &state->internal_binding_ref);
+  DeleteRefIfPresent(env, &state->private_symbols_ref);
+  DeleteRefIfPresent(env, &state->per_isolate_symbols_ref);
+  DeleteRefIfPresent(env, &state->require_ref);
+  DeleteRefIfPresent(env, &state->native_builtins_binding_ref);
+  DeleteRefIfPresent(env, &state->internal_binding_loader_ref);
+  DeleteRefIfPresent(env, &state->require_builtin_loader_ref);
+  FinalizeTraceEventsState(env, state);
+  FinalizeContextifyBindingRef(env, state);
+  state->entry_dir.clear();
 }
 
-void OnModuleLoaderEnvCleanup(void* arg) {
-  napi_env env = static_cast<napi_env>(arg);
-  g_loader_cleanup_hook_registered.erase(env);
+static void FinalizeModuleLoaderState(napi_env env) {
+  ModuleLoaderState* state = GetModuleLoaderState(env);
+  if (state == nullptr || state->finalized) return;
+  state->finalized = true;
+  state->cleanup_hook_registered = false;
+  ResetModuleLoaderState(env, state);
+  ClearModuleLoaderStateHolder(env);
+  delete state;
 }
 
-void EnsureModuleLoaderCleanupHook(napi_env env) {
-  if (env == nullptr) return;
-  auto [it, inserted] = g_loader_cleanup_hook_registered.emplace(env);
-  if (!inserted) return;
-  if (napi_add_env_cleanup_hook(env, OnModuleLoaderEnvCleanup, env) != napi_ok) {
-    g_loader_cleanup_hook_registered.erase(it);
+static void OnModuleLoaderEnvCleanup(void* arg) {
+  FinalizeModuleLoaderState(static_cast<napi_env>(arg));
+}
+
+static void EnsureModuleLoaderCleanupHook(napi_env env, ModuleLoaderState* state) {
+  if (env == nullptr || state == nullptr || state->cleanup_hook_registered) return;
+  if (napi_add_env_cleanup_hook(env, OnModuleLoaderEnvCleanup, env) == napi_ok) {
+    state->cleanup_hook_registered = true;
   }
 }
 
@@ -1208,6 +1274,22 @@ static napi_value GetStatePrimordials(napi_env env, ModuleLoaderState* state) {
   return GetRefValue(env, state->primordials_ref);
 }
 
+static napi_value GetStatePerContextExports(napi_env env, ModuleLoaderState* state) {
+  if (state == nullptr) return nullptr;
+  return GetRefValue(env, state->per_context_exports_ref);
+}
+
+static napi_value EnsureStatePerContextExports(napi_env env, ModuleLoaderState* state) {
+  napi_value exports_obj = GetStatePerContextExports(env, state);
+  if (exports_obj != nullptr) return exports_obj;
+
+  if (napi_create_object(env, &exports_obj) != napi_ok || exports_obj == nullptr) {
+    return nullptr;
+  }
+  ResetStateRef(env, &state->per_context_exports_ref, exports_obj);
+  return GetStatePerContextExports(env, state);
+}
+
 static napi_value GetStatePrivateSymbols(napi_env env, ModuleLoaderState* state) {
   if (state == nullptr) return nullptr;
   return GetRefValue(env, state->private_symbols_ref);
@@ -1296,8 +1378,8 @@ static bool ResolveNativeBuiltinCompileInput(napi_env env,
   const NativeBuiltinExecutionKind kind = GetNativeBuiltinExecutionKind(id);
   switch (kind) {
     case NativeBuiltinExecutionKind::kPerContext: {
-      napi_value exports_obj = nullptr;
-      if (napi_create_object(env, &exports_obj) != napi_ok || exports_obj == nullptr) {
+      napi_value exports_obj = EnsureStatePerContextExports(env, state);
+      if (exports_obj == nullptr) {
         return ThrowNativeBuiltinExecutionError(env, id, "failed to create per-context exports object");
       }
 
@@ -1710,9 +1792,20 @@ static napi_value UvErrNameCallback(napi_env env, napi_callback_info info) {
   return out;
 }
 
-bool UseEnvProxyEnabledByEnvironment() {
-  const char* value = std::getenv("NODE_USE_ENV_PROXY");
-  return value != nullptr && std::strcmp(value, "1") == 0;
+std::string GetEnvironmentOptionValue(napi_env env, const char* name) {
+  if (name == nullptr || name[0] == '\0') return {};
+  if (env != nullptr && !UbiWorkerEnvOwnsProcessState(env) && !UbiWorkerEnvSharesEnvironment(env)) {
+    const std::map<std::string, std::string> entries = UbiWorkerEnvSnapshotEnvVars(env);
+    auto it = entries.find(name);
+    if (it != entries.end()) return it->second;
+    return {};
+  }
+  const char* value = std::getenv(name);
+  return value != nullptr ? value : std::string();
+}
+
+bool EnvironmentOptionEnabled(napi_env env, const char* name) {
+  return GetEnvironmentOptionValue(env, name) == "1";
 }
 
 static std::vector<std::string> GetEffectiveCliTokens(napi_env env) {
@@ -2018,6 +2111,10 @@ static napi_value OptionsGetCLIOptionsValuesCallback(napi_env env, napi_callback
   std::unordered_set<std::string> number_option_set;
   number_option_set.reserve(number_defaults.size());
   for (const auto& [key, _] : number_defaults) number_option_set.emplace(key);
+  bool saw_pending_deprecation_cli = false;
+  bool saw_preserve_symlinks_cli = false;
+  bool saw_preserve_symlinks_main_cli = false;
+  bool saw_redirect_warnings_cli = false;
   bool saw_use_env_proxy_cli = false;
 
   const std::vector<std::string> tokens = GetEffectiveCliTokens(env);
@@ -2080,6 +2177,10 @@ static napi_value OptionsGetCLIOptionsValuesCallback(napi_env env, napi_callback
       const std::string normalized = "--" + key.substr(5);
       if (bool_option_set.find(normalized) != bool_option_set.end()) {
         SetBoolProperty(env, out, normalized.c_str(), false);
+        saw_pending_deprecation_cli = saw_pending_deprecation_cli || normalized == "--pending-deprecation";
+        saw_preserve_symlinks_cli = saw_preserve_symlinks_cli || normalized == "--preserve-symlinks";
+        saw_preserve_symlinks_main_cli =
+            saw_preserve_symlinks_main_cli || normalized == "--preserve-symlinks-main";
         if (normalized == "--use-env-proxy") saw_use_env_proxy_cli = true;
       }
       continue;
@@ -2099,6 +2200,10 @@ static napi_value OptionsGetCLIOptionsValuesCallback(napi_env env, napi_callback
     if (eq == std::string::npos) {
       if (bool_option_set.find(key) != bool_option_set.end()) {
         SetBoolProperty(env, out, key.c_str(), true);
+        saw_pending_deprecation_cli = saw_pending_deprecation_cli || key == "--pending-deprecation";
+        saw_preserve_symlinks_cli = saw_preserve_symlinks_cli || key == "--preserve-symlinks";
+        saw_preserve_symlinks_main_cli =
+            saw_preserve_symlinks_main_cli || key == "--preserve-symlinks-main";
         if (key == "--use-env-proxy") saw_use_env_proxy_cli = true;
         continue;
       }
@@ -2106,6 +2211,7 @@ static napi_value OptionsGetCLIOptionsValuesCallback(napi_env env, napi_callback
         if (i + 1 < tokens.size()) {
           const std::string value = ubi_options::MaybeUnescapeLeadingDashOptionValue(tokens[++i]);
           SetStringProperty(env, out, key.c_str(), value.c_str());
+          saw_redirect_warnings_cli = saw_redirect_warnings_cli || key == "--redirect-warnings";
         }
         continue;
       }
@@ -2124,6 +2230,10 @@ static napi_value OptionsGetCLIOptionsValuesCallback(napi_env env, napi_callback
 
     if (bool_option_set.find(key) != bool_option_set.end()) {
       SetBoolProperty(env, out, key.c_str(), raw != "false" && raw != "0");
+      saw_pending_deprecation_cli = saw_pending_deprecation_cli || key == "--pending-deprecation";
+      saw_preserve_symlinks_cli = saw_preserve_symlinks_cli || key == "--preserve-symlinks";
+      saw_preserve_symlinks_main_cli =
+          saw_preserve_symlinks_main_cli || key == "--preserve-symlinks-main";
       if (key == "--use-env-proxy") saw_use_env_proxy_cli = true;
       continue;
     }
@@ -2136,10 +2246,27 @@ static napi_value OptionsGetCLIOptionsValuesCallback(napi_env env, napi_callback
     }
     if (string_option_set.find(key) != string_option_set.end()) {
       SetStringProperty(env, out, key.c_str(), raw.c_str());
+      saw_redirect_warnings_cli = saw_redirect_warnings_cli || key == "--redirect-warnings";
     }
   }
 
-  if (UseEnvProxyEnabledByEnvironment() && !saw_use_env_proxy_cli) {
+  if (!saw_pending_deprecation_cli && EnvironmentOptionEnabled(env, "NODE_PENDING_DEPRECATION")) {
+    SetBoolProperty(env, out, "--pending-deprecation", true);
+  }
+  if (!saw_preserve_symlinks_cli && EnvironmentOptionEnabled(env, "NODE_PRESERVE_SYMLINKS")) {
+    SetBoolProperty(env, out, "--preserve-symlinks", true);
+  }
+  if (!saw_preserve_symlinks_main_cli &&
+      EnvironmentOptionEnabled(env, "NODE_PRESERVE_SYMLINKS_MAIN")) {
+    SetBoolProperty(env, out, "--preserve-symlinks-main", true);
+  }
+  if (!saw_redirect_warnings_cli) {
+    const std::string redirect_warnings = GetEnvironmentOptionValue(env, "NODE_REDIRECT_WARNINGS");
+    if (!redirect_warnings.empty()) {
+      SetStringProperty(env, out, "--redirect-warnings", redirect_warnings.c_str());
+    }
+  }
+  if (EnvironmentOptionEnabled(env, "NODE_USE_ENV_PROXY") && !saw_use_env_proxy_cli) {
     SetBoolProperty(env, out, "--use-env-proxy", true);
   }
 
@@ -2276,7 +2403,7 @@ static napi_value OptionsGetCLIOptionsInfoCallback(napi_env env, napi_callback_i
 
 static napi_value OptionsGetOptionsAsFlagsCallback(napi_env env, napi_callback_info /*info*/) {
   std::vector<std::string> exec_argv = GetEffectiveCliTokens(env);
-  if (UseEnvProxyEnabledByEnvironment()) {
+  if (EnvironmentOptionEnabled(env, "NODE_USE_ENV_PROXY")) {
     const bool has_use_env_proxy =
         std::find(exec_argv.begin(), exec_argv.end(), "--use-env-proxy") != exec_argv.end();
     const bool has_no_use_env_proxy =
@@ -3251,6 +3378,12 @@ static napi_value TraceEventsTrace(napi_env env, napi_callback_info /*info*/) {
   return undefined;
 }
 
+static TraceEventsBindingState* GetTraceEventsState(napi_env env) {
+  ModuleLoaderState* state = GetModuleLoaderState(env);
+  if (state == nullptr || state->finalized) return nullptr;
+  return &state->trace_events_state;
+}
+
 static bool TraceEventsIsEnabled(const TraceEventsBindingState& st, const std::string& category) {
   auto it = st.category_refcounts.find(category);
   return it != st.category_refcounts.end() && it->second > 0;
@@ -3399,19 +3532,21 @@ static napi_value TraceEventsIsTraceCategoryEnabled(napi_env env, napi_callback_
   if (argc >= 1 && argv[0] != nullptr) {
     category = ValueToUtf8(env, argv[0]);
   }
-  const auto& st = g_trace_events_states[env];
-  const bool enabled = !category.empty() && TraceEventsIsEnabled(st, category);
+  TraceEventsBindingState* st = GetTraceEventsState(env);
+  const bool enabled = st != nullptr && !category.empty() && TraceEventsIsEnabled(*st, category);
   napi_value out = nullptr;
   napi_get_boolean(env, enabled, &out);
   return out;
 }
 
 static napi_value TraceEventsGetEnabledCategories(napi_env env, napi_callback_info /*info*/) {
-  const auto& st = g_trace_events_states[env];
+  TraceEventsBindingState* st = GetTraceEventsState(env);
   std::vector<std::string> enabled_categories;
-  enabled_categories.reserve(st.category_refcounts.size());
-  for (const auto& entry : st.category_refcounts) {
-    if (entry.second > 0) enabled_categories.push_back(entry.first);
+  if (st != nullptr) {
+    enabled_categories.reserve(st->category_refcounts.size());
+    for (const auto& entry : st->category_refcounts) {
+      if (entry.second > 0) enabled_categories.push_back(entry.first);
+    }
   }
   std::sort(enabled_categories.begin(), enabled_categories.end());
   std::string joined;
@@ -3429,8 +3564,9 @@ static napi_value TraceEventsGetCategoryEnabledBuffer(napi_env env, napi_callbac
   napi_value argv[1] = {nullptr};
   if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok) return nullptr;
   std::string category = argc >= 1 && argv[0] != nullptr ? ValueToUtf8(env, argv[0]) : "";
-  auto& st = g_trace_events_states[env];
-  return TraceEventsGetCategoryBuffer(env, st, category);
+  TraceEventsBindingState* st = GetTraceEventsState(env);
+  if (st == nullptr) return nullptr;
+  return TraceEventsGetCategoryBuffer(env, *st, category);
 }
 
 struct TraceEventsCategorySetWrap {
@@ -3443,9 +3579,9 @@ static void TraceEventsCategorySetFinalize(napi_env env, void* data, void* /*hin
   auto* wrap = static_cast<TraceEventsCategorySetWrap*>(data);
   if (wrap == nullptr) return;
   if (wrap->enabled) {
-    auto st_it = g_trace_events_states.find(env);
-    if (st_it != g_trace_events_states.end()) {
-      TraceEventsApplyCategoryDelta(env, st_it->second, wrap->categories, false);
+    TraceEventsBindingState* st = GetTraceEventsState(env);
+    if (st != nullptr) {
+      TraceEventsApplyCategoryDelta(env, *st, wrap->categories, false);
     }
   }
   if (wrap->wrapper_ref != nullptr) napi_delete_reference(env, wrap->wrapper_ref);
@@ -3463,10 +3599,10 @@ static napi_value TraceEventsCategorySetEnable(napi_env env, napi_callback_info 
   size_t argc = 0;
   napi_get_cb_info(env, info, &argc, nullptr, &this_arg, nullptr);
   auto* wrap = TraceEventsUnwrapCategorySet(env, this_arg);
-  if (wrap != nullptr && !wrap->enabled) {
+  TraceEventsBindingState* st = GetTraceEventsState(env);
+  if (wrap != nullptr && st != nullptr && !wrap->enabled) {
     wrap->enabled = true;
-    auto& st = g_trace_events_states[env];
-    TraceEventsApplyCategoryDelta(env, st, wrap->categories, true);
+    TraceEventsApplyCategoryDelta(env, *st, wrap->categories, true);
   }
   napi_value undefined = nullptr;
   napi_get_undefined(env, &undefined);
@@ -3478,10 +3614,10 @@ static napi_value TraceEventsCategorySetDisable(napi_env env, napi_callback_info
   size_t argc = 0;
   napi_get_cb_info(env, info, &argc, nullptr, &this_arg, nullptr);
   auto* wrap = TraceEventsUnwrapCategorySet(env, this_arg);
-  if (wrap != nullptr && wrap->enabled) {
+  TraceEventsBindingState* st = GetTraceEventsState(env);
+  if (wrap != nullptr && st != nullptr && wrap->enabled) {
     wrap->enabled = false;
-    auto& st = g_trace_events_states[env];
-    TraceEventsApplyCategoryDelta(env, st, wrap->categories, false);
+    TraceEventsApplyCategoryDelta(env, *st, wrap->categories, false);
   }
   napi_value undefined = nullptr;
   napi_get_undefined(env, &undefined);
@@ -3509,16 +3645,17 @@ static napi_value TraceEventsSetTraceCategoryStateUpdateHandler(napi_env env, na
   napi_value argv[1] = {nullptr};
   if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok) return nullptr;
 
-  auto& st = g_trace_events_states[env];
-  if (st.state_update_handler_ref != nullptr) {
-    napi_delete_reference(env, st.state_update_handler_ref);
-    st.state_update_handler_ref = nullptr;
+  TraceEventsBindingState* st = GetTraceEventsState(env);
+  if (st == nullptr) return nullptr;
+  if (st->state_update_handler_ref != nullptr) {
+    napi_delete_reference(env, st->state_update_handler_ref);
+    st->state_update_handler_ref = nullptr;
   }
   if (argc >= 1 && argv[0] != nullptr) {
     napi_valuetype t = napi_undefined;
     if (napi_typeof(env, argv[0], &t) == napi_ok && t == napi_function) {
-      napi_create_reference(env, argv[0], 1, &st.state_update_handler_ref);
-      TraceEventsNotifyStateHandler(env, st);
+      napi_create_reference(env, argv[0], 1, &st->state_update_handler_ref);
+      TraceEventsNotifyStateHandler(env, *st);
     }
   }
   napi_value undefined = nullptr;
@@ -3527,10 +3664,11 @@ static napi_value TraceEventsSetTraceCategoryStateUpdateHandler(napi_env env, na
 }
 
 static napi_value GetOrCreateTraceEventsBinding(napi_env env) {
-  auto& st = g_trace_events_states[env];
-  if (st.binding_ref != nullptr) {
+  TraceEventsBindingState* st = GetTraceEventsState(env);
+  if (st == nullptr) return nullptr;
+  if (st->binding_ref != nullptr) {
     napi_value existing = nullptr;
-    if (napi_get_reference_value(env, st.binding_ref, &existing) == napi_ok && existing != nullptr) {
+    if (napi_get_reference_value(env, st->binding_ref, &existing) == napi_ok && existing != nullptr) {
       return existing;
     }
   }
@@ -3569,11 +3707,11 @@ static napi_value GetOrCreateTraceEventsBinding(napi_env env) {
     return nullptr;
   }
 
-  if (st.binding_ref != nullptr) {
-    napi_delete_reference(env, st.binding_ref);
-    st.binding_ref = nullptr;
+  if (st->binding_ref != nullptr) {
+    napi_delete_reference(env, st->binding_ref);
+    st->binding_ref = nullptr;
   }
-  if (napi_create_reference(env, binding, 1, &st.binding_ref) != napi_ok || st.binding_ref == nullptr) {
+  if (napi_create_reference(env, binding, 1, &st->binding_ref) != napi_ok || st->binding_ref == nullptr) {
     return nullptr;
   }
   return binding;
@@ -3632,10 +3770,12 @@ static napi_value ResolveContextifyBinding(napi_env env) {
   napi_value undefined = nullptr;
   napi_get_undefined(env, &undefined);
 
-  auto cached_it = g_contextify_binding_refs.find(env);
-  if (cached_it != g_contextify_binding_refs.end() && cached_it->second != nullptr) {
+  ModuleLoaderState* state = GetModuleLoaderState(env);
+  if (state == nullptr || state->finalized) return undefined;
+  if (state->contextify_binding_ref != nullptr) {
     napi_value cached = nullptr;
-    if (napi_get_reference_value(env, cached_it->second, &cached) == napi_ok && cached != nullptr) {
+    if (napi_get_reference_value(env, state->contextify_binding_ref, &cached) == napi_ok &&
+        cached != nullptr) {
       return cached;
     }
   }
@@ -3721,14 +3861,8 @@ static napi_value ResolveContextifyBinding(napi_env env) {
     napi_set_named_property(env, out, "compileFunctionForCJSLoader", compile_function_for_cjs);
   }
 
-  if (cached_it != g_contextify_binding_refs.end() && cached_it->second != nullptr) {
-    napi_delete_reference(env, cached_it->second);
-    cached_it->second = nullptr;
-  }
-  napi_ref out_ref = nullptr;
-  if (napi_create_reference(env, out, 1, &out_ref) == napi_ok && out_ref != nullptr) {
-    g_contextify_binding_refs[env] = out_ref;
-  }
+  DeleteRefIfPresent(env, &state->contextify_binding_ref);
+  (void)napi_create_reference(env, out, 1, &state->contextify_binding_ref);
   return out;
 }
 
@@ -4547,8 +4681,12 @@ bool LoadResolvedModule(napi_env env, ModuleLoaderState* state, const fs::path& 
     return false;
   }
 
-  auto* child_context = new RequireContext{state, resolved_path.parent_path().string()};
-  g_require_contexts.push_back(child_context);
+  RequireContext* child_context = AddRequireContext(state, resolved_path.parent_path().string());
+  if (child_context == nullptr) {
+    RemoveCachedModule(env, state, resolved_key);
+    ThrowLoaderError(env, "Failed to create require context");
+    return false;
+  }
   napi_value require_fn = CreateRequireFunction(env, child_context);
   if (require_fn == nullptr) {
     RemoveCachedModule(env, state, resolved_key);
@@ -4582,65 +4720,72 @@ bool LoadResolvedModule(napi_env env, ModuleLoaderState* state, const fs::path& 
 
 void UbiSetPrimordials(napi_env env, napi_value primordials) {
   if (env == nullptr || primordials == nullptr) return;
-  auto it = g_loader_states.find(env);
-  if (it == g_loader_states.end()) return;
-  ResetStateRef(env, &it->second.primordials_ref, primordials);
+  ModuleLoaderState* state = GetModuleLoaderState(env);
+  if (state == nullptr || state->finalized) return;
+  ResetStateRef(env, &state->primordials_ref, primordials);
 }
 
 void UbiSetInternalBinding(napi_env env, napi_value internal_binding) {
   if (env == nullptr || internal_binding == nullptr) return;
-  auto it = g_loader_states.find(env);
-  if (it == g_loader_states.end()) return;
-  ResetStateRef(env, &it->second.internal_binding_ref, internal_binding);
+  ModuleLoaderState* state = GetModuleLoaderState(env);
+  if (state == nullptr || state->finalized) return;
+  ResetStateRef(env, &state->internal_binding_ref, internal_binding);
 }
 
 void UbiSetPrivateSymbols(napi_env env, napi_value private_symbols) {
   if (env == nullptr || private_symbols == nullptr) return;
-  auto it = g_loader_states.find(env);
-  if (it == g_loader_states.end()) return;
-  ResetStateRef(env, &it->second.private_symbols_ref, private_symbols);
+  ModuleLoaderState* state = GetModuleLoaderState(env);
+  if (state == nullptr || state->finalized) return;
+  ResetStateRef(env, &state->private_symbols_ref, private_symbols);
 }
 
 void UbiSetPerIsolateSymbols(napi_env env, napi_value per_isolate_symbols) {
   if (env == nullptr || per_isolate_symbols == nullptr) return;
-  auto it = g_loader_states.find(env);
-  if (it == g_loader_states.end()) return;
-  ResetStateRef(env, &it->second.per_isolate_symbols_ref, per_isolate_symbols);
+  ModuleLoaderState* state = GetModuleLoaderState(env);
+  if (state == nullptr || state->finalized) return;
+  ResetStateRef(env, &state->per_isolate_symbols_ref, per_isolate_symbols);
+}
+
+napi_value UbiGetPerContextExports(napi_env env) {
+  if (env == nullptr) return nullptr;
+  ModuleLoaderState* state = GetModuleLoaderState(env);
+  if (state == nullptr || state->finalized) return nullptr;
+  return GetRefValue(env, state->per_context_exports_ref);
 }
 
 napi_value UbiGetPrivateSymbols(napi_env env) {
   if (env == nullptr) return nullptr;
-  auto it = g_loader_states.find(env);
-  if (it == g_loader_states.end()) return nullptr;
-  return GetRefValue(env, it->second.private_symbols_ref);
+  ModuleLoaderState* state = GetModuleLoaderState(env);
+  if (state == nullptr || state->finalized) return nullptr;
+  return GetRefValue(env, state->private_symbols_ref);
 }
 
 napi_value UbiGetPerIsolateSymbols(napi_env env) {
   if (env == nullptr) return nullptr;
-  auto it = g_loader_states.find(env);
-  if (it == g_loader_states.end()) return nullptr;
-  return GetRefValue(env, it->second.per_isolate_symbols_ref);
+  ModuleLoaderState* state = GetModuleLoaderState(env);
+  if (state == nullptr || state->finalized) return nullptr;
+  return GetRefValue(env, state->per_isolate_symbols_ref);
 }
 
 napi_value UbiGetRequireFunction(napi_env env) {
   if (env == nullptr) return nullptr;
-  auto it = g_loader_states.find(env);
-  if (it == g_loader_states.end()) return nullptr;
-  return GetRefValue(env, it->second.require_ref);
+  ModuleLoaderState* state = GetModuleLoaderState(env);
+  if (state == nullptr || state->finalized) return nullptr;
+  return GetRefValue(env, state->require_ref);
 }
 
 napi_value UbiGetInternalBinding(napi_env env) {
   if (env == nullptr) return nullptr;
-  auto it = g_loader_states.find(env);
-  if (it == g_loader_states.end()) return nullptr;
-  return GetStateInternalBinding(env, &it->second);
+  ModuleLoaderState* state = GetModuleLoaderState(env);
+  if (state == nullptr || state->finalized) return nullptr;
+  return GetStateInternalBinding(env, state);
 }
 
 napi_value UbiGetBuiltinInternalBinding(napi_env env) {
   if (env == nullptr) return nullptr;
-  auto it = g_loader_states.find(env);
-  if (it == g_loader_states.end()) return nullptr;
-  return GetStateInternalBindingLoader(env, &it->second);
+  ModuleLoaderState* state = GetModuleLoaderState(env);
+  if (state == nullptr || state->finalized) return nullptr;
+  return GetStateInternalBindingLoader(env, state);
 }
 
 void UbiFinalizeModuleLoaderEnv(napi_env env) {
@@ -4650,23 +4795,33 @@ void UbiFinalizeModuleLoaderEnv(napi_env env) {
 
 bool UbiRequireBuiltin(napi_env env, const char* id, napi_value* out) {
   if (env == nullptr || id == nullptr || id[0] == '\0') return false;
-  auto it = g_loader_states.find(env);
-  if (it == g_loader_states.end()) return false;
-  return CallRequireBuiltinLoader(env, &it->second, id, out);
+  ModuleLoaderState* state = GetModuleLoaderState(env);
+  if (state == nullptr || state->finalized) return false;
+  return CallRequireBuiltinLoader(env, state, id, out);
 }
 
 bool UbiExecuteBuiltin(napi_env env, const char* id, napi_value* out) {
   if (env == nullptr || id == nullptr || id[0] == '\0') return false;
-  auto it = g_loader_states.find(env);
-  if (it == g_loader_states.end()) return false;
-  return ExecuteBuiltinFromNative(env, &it->second, id, out);
+  ModuleLoaderState* state = GetModuleLoaderState(env);
+  if (state == nullptr || state->finalized) return false;
+  return ExecuteBuiltinFromNative(env, state, id, out);
 }
 
 napi_status UbiInstallModuleLoader(napi_env env, const char* entry_script_path) {
   if (env == nullptr) {
     return napi_invalid_arg;
   }
-  EnsureModuleLoaderCleanupHook(env);
+  ModuleLoaderState* state = GetModuleLoaderState(env);
+  if (state == nullptr) {
+    auto* state_ptr = new ModuleLoaderState();
+    if (!SetModuleLoaderState(env, state_ptr)) {
+      delete state_ptr;
+      return napi_generic_failure;
+    }
+    state = state_ptr;
+  }
+  state->finalized = false;
+  EnsureModuleLoaderCleanupHook(env, state);
 
   const bool is_eval_entry = entry_script_path == nullptr || entry_script_path[0] == '\0';
   fs::path entry_path;
@@ -4676,77 +4831,19 @@ napi_status UbiInstallModuleLoader(napi_env env, const char* entry_script_path) 
     entry_path = fs::path(ubi_path::PathResolve({})) / "<eval>";
   }
 
-  auto& state = g_loader_states[env];
-  RemoveRequireContextsForState(&state);
-  auto ctx_it = g_contextify_binding_refs.find(env);
-  if (ctx_it != g_contextify_binding_refs.end()) {
-    if (ctx_it->second != nullptr) {
-      napi_delete_reference(env, ctx_it->second);
-    }
-    g_contextify_binding_refs.erase(ctx_it);
-  }
-  for (auto& kv : state.module_cache) {
-    napi_delete_reference(env, kv.second);
-  }
-  state.module_cache.clear();
-  for (auto& kv : state.binding_cache) {
-    if (kv.second != nullptr) {
-      napi_delete_reference(env, kv.second);
-    }
-  }
-  state.binding_cache.clear();
-  for (auto& kv : state.internal_binding_cache) {
-    if (kv.second != nullptr) {
-      napi_delete_reference(env, kv.second);
-    }
-  }
-  state.internal_binding_cache.clear();
-  if (state.cache_object_ref != nullptr) {
-    napi_delete_reference(env, state.cache_object_ref);
-    state.cache_object_ref = nullptr;
-  }
-  if (state.primordials_ref != nullptr) {
-    napi_delete_reference(env, state.primordials_ref);
-    state.primordials_ref = nullptr;
-  }
-  if (state.internal_binding_ref != nullptr) {
-    napi_delete_reference(env, state.internal_binding_ref);
-    state.internal_binding_ref = nullptr;
-  }
-  if (state.private_symbols_ref != nullptr) {
-    napi_delete_reference(env, state.private_symbols_ref);
-    state.private_symbols_ref = nullptr;
-  }
-  if (state.per_isolate_symbols_ref != nullptr) {
-    napi_delete_reference(env, state.per_isolate_symbols_ref);
-    state.per_isolate_symbols_ref = nullptr;
-  }
-  if (state.require_ref != nullptr) {
-    napi_delete_reference(env, state.require_ref);
-    state.require_ref = nullptr;
-  }
-  if (state.native_builtins_binding_ref != nullptr) {
-    napi_delete_reference(env, state.native_builtins_binding_ref);
-    state.native_builtins_binding_ref = nullptr;
-  }
-  if (state.internal_binding_loader_ref != nullptr) {
-    napi_delete_reference(env, state.internal_binding_loader_ref);
-    state.internal_binding_loader_ref = nullptr;
-  }
-  if (state.require_builtin_loader_ref != nullptr) {
-    napi_delete_reference(env, state.require_builtin_loader_ref);
-    state.require_builtin_loader_ref = nullptr;
-  }
-  state.entry_dir = entry_path.parent_path().string();
+  ResetModuleLoaderState(env, state);
+  state->entry_dir = entry_path.parent_path().string();
 
-  auto* root_context = new RequireContext{&state, state.entry_dir};
-  g_require_contexts.push_back(root_context);
+  RequireContext* root_context = AddRequireContext(state, state->entry_dir);
+  if (root_context == nullptr) {
+    return napi_generic_failure;
+  }
 
   napi_value require_fn = CreateRequireFunction(env, root_context);
   if (require_fn == nullptr) {
     return napi_generic_failure;
   }
-  napi_value cache_obj = GetCacheObject(env, &state);
+  napi_value cache_obj = GetCacheObject(env, state);
   if (cache_obj == nullptr) {
     return napi_generic_failure;
   }
@@ -4759,7 +4856,7 @@ napi_status UbiInstallModuleLoader(napi_env env, const char* entry_script_path) 
   if (napi_set_named_property(env, require_fn, "cache", cache_obj) != napi_ok) {
     return napi_generic_failure;
   }
-  ResetStateRef(env, &state.require_ref, require_fn);
+  ResetStateRef(env, &state->require_ref, require_fn);
 
   if (is_eval_entry && !EvalEntryUsesModuleInputType(env)) {
     napi_value filename_value = nullptr;
@@ -4780,7 +4877,7 @@ napi_status UbiInstallModuleLoader(napi_env env, const char* entry_script_path) 
                            "internalBinding",
                            NAPI_AUTO_LENGTH,
                            NativeGetInternalBindingCallback,
-                           &state,
+                           state,
                            &native_get_internal_binding_fn) != napi_ok ||
       native_get_internal_binding_fn == nullptr ||
       napi_set_named_property(env,

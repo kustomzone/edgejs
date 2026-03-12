@@ -317,18 +317,33 @@ void OnProcessClose(uv_handle_t* handle) {
   wrap->alive = false;
   UntrackLiveChildPid(wrap->pid);
 
+  UbiHandleWrapDetach(&wrap->handle_wrap);
   UbiHandleWrapReleaseWrapperRef(&wrap->handle_wrap);
-  UbiHandleWrapMaybeCallOnClose(&wrap->handle_wrap);
 
   if (wrap->handle_wrap.active_handle_token != nullptr) {
     UbiUnregisterActiveHandle(wrap->handle_wrap.env, wrap->handle_wrap.active_handle_token);
     wrap->handle_wrap.active_handle_token = nullptr;
   }
 
+  UbiHandleWrapMaybeCallOnClose(&wrap->handle_wrap);
   QueueDestroy(wrap);
 
-  if (wrap->handle_wrap.delete_on_close || wrap->handle_wrap.finalized) {
+  bool can_delete = wrap->handle_wrap.finalized;
+  if (!can_delete && wrap->handle_wrap.delete_on_close) {
+    can_delete = UbiHandleWrapCancelFinalizer(&wrap->handle_wrap, wrap);
+  }
+  if (can_delete) {
     delete wrap;
+  }
+}
+
+void CloseProcessWrapForCleanup(void* data) {
+  auto* wrap = static_cast<ProcessWrap*>(data);
+  if (wrap == nullptr || wrap->handle_wrap.state != kUbiHandleInitialized) return;
+  uv_handle_t* handle = reinterpret_cast<uv_handle_t*>(&wrap->process);
+  if (!uv_is_closing(handle)) {
+    wrap->handle_wrap.state = kUbiHandleClosing;
+    uv_close(handle, OnProcessClose);
   }
 }
 
@@ -375,6 +390,7 @@ void ProcessFinalize(napi_env env, void* data, void* /*hint*/) {
   UbiHandleWrapDeleteRefIfPresent(env, &wrap->handle_wrap.wrapper_ref);
 
   if (wrap->handle_wrap.state == kUbiHandleUninitialized || wrap->handle_wrap.state == kUbiHandleClosed) {
+    UbiHandleWrapDetach(&wrap->handle_wrap);
     if (wrap->handle_wrap.active_handle_token != nullptr) {
       UbiUnregisterActiveHandle(env, wrap->handle_wrap.active_handle_token);
       wrap->handle_wrap.active_handle_token = nullptr;
@@ -387,12 +403,8 @@ void ProcessFinalize(napi_env env, void* data, void* /*hint*/) {
   wrap->handle_wrap.delete_on_close = true;
   wrap->alive = false;
   UntrackLiveChildPid(wrap->pid);
-  uv_handle_t* handle = reinterpret_cast<uv_handle_t*>(&wrap->process);
-  if (wrap->handle_wrap.state == kUbiHandleInitialized && !uv_is_closing(handle)) {
-    wrap->handle_wrap.state = kUbiHandleClosing;
-    uv_close(handle, OnProcessClose);
-    return;
-  }
+  CloseProcessWrapForCleanup(wrap);
+  if (wrap->handle_wrap.state == kUbiHandleClosing) return;
 
   if (wrap->handle_wrap.state != kUbiHandleClosing) {
     if (wrap->handle_wrap.active_handle_token != nullptr) {
@@ -525,9 +537,8 @@ napi_value ProcessSpawn(napi_env env, napi_callback_info info) {
   wrap->handle_wrap.state = kUbiHandleUninitialized;
 
   const int rc = uv_spawn(loop, &wrap->process, &options);
-  wrap->handle_wrap.state = kUbiHandleInitialized;
-  UbiHandleWrapHoldWrapperRef(&wrap->handle_wrap);
   if (rc != 0) {
+    wrap->process = {};
     wrap->pid = 0;
     wrap->alive = false;
     SetPidUndefined(env, self);
@@ -537,6 +548,12 @@ napi_value ProcessSpawn(napi_env env, napi_callback_info info) {
     return MakeInt32(env, rc);
   }
 
+  wrap->handle_wrap.state = kUbiHandleInitialized;
+  UbiHandleWrapAttach(&wrap->handle_wrap,
+                      wrap,
+                      reinterpret_cast<uv_handle_t*>(&wrap->process),
+                      CloseProcessWrapForCleanup);
+  UbiHandleWrapHoldWrapperRef(&wrap->handle_wrap);
   wrap->pid = static_cast<int32_t>(wrap->process.pid);
   wrap->alive = true;
   TrackLiveChildPid(wrap->pid);
@@ -605,11 +622,7 @@ napi_value ProcessClose(napi_env env, napi_callback_info info) {
   wrap->alive = false;
   UntrackLiveChildPid(wrap->pid);
 
-  uv_handle_t* handle = reinterpret_cast<uv_handle_t*>(&wrap->process);
-  if (!uv_is_closing(handle)) {
-    wrap->handle_wrap.state = kUbiHandleClosing;
-    uv_close(handle, OnProcessClose);
-  }
+  CloseProcessWrapForCleanup(wrap);
 
   return internal_binding::Undefined(env);
 }

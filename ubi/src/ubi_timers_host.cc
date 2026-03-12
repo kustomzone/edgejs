@@ -38,6 +38,10 @@ struct TimersHostState {
   uint32_t pending_handle_closes = 0;
 };
 
+bool TimersHostStateIsUnavailable(const TimersHostState* st) {
+  return st == nullptr || st->cleanup_started;
+}
+
 constexpr int kImmediateCount = 0;
 constexpr int kImmediateRefCount = 1;
 constexpr int kImmediateHasOutstanding = 2;
@@ -124,6 +128,7 @@ void OnHandleClosed(uv_handle_t* handle) {
 
 void CloseHandleIfInitialized(TimersHostState* st, uv_handle_t* handle, bool* initialized_flag) {
   if (st == nullptr || handle == nullptr || initialized_flag == nullptr || !*initialized_flag) return;
+  *initialized_flag = false;
   if (uv_is_closing(handle) != 0) return;
   ++st->pending_handle_closes;
   uv_close(handle, OnHandleClosed);
@@ -141,7 +146,6 @@ void OnTimersEnvCleanup(void* arg) {
   DeleteRefIfAny(st->env, &st->immediate_callback_ref);
   DeleteRefIfAny(st->env, &st->immediate_info_ref);
   DeleteRefIfAny(st->env, &st->timeout_info_ref);
-  st->env = nullptr;
 
   if (st->timer_initialized) {
     uv_timer_stop(&st->timer_handle);
@@ -183,6 +187,10 @@ TimersHostState* GetOrCreateState(napi_env env) {
     it->second = std::move(state);
   }
   return it->second.get();
+}
+
+TimersHostState* GetStateForJsBindingCall(napi_env env) {
+  return env != nullptr ? GetState(env) : nullptr;
 }
 
 void SetFunctionRef(napi_env env, napi_value fn, napi_ref* ref_slot) {
@@ -271,6 +279,7 @@ void EnsureTimerHandle(TimersHostState* st) {
   if (loop == nullptr) return;
   if (uv_timer_init(loop, &st->timer_handle) == 0) {
     st->timer_handle.data = st;
+    uv_unref(reinterpret_cast<uv_handle_t*>(&st->timer_handle));
     st->timer_initialized = true;
     DebugLog("timer handle initialized");
   }
@@ -286,7 +295,7 @@ void EnsureCheckHandle(TimersHostState* st) {
   if (uv_check_start(&st->check_handle,
                      [](uv_check_t* handle) {
                        auto* state = static_cast<TimersHostState*>(handle->data);
-                       if (state == nullptr || state->env == nullptr) {
+                       if (state == nullptr || state->cleanup_started) {
                          return;
                        }
                        if (ImmediateCount(state) == 0 && !HasNativeImmediateTasks(state)) {
@@ -333,7 +342,7 @@ void EnsureIdleHandle(TimersHostState* st) {
 }
 
 bool CallImmediateCallback(TimersHostState* st) {
-  if (st == nullptr || st->env == nullptr || st->immediate_callback_ref == nullptr) return true;
+  if (st == nullptr || st->cleanup_started || st->immediate_callback_ref == nullptr) return true;
   static unsigned long long immediate_calls = 0;
   immediate_calls++;
   if (TimersDebugEnabled() && (immediate_calls <= 10 || (immediate_calls % 1000) == 0)) {
@@ -355,7 +364,7 @@ bool CallImmediateCallback(TimersHostState* st) {
 }
 
 double CallTimersCallback(TimersHostState* st, double now) {
-  if (st == nullptr || st->env == nullptr || st->timers_callback_ref == nullptr) return 0;
+  if (st == nullptr || st->cleanup_started || st->timers_callback_ref == nullptr) return 0;
   DebugLog("CallTimersCallback(now=%.3f)", now);
 
   napi_value cb = nullptr;
@@ -421,7 +430,7 @@ bool TimerCallbackResultNeedsRefresh(TimersHostState* st, double next_expiry) {
 
 void RunTimersCallback(uv_timer_t* handle) {
   auto* state = static_cast<TimersHostState*>(handle->data);
-  if (state == nullptr) return;
+  if (state == nullptr || state->cleanup_started) return;
 
   state->running_timers_callback = true;
   state->timer_rescheduled_in_callback = false;
@@ -467,8 +476,12 @@ void ScheduleFromNextExpiry(TimersHostState* st, double next_expiry, double now)
 }
 
 napi_value SetupTimers(napi_env env, napi_callback_info info) {
-  TimersHostState* st = GetOrCreateState(env);
-  if (st == nullptr) return nullptr;
+  TimersHostState* st = GetStateForJsBindingCall(env);
+  if (st == nullptr || TimersHostStateIsUnavailable(st)) {
+    napi_value undefined = nullptr;
+    napi_get_undefined(env, &undefined);
+    return undefined;
+  }
 
   size_t argc = 2;
   napi_value argv[2] = {nullptr, nullptr};
@@ -485,8 +498,12 @@ napi_value SetupTimers(napi_env env, napi_callback_info info) {
 }
 
 napi_value ScheduleTimer(napi_env env, napi_callback_info info) {
-  TimersHostState* st = GetOrCreateState(env);
-  if (st == nullptr) return nullptr;
+  TimersHostState* st = GetStateForJsBindingCall(env);
+  if (st == nullptr || TimersHostStateIsUnavailable(st)) {
+    napi_value undefined = nullptr;
+    napi_get_undefined(env, &undefined);
+    return undefined;
+  }
 
   size_t argc = 1;
   napi_value argv[1] = {nullptr};
@@ -514,8 +531,12 @@ napi_value ScheduleTimer(napi_env env, napi_callback_info info) {
 }
 
 napi_value ToggleTimerRef(napi_env env, napi_callback_info info) {
-  TimersHostState* st = GetOrCreateState(env);
-  if (st == nullptr) return nullptr;
+  TimersHostState* st = GetStateForJsBindingCall(env);
+  if (st == nullptr || TimersHostStateIsUnavailable(st)) {
+    napi_value undefined = nullptr;
+    napi_get_undefined(env, &undefined);
+    return undefined;
+  }
 
   size_t argc = 1;
   napi_value argv[1] = {nullptr};
@@ -529,8 +550,12 @@ napi_value ToggleTimerRef(napi_env env, napi_callback_info info) {
 }
 
 napi_value ToggleImmediateRef(napi_env env, napi_callback_info info) {
-  TimersHostState* st = GetOrCreateState(env);
-  if (st == nullptr) return nullptr;
+  TimersHostState* st = GetStateForJsBindingCall(env);
+  if (st == nullptr || TimersHostStateIsUnavailable(st)) {
+    napi_value undefined = nullptr;
+    napi_get_undefined(env, &undefined);
+    return undefined;
+  }
 
   size_t argc = 1;
   napi_value argv[1] = {nullptr};
@@ -544,10 +569,10 @@ napi_value ToggleImmediateRef(napi_env env, napi_callback_info info) {
 }
 
 napi_value GetLibuvNow(napi_env env, napi_callback_info /*info*/) {
-  TimersHostState* st = GetOrCreateState(env);
-  if (st == nullptr) return nullptr;
+  TimersHostState* st = GetStateForJsBindingCall(env);
   napi_value out = nullptr;
-  napi_create_double(env, GetNowMs(st), &out);
+  const double now = (st == nullptr || TimersHostStateIsUnavailable(st)) ? 0 : GetNowMs(st);
+  napi_create_double(env, now, &out);
   return out;
 }
 
@@ -600,11 +625,9 @@ void AttachInfoArrays(napi_env env, napi_value binding, TimersHostState* st) {
 napi_value UbiInstallTimersHostBinding(napi_env env) {
   if (env == nullptr) return nullptr;
 
-  TimersHostState* st = GetOrCreateState(env);
+  if (UbiInitializeTimersHost(env) != napi_ok) return nullptr;
+  TimersHostState* st = GetState(env);
   if (st == nullptr) return nullptr;
-  EnsureTimerHandle(st);
-  EnsureCheckHandle(st);
-  EnsureIdleHandle(st);
   DebugLog("install timers host binding");
 
   napi_value binding = nullptr;
@@ -619,6 +642,16 @@ napi_value UbiInstallTimersHostBinding(napi_env env) {
   AttachInfoArrays(env, binding, st);
 
   return binding;
+}
+
+napi_status UbiInitializeTimersHost(napi_env env) {
+  if (env == nullptr) return napi_invalid_arg;
+  TimersHostState* st = GetOrCreateState(env);
+  if (st == nullptr) return napi_generic_failure;
+  EnsureTimerHandle(st);
+  EnsureCheckHandle(st);
+  EnsureIdleHandle(st);
+  return napi_ok;
 }
 
 int32_t UbiGetActiveTimeoutCount(napi_env env) {
@@ -638,16 +671,30 @@ uint32_t UbiGetActiveImmediateRefCount(napi_env env) {
 }
 
 void UbiEnsureTimersImmediatePump(napi_env env) {
-  TimersHostState* st = GetOrCreateState(env);
+  TimersHostState* st = GetState(env);
   if (st == nullptr) return;
+  if (TimersHostStateIsUnavailable(st)) return;
   EnsureCheckHandle(st);
 }
 
 void UbiToggleImmediateRefFromNative(napi_env env, bool ref) {
   TimersHostState* st = GetState(env);
-  if (st == nullptr) {
-    st = GetOrCreateState(env);
-  }
   if (st == nullptr) return;
+  if (TimersHostStateIsUnavailable(st)) return;
   ApplyImmediateRefState(st, ref);
+}
+
+void UbiRunTimersHostEnvCleanup(napi_env env) {
+  if (env == nullptr) return;
+  if (g_timers_cleanup_hook_registered.erase(env) != 0) {
+    (void)napi_remove_env_cleanup_hook(env, OnTimersEnvCleanup, env);
+  }
+  OnTimersEnvCleanup(env);
+  uv_loop_t* loop = UbiGetExistingEnvLoop(env);
+  TimersHostState* st = GetState(env);
+  for (size_t guard = 0; loop != nullptr && st != nullptr && st->pending_handle_closes != 0 && guard < 1024;
+       ++guard) {
+    (void)uv_run(loop, UV_RUN_NOWAIT);
+    st = GetState(env);
+  }
 }

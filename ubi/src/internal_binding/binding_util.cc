@@ -1,8 +1,7 @@
 #include "internal_binding/dispatch.h"
 
 #include <cstdint>
-#include <unordered_map>
-#include <unordered_set>
+#include <vector>
 
 #include "internal_binding/helpers.h"
 
@@ -12,10 +11,8 @@ namespace {
 
 struct UtilBindingState {
   napi_ref types_ref = nullptr;
+  std::vector<void*> callback_data;
 };
-
-std::unordered_map<napi_env, UtilBindingState> g_util_states;
-std::unordered_set<napi_env> g_util_cleanup_hook_registered;
 
 void DeleteRefIfPresent(napi_env env, napi_ref* ref) {
   if (env == nullptr || ref == nullptr || *ref == nullptr) return;
@@ -23,30 +20,10 @@ void DeleteRefIfPresent(napi_env env, napi_ref* ref) {
   *ref = nullptr;
 }
 
-void OnUtilEnvCleanup(void* data) {
-  napi_env env = static_cast<napi_env>(data);
-  g_util_cleanup_hook_registered.erase(env);
-
-  auto it = g_util_states.find(env);
-  if (it == g_util_states.end()) return;
-  DeleteRefIfPresent(env, &it->second.types_ref);
-  g_util_states.erase(it);
-}
-
-void EnsureUtilCleanupHook(napi_env env) {
-  if (env == nullptr) return;
-  auto [it, inserted] = g_util_cleanup_hook_registered.emplace(env);
-  if (!inserted) return;
-  if (napi_add_env_cleanup_hook(env, OnUtilEnvCleanup, env) != napi_ok) {
-    g_util_cleanup_hook_registered.erase(it);
-  }
-}
-
-napi_value GetTypesBinding(napi_env env) {
-  auto it = g_util_states.find(env);
-  if (it == g_util_states.end() || it->second.types_ref == nullptr) return nullptr;
+napi_value GetTypesBinding(napi_env env, UtilBindingState* state) {
+  if (state == nullptr || state->types_ref == nullptr) return nullptr;
   napi_value out = nullptr;
-  if (napi_get_reference_value(env, it->second.types_ref, &out) != napi_ok || out == nullptr) return nullptr;
+  if (napi_get_reference_value(env, state->types_ref, &out) != napi_ok || out == nullptr) return nullptr;
   return out;
 }
 
@@ -98,8 +75,38 @@ const char* TypesMethodName(TypesAlias alias) {
   return "";
 }
 
-napi_value CallTypesPredicate(napi_env env, TypesAlias alias, napi_value value) {
-  napi_value types = GetTypesBinding(env);
+struct UtilTypesMethodData {
+  UtilBindingState* state = nullptr;
+  TypesAlias alias = TypesAlias::kIsAnyArrayBuffer;
+};
+
+void UtilBindingFinalize(napi_env env, void* data, void* /*hint*/) {
+  auto* state = static_cast<UtilBindingState*>(data);
+  if (state == nullptr) return;
+  DeleteRefIfPresent(env, &state->types_ref);
+  for (void* ptr : state->callback_data) {
+    delete static_cast<UtilTypesMethodData*>(ptr);
+  }
+  delete state;
+}
+
+UtilBindingState* GetOrCreateUtilBindingState(napi_env env, napi_value binding) {
+  if (binding == nullptr) return nullptr;
+  void* data = nullptr;
+  if (napi_unwrap(env, binding, &data) == napi_ok && data != nullptr) {
+    return static_cast<UtilBindingState*>(data);
+  }
+
+  auto* state = new UtilBindingState();
+  if (napi_wrap(env, binding, state, UtilBindingFinalize, nullptr, nullptr) != napi_ok) {
+    delete state;
+    return nullptr;
+  }
+  return state;
+}
+
+napi_value CallTypesPredicate(napi_env env, UtilBindingState* state, TypesAlias alias, napi_value value) {
+  napi_value types = GetTypesBinding(env, state);
   if (types == nullptr || IsUndefined(env, types)) return Undefined(env);
   const char* name = TypesMethodName(alias);
   napi_value fn = nullptr;
@@ -121,8 +128,13 @@ napi_value UtilTypesAliasCallback(napi_env env, napi_callback_info info) {
   napi_value argv[1] = {nullptr};
   void* data = nullptr;
   napi_get_cb_info(env, info, &argc, argv, nullptr, &data);
-  TypesAlias alias = static_cast<TypesAlias>(reinterpret_cast<uintptr_t>(data));
-  return CallTypesPredicate(env, alias, argc >= 1 ? argv[0] : Undefined(env));
+  auto* method_data = static_cast<UtilTypesMethodData*>(data);
+  if (method_data == nullptr) return Undefined(env);
+  return CallTypesPredicate(
+      env,
+      method_data->state,
+      method_data->alias,
+      argc >= 1 ? argv[0] : Undefined(env));
 }
 
 napi_value UtilIsArrayBufferView(napi_env env, napi_callback_info info) {
@@ -177,15 +189,24 @@ napi_value UtilIsUint8Array(napi_env env, napi_callback_info info) {
   return out != nullptr ? out : Undefined(env);
 }
 
-void EnsureMethodFromTypes(napi_env env, napi_value binding, const char* name, TypesAlias alias) {
+void EnsureMethodFromTypes(napi_env env,
+                           napi_value binding,
+                           UtilBindingState* state,
+                           const char* name,
+                           TypesAlias alias) {
   bool has = false;
   if (napi_has_named_property(env, binding, name, &has) != napi_ok || has) return;
+  if (state == nullptr) return;
+  auto* data = new UtilTypesMethodData();
+  data->state = state;
+  data->alias = alias;
+  state->callback_data.push_back(data);
   napi_value fn = nullptr;
   napi_create_function(env,
                        name,
                        NAPI_AUTO_LENGTH,
                        UtilTypesAliasCallback,
-                       reinterpret_cast<void*>(static_cast<uintptr_t>(alias)),
+                       data,
                        &fn);
   if (fn != nullptr) napi_set_named_property(env, binding, name, fn);
 }
@@ -202,31 +223,32 @@ void EnsureMethod(napi_env env, napi_value binding, const char* name, napi_callb
 }  // namespace
 
 napi_value ResolveUtil(napi_env env, const ResolveOptions& options) {
-  EnsureUtilCleanupHook(env);
   if (options.callbacks.resolve_binding == nullptr) return Undefined(env);
   napi_value binding = options.callbacks.resolve_binding(env, options.state, "util");
   if (binding == nullptr || IsUndefined(env, binding)) return Undefined(env);
+  UtilBindingState* state = GetOrCreateUtilBindingState(env, binding);
 
   napi_value types = options.callbacks.resolve_binding(env, options.state, "types");
-  if (types != nullptr && !IsUndefined(env, types)) {
-    auto& st = g_util_states[env];
-    DeleteRefIfPresent(env, &st.types_ref);
-    napi_create_reference(env, types, 1, &st.types_ref);
+  if (state != nullptr) {
+    DeleteRefIfPresent(env, &state->types_ref);
+    if (types != nullptr && !IsUndefined(env, types)) {
+      napi_create_reference(env, types, 1, &state->types_ref);
+    }
   }
 
-  EnsureMethodFromTypes(env, binding, "isAnyArrayBuffer", TypesAlias::kIsAnyArrayBuffer);
-  EnsureMethodFromTypes(env, binding, "isArrayBuffer", TypesAlias::kIsArrayBuffer);
-  EnsureMethodFromTypes(env, binding, "isAsyncFunction", TypesAlias::kIsAsyncFunction);
-  EnsureMethodFromTypes(env, binding, "isDataView", TypesAlias::kIsDataView);
-  EnsureMethodFromTypes(env, binding, "isDate", TypesAlias::kIsDate);
-  EnsureMethodFromTypes(env, binding, "isExternal", TypesAlias::kIsExternal);
-  EnsureMethodFromTypes(env, binding, "isMap", TypesAlias::kIsMap);
-  EnsureMethodFromTypes(env, binding, "isMapIterator", TypesAlias::kIsMapIterator);
-  EnsureMethodFromTypes(env, binding, "isNativeError", TypesAlias::kIsNativeError);
-  EnsureMethodFromTypes(env, binding, "isPromise", TypesAlias::kIsPromise);
-  EnsureMethodFromTypes(env, binding, "isRegExp", TypesAlias::kIsRegExp);
-  EnsureMethodFromTypes(env, binding, "isSet", TypesAlias::kIsSet);
-  EnsureMethodFromTypes(env, binding, "isSetIterator", TypesAlias::kIsSetIterator);
+  EnsureMethodFromTypes(env, binding, state, "isAnyArrayBuffer", TypesAlias::kIsAnyArrayBuffer);
+  EnsureMethodFromTypes(env, binding, state, "isArrayBuffer", TypesAlias::kIsArrayBuffer);
+  EnsureMethodFromTypes(env, binding, state, "isAsyncFunction", TypesAlias::kIsAsyncFunction);
+  EnsureMethodFromTypes(env, binding, state, "isDataView", TypesAlias::kIsDataView);
+  EnsureMethodFromTypes(env, binding, state, "isDate", TypesAlias::kIsDate);
+  EnsureMethodFromTypes(env, binding, state, "isExternal", TypesAlias::kIsExternal);
+  EnsureMethodFromTypes(env, binding, state, "isMap", TypesAlias::kIsMap);
+  EnsureMethodFromTypes(env, binding, state, "isMapIterator", TypesAlias::kIsMapIterator);
+  EnsureMethodFromTypes(env, binding, state, "isNativeError", TypesAlias::kIsNativeError);
+  EnsureMethodFromTypes(env, binding, state, "isPromise", TypesAlias::kIsPromise);
+  EnsureMethodFromTypes(env, binding, state, "isRegExp", TypesAlias::kIsRegExp);
+  EnsureMethodFromTypes(env, binding, state, "isSet", TypesAlias::kIsSet);
+  EnsureMethodFromTypes(env, binding, state, "isSetIterator", TypesAlias::kIsSetIterator);
 
   EnsureMethod(env, binding, "isArrayBufferView", UtilIsArrayBufferView);
   EnsureMethod(env, binding, "isTypedArray", UtilIsTypedArray);

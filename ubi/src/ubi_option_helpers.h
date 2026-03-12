@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -65,6 +66,13 @@ inline bool ReadFileText(const fs::path& path, std::string* out) {
   ss << in.rdbuf();
   *out = ss.str();
   return true;
+}
+
+inline std::optional<fs::path> TryGetCurrentPath() {
+  std::error_code ec;
+  fs::path cwd = fs::current_path(ec);
+  if (ec) return std::nullopt;
+  return cwd;
 }
 
 inline std::vector<std::string> ParseNodeOptionsString(const std::string& node_options,
@@ -240,13 +248,13 @@ inline void CollectEnvFileSpecs(const std::vector<std::string>& raw_exec_argv,
                                 std::vector<std::pair<fs::path, bool>>* out_specs) {
   if (out_specs == nullptr) return;
   out_specs->clear();
-  const fs::path cwd = fs::current_path();
+  const std::optional<fs::path> cwd = TryGetCurrentPath();
 
   for (size_t i = 0; i < raw_exec_argv.size(); ++i) {
     const std::string& token = raw_exec_argv[i];
     auto push_spec = [&](const std::string& raw_path, bool optional) {
       fs::path path(raw_path);
-      if (path.is_relative()) path = cwd / path;
+      if (path.is_relative() && cwd.has_value()) path = *cwd / path;
       out_specs->push_back({path.lexically_normal(), optional});
     };
 
@@ -325,18 +333,18 @@ inline void CollectConfigFileSpecs(const std::vector<std::string>& raw_exec_argv
                                    std::vector<fs::path>* out_paths) {
   if (out_paths == nullptr) return;
   out_paths->clear();
-  const fs::path cwd = fs::current_path();
+  const std::optional<fs::path> cwd = TryGetCurrentPath();
   for (size_t i = 0; i < raw_exec_argv.size(); ++i) {
     const std::string& token = raw_exec_argv[i];
     if (token.rfind("--experimental-config-file=", 0) == 0) {
       fs::path path(token.substr(sizeof("--experimental-config-file=") - 1));
-      if (path.is_relative()) path = cwd / path;
+      if (path.is_relative() && cwd.has_value()) path = *cwd / path;
       out_paths->push_back(path.lexically_normal());
       continue;
     }
     if (token == "--experimental-config-file" && i + 1 < raw_exec_argv.size()) {
       fs::path path(raw_exec_argv[++i]);
-      if (path.is_relative()) path = cwd / path;
+      if (path.is_relative() && cwd.has_value()) path = *cwd / path;
       out_paths->push_back(path.lexically_normal());
     }
   }

@@ -47,6 +47,7 @@ std::unordered_map<napi_env, napi_ref> g_udp_ctor_refs;
 std::unordered_set<napi_env> g_udp_cleanup_hook_registered;
 
 void OnClosed(uv_handle_t* h);
+void CloseUdpWrapForCleanup(void* data);
 
 napi_value GetRefValue(napi_env env, napi_ref ref) {
   if (ref == nullptr) return nullptr;
@@ -393,6 +394,12 @@ class UdpWrap final : public UbiUdpWrapBase, public UbiUdpListener {
       }
     }
     handle.data = this;
+    if (handle_wrap.state == kUbiHandleInitialized) {
+      UbiHandleWrapAttach(&handle_wrap,
+                          this,
+                          reinterpret_cast<uv_handle_t*>(&handle),
+                          CloseUdpWrapForCleanup);
+    }
     set_listener(this);
   }
 
@@ -704,18 +711,17 @@ void UdpFinalize(napi_env env, void* data, void* hint) {
   if (wrap == nullptr) return;
   wrap->handle_wrap.finalized = true;
   UbiHandleWrapDeleteRefIfPresent(env, &wrap->handle_wrap.wrapper_ref);
-  uv_handle_t* h = reinterpret_cast<uv_handle_t*>(&wrap->handle);
   if (wrap->handle_wrap.state == kUbiHandleInitialized) {
     wrap->handle_wrap.delete_on_close = true;
-    wrap->handle_wrap.state = kUbiHandleClosing;
     UbiHandleWrapReleaseWrapperRef(&wrap->handle_wrap);
-    if (!uv_is_closing(h)) uv_close(h, OnClosed);
+    CloseUdpWrapForCleanup(wrap);
     return;
   }
   if (wrap->handle_wrap.state == kUbiHandleClosing) {
     wrap->handle_wrap.delete_on_close = true;
     return;
   }
+  UbiHandleWrapDetach(&wrap->handle_wrap);
   if (wrap->handle_wrap.active_handle_token != nullptr) {
     UbiUnregisterActiveHandle(env, wrap->handle_wrap.active_handle_token);
     wrap->handle_wrap.active_handle_token = nullptr;
@@ -769,16 +775,31 @@ void OnClosed(uv_handle_t* h) {
   auto* wrap = static_cast<UdpWrap*>(h->data);
   if (wrap == nullptr) return;
   wrap->handle_wrap.state = kUbiHandleClosed;
+  UbiHandleWrapDetach(&wrap->handle_wrap);
   UbiHandleWrapReleaseWrapperRef(&wrap->handle_wrap);
-  UbiHandleWrapMaybeCallOnClose(&wrap->handle_wrap);
   if (wrap->handle_wrap.active_handle_token != nullptr) {
     UbiUnregisterActiveHandle(wrap->handle_wrap.env, wrap->handle_wrap.active_handle_token);
     wrap->handle_wrap.active_handle_token = nullptr;
   }
+  UbiHandleWrapMaybeCallOnClose(&wrap->handle_wrap);
   QueueUdpWrapDestroyIfNeeded(wrap);
-  if (wrap->handle_wrap.delete_on_close || wrap->handle_wrap.finalized) {
+  bool can_delete = wrap->handle_wrap.finalized;
+  if (!can_delete && wrap->handle_wrap.delete_on_close) {
+    can_delete = UbiHandleWrapCancelFinalizer(&wrap->handle_wrap, wrap);
+  }
+  if (can_delete) {
     UbiHandleWrapDeleteRefIfPresent(wrap->handle_wrap.env, &wrap->handle_wrap.wrapper_ref);
     delete wrap;
+  }
+}
+
+void CloseUdpWrapForCleanup(void* data) {
+  auto* wrap = static_cast<UdpWrap*>(data);
+  if (wrap == nullptr || wrap->handle_wrap.state != kUbiHandleInitialized) return;
+  uv_handle_t* handle = reinterpret_cast<uv_handle_t*>(&wrap->handle);
+  if (!uv_is_closing(handle)) {
+    wrap->handle_wrap.state = kUbiHandleClosing;
+    uv_close(handle, OnClosed);
   }
 }
 
@@ -882,8 +903,7 @@ napi_value UdpClose(napi_env env, napi_callback_info info) {
 
   if (wrap->handle_wrap.state == kUbiHandleInitialized &&
       !uv_is_closing(reinterpret_cast<uv_handle_t*>(&wrap->handle))) {
-    wrap->handle_wrap.state = kUbiHandleClosing;
-    uv_close(reinterpret_cast<uv_handle_t*>(&wrap->handle), OnClosed);
+    CloseUdpWrapForCleanup(wrap);
   }
   napi_value undefined = nullptr;
   napi_get_undefined(env, &undefined);
