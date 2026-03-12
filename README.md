@@ -14,11 +14,20 @@
 
 Edge.js is a **Node.js-compatible** runtime with stronger sandboxing than any other JS runtime thanks to WebAssembly.
 
-- ✅ **Full compatible with Node.js**: use your codebase, packages, and workflow.
-- 🛡️ **Safer by design**: built for serverless and embedded workloads.
-- 🧩 **Pluggable JS engine**: you can use the JS engine you prefer: V8, JavaScriptCore or QuickJS.
-- 💪 **Compatible with NPM/PNPM/Yarn/Bun**: use your current package manager with `ubi`.
+✅ **Full compatibility with Node**: use your codebase, packages, and workflow.
+🛡️ **Sandboxed by design**: built for serverless and embedded workloads.
+🧩 **Choose the JS engine**: V8, JavaScriptCore or QuickJS.
+💪 **Compatible with NPM/PNPM/Yarn/Bun**: use your current package manager with `ubi`.
 
+## Install Edge.js
+
+```bash
+curl -fsSL https://edgejs.org/install | bash
+```
+
+## Use it!
+
+You can use it as you would do it with Node.js:
 
 ```js
 const http = require("node:http");
@@ -30,6 +39,18 @@ http
   .listen(3000, () => {
     console.log("listening on http://localhost:3000");
   });
+```
+
+```bash
+$ ubi server.js
+```
+
+If you want to use it in your current workflow, just wrap your commands with `ubi`:
+
+```bash
+$ ubi node myfile.js
+$ ubi npm install
+$ ubi pnpm run dev
 ```
 
 ## Development
