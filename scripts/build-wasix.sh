@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+BUILD_DIR="${PROJECT_ROOT}/build-wasix"
+TOOLCHAIN_FILE="${PROJECT_ROOT}/scripts/cmake/wasix-toolchain.cmake"
+OPENSSL_WASIX_DIR="${PROJECT_ROOT}/deps/openssl-wasix"
+
+export WASIXCC_WASM_EXCEPTIONS="${WASIXCC_WASM_EXCEPTIONS:-yes}"
+
+optimize_wasm() {
+  local input="$1"
+  local output="$2"
+  if command -v wasm-opt >/dev/null 2>&1; then
+    wasm-opt --emit-exnref -o "${output}" "${input}"
+    return
+  fi
+  echo "warning: wasm-opt not found in PATH; copying ${input} to ${output}" >&2
+  cp "${input}" "${output}"
+}
+
+"${SCRIPT_DIR}/setup-wasix-deps.sh"
+
+if [[ ! -f "${OPENSSL_WASIX_DIR}/libcrypto.a" || ! -f "${OPENSSL_WASIX_DIR}/libssl.a" ]]; then
+  echo "Building OpenSSL static libraries for WASIX..."
+  (
+    cd "${OPENSSL_WASIX_DIR}"
+    make distclean >/dev/null 2>&1 || true
+    CC=wasixcc \
+    CXX=wasixcc++ \
+    AR=wasixar \
+    RANLIB=wasixranlib \
+    NM=wasixnm \
+    LD=wasixld \
+    CFLAGS="--target=wasm32-wasix -matomics -mbulk-memory -mmutable-globals -pthread -mthread-model posix -ftls-model=local-exec -fno-trapping-math -D_WASI_EMULATED_MMAN -D_WASI_EMULATED_SIGNAL -D_WASI_EMULATED_PROCESS_CLOCKS -DUSE_TIMEGM -DOPENSSL_NO_SECURE_MEMORY -DOPENSSL_NO_DGRAM -DOPENSSL_THREADS -O2" \
+    LDFLAGS="-Wl,--allow-undefined" \
+    ./Configure linux-generic32 -static no-shared no-pic no-asm no-tests no-apps no-afalgeng -DUSE_TIMEGM -DOPENSSL_NO_SECURE_MEMORY -DOPENSSL_NO_DGRAM -DOPENSSL_THREADS
+    make build_generated
+    make -j4 libcrypto.a libssl.a
+    wasixranlib libcrypto.a || true
+    wasixranlib libssl.a || true
+  )
+fi
+
+cmake \
+  -S "${PROJECT_ROOT}" \
+  -B "${BUILD_DIR}" \
+  -DCMAKE_TOOLCHAIN_FILE="${TOOLCHAIN_FILE}" \
+  -DEDGE_NAPI_PROVIDER=imports \
+  -DEDGE_BUILD_CLI=ON \
+  -DBUILD_TESTING=OFF
+
+cmake --build "${BUILD_DIR}" -j4
+
+if [[ -f "${BUILD_DIR}/edge" ]]; then
+  optimize_wasm "${BUILD_DIR}/edge" "${BUILD_DIR}/edge.wasm"
+  cp "${BUILD_DIR}/edge.wasm" "${BUILD_DIR}/ubi.wasm"
+elif [[ -f "${BUILD_DIR}/ubi" ]]; then
+  optimize_wasm "${BUILD_DIR}/ubi" "${BUILD_DIR}/ubi.wasm"
+  cp "${BUILD_DIR}/ubi.wasm" "${BUILD_DIR}/edge.wasm"
+else
+  echo "error: expected ${BUILD_DIR}/edge or ${BUILD_DIR}/ubi after build" >&2
+  exit 1
+fi
+
+if [[ -f "${BUILD_DIR}/edgeenv" ]]; then
+  optimize_wasm "${BUILD_DIR}/edgeenv" "${BUILD_DIR}/edgeenv.wasm"
+fi
+
+echo "Built WASIX targets at ${BUILD_DIR}/edge.wasm and ${BUILD_DIR}/ubi.wasm"

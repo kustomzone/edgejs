@@ -6,6 +6,36 @@ on:
   workflow_dispatch:
 
 jobs:
+  metadata:
+    name: metadata
+    runs-on: ubuntu-latest
+    outputs:
+      edge_version: ${{ steps.version.outputs.edge_version }}
+      release_tag: ${{ steps.version.outputs.release_tag }}
+      release_name: ${{ steps.version.outputs.release_name }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compute release metadata
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          major="$(sed -n 's/^#define EDGE_MAJOR_VERSION //p' src/edge_version.h)"
+          minor="$(sed -n 's/^#define EDGE_MINOR_VERSION //p' src/edge_version.h)"
+          patch="$(sed -n 's/^#define EDGE_PATCH_VERSION //p' src/edge_version.h)"
+          if [[ -z "${major}" || -z "${minor}" || -z "${patch}" ]]; then
+            echo "Failed to parse EDGE version from src/edge_version.h" >&2
+            exit 1
+          fi
+          edge_version="${major}.${minor}.${patch}"
+          release_tag="${edge_version}-nightly"
+          release_name="${release_tag}"
+          {
+            echo "edge_version=${edge_version}"
+            echo "release_tag=${release_tag}"
+            echo "release_name=${release_name}"
+          } >> "${GITHUB_OUTPUT}"
+
   build-linux:
     name: build-linux
     runs-on: ubuntu-latest
@@ -28,6 +58,13 @@ jobs:
           git -c protocol.version=2 submodule update --init --recursive --depth=1
           test -f node/src/node_api_types.h
 
+      - name: Install Linux build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y libicu-dev
+
       - name: Validate public N-API headers stay V8-agnostic
         run: |
           ! grep -nE "v8::|<v8.h>|\"v8.h\"" napi/include/js_native_api.h napi/include/node_api.h
@@ -41,7 +78,7 @@ jobs:
       - name: Test napi-v8
         run: ctest --test-dir napi/v8/build --output-on-failure -R '^napi_v8\.'
 
-      - name: Build ubi
+      - name: Build edge
         run: |
           make build CMAKE_BUILD_TYPE=Release JOBS=4
 
@@ -49,23 +86,128 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          make dist-only JOBS=4 ZIP_NAME=ubi-linux.zip
+          make dist-only JOBS=4 ZIP_NAME=edge-linux-amd64.zip
 
-      - name: Upload artifact ubi
+      - name: Upload artifact edge
         uses: actions/upload-artifact@v4
         with:
-          name: ubi-linux
-          path: ubi-linux.zip
+          name: edge-linux-amd64
+          path: edge-linux-amd64.zip
           if-no-files-found: error
 
-      - name: Test ubi
-        if: false
+      - name: Test edge
         run: |
           make test-only TEST_JOBS=4
 
       - name: sccache stats
         if: always()
         run: sccache --show-stats || true
+
+  publish-nightly:
+    name: publish-nightly
+    runs-on: ubuntu-latest
+    needs:
+      - metadata
+      - build-linux
+      - build-macos
+      - build-wasix-linux
+    if: ${{ always() && github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    env:
+      GH_TOKEN: ${{ secrets.RELEASE_PLEASE_GH_TOKEN }}
+      TARGET_REPO: wasmerio/edgejs-nightlies
+      RELEASE_TAG: ${{ needs.metadata.outputs.release_tag }}
+      RELEASE_NAME: ${{ needs.metadata.outputs.release_name }}
+      EDGE_VERSION: ${{ needs.metadata.outputs.edge_version }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - name: Download Linux artifact
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: edge-linux-amd64
+          path: release-assets/linux
+
+      - name: Download macOS artifact
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: edge-macos-arm64
+          path: release-assets/macos
+
+      - name: Download WASIX artifact
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: edge-wasix
+          path: release-assets/wasix
+
+      - name: Collect release assets
+        id: assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+          mapfile -t files < <(find release-assets -type f -name '*.zip' | sort)
+          {
+            echo "asset_count=${#files[@]}"
+            echo "asset_list<<EOF"
+            printf '%s\n' "${files[@]}"
+            echo "EOF"
+          } >> "${GITHUB_OUTPUT}"
+          printf 'Discovered %s release asset(s)\n' "${#files[@]}"
+          printf '%s\n' "${files[@]}"
+
+      - name: Create release notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "Automated nightly build for EDGE ${EDGE_VERSION}."
+            echo
+            echo "- Source repo: ${GITHUB_REPOSITORY}"
+            echo "- Commit: ${GITHUB_SHA}"
+            echo "- Workflow run: ${RUN_URL}"
+            echo "- Uploaded assets: ${{ steps.assets.outputs.asset_count }}"
+          } > release-notes.md
+
+      - name: Ensure nightly release exists
+        shell: bash
+        run: |
+          set -euo pipefail
+          target_ref="$(gh repo view "${TARGET_REPO}" --json defaultBranchRef --jq '.defaultBranchRef.name')"
+          if [[ -z "${target_ref}" ]]; then
+            echo "Failed to resolve default branch for ${TARGET_REPO}" >&2
+            exit 1
+          fi
+          if ! gh release view "${RELEASE_TAG}" --repo "${TARGET_REPO}" >/dev/null 2>&1; then
+            gh release create "${RELEASE_TAG}" \
+              --repo "${TARGET_REPO}" \
+              --target "${target_ref}" \
+              --title "${RELEASE_NAME}" \
+              --notes-file release-notes.md \
+              --prerelease \
+              --latest=false
+          fi
+          release_id="$(gh api "repos/${TARGET_REPO}/releases/tags/${RELEASE_TAG}" --jq '.id')"
+          gh api \
+            --method PATCH \
+            "repos/${TARGET_REPO}/releases/${release_id}" \
+            -f name="${RELEASE_NAME}" \
+            -F prerelease=true \
+            -F make_latest=false \
+            -F body=@release-notes.md \
+            >/dev/null
+
+      - name: Upload nightly assets
+        if: ${{ steps.assets.outputs.asset_count != '0' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t files < <(printf '%s\n' "${{ steps.assets.outputs.asset_list }}" | sed '/^$/d')
+          gh release upload "${RELEASE_TAG}" \
+            --repo "${TARGET_REPO}" \
+            --clobber \
+            "${files[@]}"
 
   build-macos:
     name: build-macos
@@ -100,7 +242,7 @@ jobs:
       - name: Test napi-v8
         run: ctest --test-dir napi/v8/build --output-on-failure -R '^napi_v8\.'
 
-      - name: Build ubi
+      - name: Build edge
         run: |
           make build CMAKE_BUILD_TYPE=Release JOBS=4
 
@@ -108,17 +250,16 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          make dist-only JOBS=4 ZIP_NAME=ubi-macos.zip
+          make dist-only JOBS=4 ZIP_NAME=edge-macos-arm64.zip
 
-      - name: Upload artifact ubi
+      - name: Upload artifact edge
         uses: actions/upload-artifact@v4
         with:
-          name: ubi-macos
-          path: ubi-macos.zip
+          name: edge-macos-arm64
+          path: edge-macos-arm64.zip
           if-no-files-found: error
 
-      - name: Test ubi
-        if: false
+      - name: Test edge
         run: |
           make test-only TEST_JOBS=4
 
@@ -152,23 +293,23 @@ jobs:
         run: |
           cargo install --locked wasm-tools
 
-      - name: Build ubi (WASIX)
+      - name: Build edge (WASIX)
         shell: bash
         run: |
           set -euo pipefail
-          ./ubi/scripts/build-wasix.sh
+          ./scripts/build-wasix.sh
 
       - name: Generate dist
         shell: bash
         run: |
           set -euo pipefail
-          make dist-only BUILD_DIR=build-wasix JOBS=4 ZIP_NAME=ubi-wasix.zip
+          make dist-only BUILD_DIR=build-wasix JOBS=4 ZIP_NAME=edge-wasix.zip
 
-      - name: Upload artifact ubi
+      - name: Upload artifact edge
         uses: actions/upload-artifact@v4
         with:
-          name: ubi-wasix
-          path: ubi-wasix.zip
+          name: edge-wasix
+          path: edge-wasix.zip
           if-no-files-found: error
 
       - name: sccache stats

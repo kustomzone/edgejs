@@ -1,16 +1,17 @@
-/ubi/build*
 /build*
 /napi/v8/build*
-/ubi/Testing
 .DS_Store
-/ubi/tests/cmake
 /Testing
+/tests/cmake
 /napi/target
 /napi/wasmer/target
 /napi/cmake
 v8-*.tar.xz
 /deps/libuv-wasix
 /deps/openssl-wasix
+/dist
+/v8-custom-builds
+/.vscode
 
 # direnv
 .envrc

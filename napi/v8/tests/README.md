@@ -23,7 +23,7 @@ The gtest binary requires a V8 library to link against.
 
 Configure V8 resolution with `NAPI_V8_BUILD_METHOD`:
 
-- `prebuilt` (default): download pinned prebuilt V8 (`11.9.1`) for supported hosts.
+- `prebuilt` (default): download pinned prebuilt V8 (`11.9.2`) for supported hosts.
 - `source`: build V8 from `deps/v8` using `gn` + `ninja`.
 - `local`: use local V8 include/library paths.
 

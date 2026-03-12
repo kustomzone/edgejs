@@ -52,7 +52,7 @@ fn candidate_repo_roots(seed_paths: &[&Path]) -> Vec<PathBuf> {
 
 fn resolve_repo_root(seed_paths: &[&Path]) -> Option<PathBuf> {
     for root in candidate_repo_roots(seed_paths) {
-        if root.join("node-lib").is_dir() && root.join("node").is_dir() {
+        if (root.join("lib").is_dir() || root.join("node-lib").is_dir()) && root.join("node").is_dir() {
             return std::fs::canonicalize(&root).ok().or(Some(root));
         }
     }
@@ -246,14 +246,19 @@ pub fn run_wasix_main_capture_stdio(
         if repo_root.is_some() || !extra_mounts.is_empty() {
             let host_handle = tokio::runtime::Handle::current();
             if let Some(repo_root) = repo_root {
-                let node_lib_dir = repo_root.join("node-lib");
-                let node_lib_fs: Arc<dyn FileSystem + Send + Sync> = Arc::new(
-                    virtual_fs::host_fs::FileSystem::new(host_handle.clone(), node_lib_dir.clone())
+                let lib_dir = if repo_root.join("lib").is_dir() {
+                    repo_root.join("lib")
+                } else {
+                    repo_root.join("node-lib")
+                };
+                let lib_fs: Arc<dyn FileSystem + Send + Sync> = Arc::new(
+                    virtual_fs::host_fs::FileSystem::new(host_handle.clone(), lib_dir.clone())
                         .with_context(|| {
-                            format!("failed to create host fs for {}", node_lib_dir.display())
+                            format!("failed to create host fs for {}", lib_dir.display())
                         })?,
                 );
-                runner.with_mount("/node-lib".to_string(), node_lib_fs);
+                runner.with_mount("/lib".to_string(), lib_fs.clone());
+                runner.with_mount("/node-lib".to_string(), lib_fs);
 
                 let node_deps_dir = repo_root.join("node/deps");
                 if node_deps_dir.is_dir() {

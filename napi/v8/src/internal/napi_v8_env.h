@@ -66,6 +66,7 @@ struct napi_env__ {
   void* instance_data = nullptr;
   napi_finalize instance_data_finalize_cb = nullptr;
   void* instance_data_finalize_hint = nullptr;
+  void* edge_environment = nullptr;
   std::vector<void*> threadsafe_functions;
   std::vector<void*> async_cleanup_hooks;
   std::vector<void*> env_cleanup_hooks;

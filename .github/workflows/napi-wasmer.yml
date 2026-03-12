@@ -42,7 +42,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          V8_VERSION="11.9.1"
+          V8_VERSION="11.9.2"
           ASSET="v8-linux-amd64.tar.xz"
           V8_ROOT="$PWD/.ci/v8/${V8_VERSION}/linux-amd64"
           mkdir -p "$V8_ROOT"
@@ -111,7 +111,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          V8_VERSION="11.9.1"
+          V8_VERSION="11.9.2"
           ASSET="v8-darwin-arm64.tar.xz"
           V8_ROOT="$PWD/.ci/v8/${V8_VERSION}/darwin-arm64"
           mkdir -p "$V8_ROOT"

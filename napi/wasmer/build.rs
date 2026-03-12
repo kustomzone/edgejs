@@ -1,6 +1,6 @@
 fn main() {
     println!("cargo:rerun-if-changed=src/napi_bridge_init.cc");
-    println!("cargo:rerun-if-changed=../v8/src/ubi_v8_platform.cc");
+    println!("cargo:rerun-if-changed=../v8/src/edge_v8_platform.cc");
     println!("cargo:rerun-if-env-changed=V8_INCLUDE_DIR");
     println!("cargo:rerun-if-env-changed=V8_LIB_DIR");
     println!("cargo:rerun-if-env-changed=V8_DEFINES");
@@ -16,6 +16,8 @@ fn main() {
     let napi_v8_dir = project_root.join("napi/v8");
     let napi_include = project_root.join("napi/include");
     let napi_v8_src = napi_v8_dir.join("src");
+    let edge_src = project_root.join("src");
+    let libuv_include = project_root.join("deps/libuv-wasix/include");
 
     // V8 paths
     let v8_include = std::env::var("V8_INCLUDE_DIR")
@@ -51,10 +53,19 @@ fn main() {
         .include(&v8_include)
         .include(napi_include.to_str().unwrap())
         .include(napi_v8_src.to_str().unwrap())
+        .include(edge_src.to_str().unwrap())
+        .include(libuv_include.to_str().unwrap())
         .file("src/napi_bridge_init.cc")
+        .file("src/edge_environment_shim.cc")
         .file(napi_v8_src.join("js_native_api_v8.cc").to_str().unwrap())
         .file(napi_v8_src.join("unofficial_napi.cc").to_str().unwrap())
-        .file(napi_v8_src.join("ubi_v8_platform.cc").to_str().unwrap())
+        .file(napi_v8_src.join("edge_v8_platform.cc").to_str().unwrap())
+        .file(
+            napi_v8_src
+                .join("unofficial_napi_error_utils.cc")
+                .to_str()
+                .unwrap(),
+        )
         .file(
             napi_v8_src
                 .join("unofficial_napi_contextify.cc")
