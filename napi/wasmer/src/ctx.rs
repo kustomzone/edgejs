@@ -1,10 +1,13 @@
 use anyhow::{bail, Context, Result};
+use std::collections::{HashMap, VecDeque};
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc, Mutex,
 };
 use wasmer::{ExternType, FunctionEnv, Imports, Instance, Module, StoreMut, Table, Value};
-use wasmer_wasix::PluggableRuntime;
+
+#[cfg(feature = "wasix")]
+use wasmer_wasix::{runners::wasi::WasiRunner, PluggableRuntime};
 
 use crate::{
     guest::{
@@ -35,6 +38,12 @@ pub struct NapiCtx {
 #[derive(Clone)]
 pub struct NapiSession {
     inner: Arc<NapiSessionInner>,
+}
+
+#[derive(Clone, Debug)]
+pub struct NapiRuntimeHooks {
+    ctx: NapiCtx,
+    sessions: Arc<Mutex<HashMap<usize, VecDeque<NapiSession>>>>,
 }
 
 #[derive(Debug)]
@@ -117,6 +126,32 @@ impl NapiCtx {
         self.new_session(module)
     }
 
+    pub fn module_needs_napi(module: &Module) -> bool {
+        const NAPI_ENV_IMPORTS: &[&str] = &[
+            "uv_cpu_info",
+            "uv_interface_addresses",
+            "uv_free_interface_addresses",
+            "uv_resident_set_memory",
+            "uv_get_free_memory",
+            "uv_get_total_memory",
+            "uv_get_available_memory",
+            "uv_get_constrained_memory",
+            "_Z20OSSL_set_max_threadsP15ossl_lib_ctx_sty",
+        ];
+
+        module.imports().any(|import| {
+            import.module() == "napi"
+                || (import.module() == "env" && NAPI_ENV_IMPORTS.contains(&import.name()))
+        })
+    }
+
+    pub fn runtime_hooks(&self) -> NapiRuntimeHooks {
+        NapiRuntimeHooks {
+            ctx: self.clone(),
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
     pub fn new_session(&self, module: &Module) -> Result<NapiSession> {
         let previous = self.inner.active_sessions.fetch_add(1, Ordering::AcqRel);
         if let Some(max_sessions) = self.inner.limits.max_sessions {
@@ -154,14 +189,102 @@ impl NapiCtx {
         })
     }
 
+    #[cfg(feature = "wasix")]
+    pub fn extend_runtime(&self, runtime: &mut PluggableRuntime) {
+        self.runtime_hooks().attach_to_runtime(runtime);
+    }
+
+    #[cfg(feature = "wasix")]
+    pub fn extend_wasi_runner(
+        &self,
+        runner: &mut WasiRunner,
+        runtime: &mut PluggableRuntime,
+        module: &Module,
+    ) {
+        if Self::module_needs_napi(module) {
+            runner
+                .capabilities_mut()
+                .threading
+                .enable_asynchronous_threading = false;
+        }
+        self.extend_runtime(runtime);
+    }
+
+    #[cfg(feature = "wasix")]
     pub fn configure_runtime(
         &self,
         runtime: &mut PluggableRuntime,
+        _module: &Module,
+    ) -> Result<()> {
+        self.extend_runtime(runtime);
+        Ok(())
+    }
+}
+
+impl NapiRuntimeHooks {
+    fn module_key(module: &Module) -> usize {
+        module as *const Module as usize
+    }
+
+    pub fn additional_imports(&self, module: &Module, store: &mut StoreMut<'_>) -> Result<Imports> {
+        if !NapiCtx::module_needs_napi(module) {
+            return Ok(Imports::new());
+        }
+
+        let session = self.ctx.prepare_module(module)?;
+        let imports = session.create_imports(store)?;
+        let mut sessions = self
+            .sessions
+            .lock()
+            .expect("poisoned NapiRuntimeHooks session queue");
+        sessions
+            .entry(Self::module_key(module))
+            .or_default()
+            .push_back(session);
+        Ok(imports)
+    }
+
+    pub fn configure_instance(
+        &self,
         module: &Module,
-    ) -> Result<NapiSession> {
-        let session = self.prepare_module(module)?;
-        session.attach_to_runtime(runtime);
-        Ok(session)
+        store: &mut StoreMut<'_>,
+        instance: &Instance,
+    ) -> Result<()> {
+        if !NapiCtx::module_needs_napi(module) {
+            return Ok(());
+        }
+
+        let session = {
+            let mut sessions = self
+                .sessions
+                .lock()
+                .expect("poisoned NapiRuntimeHooks session queue");
+            let key = Self::module_key(module);
+            let Some(queue) = sessions.get_mut(&key) else {
+                bail!("missing pending N-API session for module instance setup");
+            };
+            let session = queue
+                .pop_front()
+                .context("missing queued N-API session for module instance setup")?;
+            if queue.is_empty() {
+                sessions.remove(&key);
+            }
+            session
+        };
+
+        session.configure_instance(store, instance)
+    }
+
+    #[cfg(feature = "wasix")]
+    pub fn attach_to_runtime(&self, runtime: &mut PluggableRuntime) {
+        let hooks = self.clone();
+        runtime
+            .with_additional_imports(move |module, store| hooks.additional_imports(module, store));
+
+        let hooks = self.clone();
+        runtime.with_instance_setup(move |module, store, instance| {
+            hooks.configure_instance(module, store, instance)
+        });
     }
 }
 
@@ -227,12 +350,13 @@ impl NapiSession {
         Ok(())
     }
 
+    #[cfg(feature = "wasix")]
     pub fn attach_to_runtime(&self, runtime: &mut PluggableRuntime) {
         let session = self.clone();
-        runtime.with_additional_imports(move |store| session.create_imports(store));
+        runtime.with_additional_imports(move |_module, store| session.create_imports(store));
 
         let session = self.clone();
-        runtime.with_instance_setup(move |store, instance| {
+        runtime.with_instance_setup(move |_module, store, instance| {
             session.configure_instance(store, instance)
         });
     }

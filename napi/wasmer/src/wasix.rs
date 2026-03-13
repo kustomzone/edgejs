@@ -17,40 +17,6 @@ pub struct GuestMount {
     pub guest_path: PathBuf,
 }
 
-fn candidate_repo_roots(seed_paths: &[&Path]) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-
-    if let Some(root) = std::env::var_os("UBI_REPO_ROOT") {
-        out.push(PathBuf::from(root));
-    }
-
-    for seed in seed_paths {
-        for ancestor in seed.ancestors() {
-            out.push(ancestor.to_path_buf());
-        }
-    }
-
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    for ancestor in cwd.ancestors() {
-        out.push(ancestor.to_path_buf());
-    }
-
-    out.sort();
-    out.dedup();
-    out
-}
-
-fn resolve_repo_root(seed_paths: &[&Path]) -> Option<PathBuf> {
-    for root in candidate_repo_roots(seed_paths) {
-        if (root.join("lib").is_dir() || root.join("node-lib").is_dir())
-            && root.join("node").is_dir()
-        {
-            return std::fs::canonicalize(&root).ok().or(Some(root));
-        }
-    }
-    None
-}
-
 fn spawn_pipe_drain_thread(
     mut pipe: Pipe,
     mut sink: Box<dyn Write + Send>,
@@ -81,40 +47,14 @@ fn spawn_pipe_drain_thread(
 
 pub fn configure_runner_mounts(
     runner: &mut WasiRunner,
-    wasm_path: &Path,
+    _wasm_path: &Path,
     extra_mounts: &[GuestMount],
 ) -> Result<()> {
-    let repo_root = resolve_repo_root(&[wasm_path]);
-    if repo_root.is_none() && extra_mounts.is_empty() {
+    if extra_mounts.is_empty() {
         return Ok(());
     }
 
     let host_handle = tokio::runtime::Handle::current();
-    if let Some(repo_root) = repo_root {
-        let lib_dir = if repo_root.join("lib").is_dir() {
-            repo_root.join("lib")
-        } else {
-            repo_root.join("node-lib")
-        };
-        let lib_fs: Arc<dyn FileSystem + Send + Sync> = Arc::new(
-            virtual_fs::host_fs::FileSystem::new(host_handle.clone(), lib_dir.clone())
-                .with_context(|| format!("failed to create host fs for {}", lib_dir.display()))?,
-        );
-        runner.with_mount("/lib".to_string(), lib_fs.clone());
-        runner.with_mount("/node-lib".to_string(), lib_fs);
-
-        let node_deps_dir = repo_root.join("node/deps");
-        if node_deps_dir.is_dir() {
-            let node_deps_fs: Arc<dyn FileSystem + Send + Sync> = Arc::new(
-                virtual_fs::host_fs::FileSystem::new(host_handle.clone(), node_deps_dir.clone())
-                    .with_context(|| {
-                        format!("failed to create host fs for {}", node_deps_dir.display())
-                    })?,
-            );
-            runner.with_mount("/node/deps".to_string(), node_deps_fs);
-        }
-    }
-
     for mount in extra_mounts {
         let host_fs: Arc<dyn FileSystem + Send + Sync> = Arc::new(
             virtual_fs::host_fs::FileSystem::new(host_handle.clone(), mount.host_path.clone())
@@ -164,16 +104,12 @@ pub fn run_wasix_main_capture_stdio_with_ctx(
             .with_stdout(Box::new(stdout_tx))
             .with_stderr(Box::new(stderr_tx))
             .with_args(args.iter().cloned());
-        runner
-            .capabilities_mut()
-            .threading
-            .enable_asynchronous_threading = false;
         configure_runner_mounts(&mut runner, wasm_path, extra_mounts)?;
 
         let task_manager = Arc::new(TokioTaskManager::new(tokio::runtime::Handle::current()));
         let mut runtime = PluggableRuntime::new(task_manager);
         runtime.set_engine(engine.clone());
-        let _session = ctx.configure_runtime(&mut runtime, &module)?;
+        ctx.extend_wasi_runner(&mut runner, &mut runtime, &module);
 
         match runner.run_wasm(
             RuntimeOrEngine::Runtime(Arc::new(runtime)),

@@ -3,14 +3,19 @@ mod env;
 mod guest;
 mod module;
 mod snapi;
+#[cfg(feature = "wasix")]
 mod wasix;
 
 use anyhow::{Context, Result};
 use std::path::Path;
 use wasmer::{FunctionEnv, Imports, Instance, Memory, TypedFunction};
 
-pub use ctx::{NapiCtx, NapiCtxBuilder, NapiLimits, NapiSession};
+pub use ctx::{NapiCtx, NapiCtxBuilder, NapiLimits, NapiRuntimeHooks, NapiSession};
 pub use module::{load_wasix_module, LoadedWasm};
+pub fn module_needs_napi(module: &wasmer::Module) -> bool {
+    NapiCtx::module_needs_napi(module)
+}
+#[cfg(feature = "wasix")]
 pub use wasix::{
     configure_runner_mounts, run_wasix_main_capture_stdio, run_wasix_main_capture_stdio_with_ctx,
     run_wasix_main_capture_stdout, run_wasix_main_capture_stdout_with_ctx, GuestMount,

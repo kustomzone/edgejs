@@ -21,6 +21,94 @@ fn init_tracing() {
         .try_init();
 }
 
+const BUILTIN_JS_GUEST_PATH: &str = "/edgejs-builtins";
+const BUILTIN_JS_ENV_VAR: &str = "WASMER_NAPI_BUILTIN_JS_DIR";
+
+fn maybe_add_builtin_mounts(
+    extra_mounts: &mut Vec<GuestMount>,
+    explicit_builtin_dir: Option<String>,
+) -> Result<()> {
+    let explicit_builtin_dir =
+        explicit_builtin_dir.or_else(|| std::env::var(BUILTIN_JS_ENV_VAR).ok());
+    let builtin_dir = if let Some(dir) = explicit_builtin_dir {
+        let path = std::fs::canonicalize(&dir)
+            .with_context(|| format!("failed to resolve builtin js dir {}", dir))?;
+        if !path.is_dir() {
+            bail!("builtin js dir must be a directory: {}", path.display());
+        }
+        path
+    } else {
+        let manifest_dir = std::env::var_os("CARGO_MANIFEST_DIR").ok_or_else(|| {
+            anyhow!(
+                "builtin js dir is not configured: set --builtin-js-dir, {BUILTIN_JS_ENV_VAR}, or CARGO_MANIFEST_DIR"
+            )
+        })?;
+        let repo_root = PathBuf::from(manifest_dir).join("../..");
+        let lib = repo_root.join("lib");
+        if lib.is_dir() {
+            std::fs::canonicalize(&lib).ok().unwrap_or(lib)
+        } else {
+            let node_lib = repo_root.join("node-lib");
+            if node_lib.is_dir() {
+                std::fs::canonicalize(&node_lib).ok().unwrap_or(node_lib)
+            } else {
+                bail!(
+                    "builtin js dir is not configured: neither {} nor {} exists under {}",
+                    repo_root.join("lib").display(),
+                    repo_root.join("node-lib").display(),
+                    repo_root.display()
+                );
+            }
+        }
+    };
+
+    if !extra_mounts
+        .iter()
+        .any(|m| m.guest_path == Path::new(BUILTIN_JS_GUEST_PATH))
+    {
+        extra_mounts.push(GuestMount {
+            host_path: builtin_dir.clone(),
+            guest_path: PathBuf::from(BUILTIN_JS_GUEST_PATH),
+        });
+    }
+
+    if !extra_mounts
+        .iter()
+        .any(|m| m.guest_path == Path::new("/lib"))
+    {
+        extra_mounts.push(GuestMount {
+            host_path: builtin_dir.clone(),
+            guest_path: PathBuf::from("/lib"),
+        });
+    }
+
+    if !extra_mounts
+        .iter()
+        .any(|m| m.guest_path == Path::new("/node-lib"))
+    {
+        extra_mounts.push(GuestMount {
+            host_path: builtin_dir.clone(),
+            guest_path: PathBuf::from("/node-lib"),
+        });
+    }
+
+    if let Some(parent) = builtin_dir.parent() {
+        let node_deps_dir = parent.join("node/deps");
+        if node_deps_dir.is_dir()
+            && !extra_mounts
+                .iter()
+                .any(|m| m.guest_path == Path::new("/node/deps"))
+        {
+            extra_mounts.push(GuestMount {
+                host_path: node_deps_dir,
+                guest_path: PathBuf::from("/node/deps"),
+            });
+        }
+    }
+
+    Ok(())
+}
+
 fn parse_mount(spec: &str) -> Result<GuestMount> {
     let (host, guest) = spec
         .split_once(':')
@@ -99,18 +187,12 @@ fn run_wasix_example(
             .with_stdout(Box::new(stdout_tx))
             .with_stderr(Box::new(stderr_tx))
             .with_args(args.iter().cloned());
-        runner
-            .capabilities_mut()
-            .threading
-            .enable_asynchronous_threading = false;
         configure_runner_mounts(&mut runner, wasm_path, extra_mounts)?;
 
         let task_manager = Arc::new(TokioTaskManager::new(tokio::runtime::Handle::current()));
         let mut runtime = PluggableRuntime::new(task_manager);
         runtime.set_engine(engine);
-
-        let session = napi.prepare_module(&module)?;
-        session.attach_to_runtime(&mut runtime);
+        napi.extend_wasi_runner(&mut runner, &mut runtime, &module);
 
         match runner.run_wasm(
             RuntimeOrEngine::Runtime(Arc::new(runtime)),
@@ -146,13 +228,14 @@ fn main() -> Result<()> {
         Some(p) => p,
         None => {
             bail!(
-                "usage: cargo run -p napi_wasmer -- <wasm-file> [<script.js>] [--app-dir <host-dir>] [--mount <host-dir>:<guest-dir>] [wasix|main]"
+                "usage: cargo run -p napi_wasmer -- <wasm-file> [<script.js>] [--builtin-js-dir <host-dir>] [--app-dir <host-dir>] [--mount <host-dir>:<guest-dir>] [wasix|main]"
             );
         }
     };
     let wasm_path = Path::new(&wasm_path);
     let mut entry = "wasix".to_string();
     let mut script_arg: Option<String> = None;
+    let mut builtin_js_dir: Option<String> = None;
     let mut extra_mounts = Vec::new();
 
     while let Some(arg) = args.next() {
@@ -178,8 +261,17 @@ fn main() -> Result<()> {
                     .ok_or_else(|| anyhow!("--mount requires <host-dir>:<guest-dir>"))?;
                 extra_mounts.push(parse_mount(&spec)?);
             }
+            "--builtin-js-dir" => {
+                let dir = args
+                    .next()
+                    .ok_or_else(|| anyhow!("--builtin-js-dir requires a host directory"))?;
+                builtin_js_dir = Some(dir);
+            }
             _ if arg.starts_with("--mount=") => {
                 extra_mounts.push(parse_mount(arg.trim_start_matches("--mount="))?);
+            }
+            _ if arg.starts_with("--builtin-js-dir=") => {
+                builtin_js_dir = Some(arg.trim_start_matches("--builtin-js-dir=").to_string());
             }
             _ if arg.starts_with("--app-dir=") => {
                 let host_dir = arg.trim_start_matches("--app-dir=");
@@ -201,7 +293,7 @@ fn main() -> Result<()> {
     if entry == "wasix" {
         let napi = NapiCtx::builder().build();
         let mut guest_args = Vec::new();
-        if let Some(script) = script_arg {
+        if let Some(script) = script_arg.clone() {
             let host_script = PathBuf::from(&script);
             let host_script = if host_script.is_absolute() {
                 host_script
@@ -229,6 +321,7 @@ fn main() -> Result<()> {
                 .ok_or_else(|| anyhow!("script has no file name: {}", host_script.display()))?;
             guest_args.push(format!("/app/{}", script_name.to_string_lossy()));
         }
+        maybe_add_builtin_mounts(&mut extra_mounts, builtin_js_dir)?;
         let exit = run_wasix_example(&napi, wasm_path, &guest_args, &extra_mounts)?;
         println!("wasix_exit_code={exit}");
         return Ok(());

@@ -3,6 +3,10 @@ name = "napi_wasmer"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = ["wasix"]
+wasix = ["dep:wasmer-wasix"]
+
 [dependencies]
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
@@ -13,16 +17,16 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 # wasmer = { version = "=7.1.0-alpha.1", features = ["llvm"] }
 # wasmer-compiler-llvm = { version = "=7.1.0-alpha.1" }
 # wasmer-types = { version = "=7.1.0-alpha.1" }
-# wasmer-wasix = { version = "=0.701.0-alpha.1" }
+# wasmer-wasix = { version = "=0.701.0-alpha.1", optional = true }
 # virtual-fs = { version = "0.701.0-alpha.1" }
 # virtual-mio = { version = "0.701.0-alpha.1" }
 # wasmer-cache = { version = "=7.1.0-alpha.1" }
 
-# Git dependency on wasmer
+# Git dependency on wasmer main:
 wasmer = { git = "https://github.com/wasmerio/wasmer", branch = "main", features = ["llvm"] }
 wasmer-compiler-llvm = { git = "https://github.com/wasmerio/wasmer", branch = "main" }
 wasmer-types = { git = "https://github.com/wasmerio/wasmer", branch = "main" }
-wasmer-wasix = { git = "https://github.com/wasmerio/wasmer", branch = "main" }
+wasmer-wasix = { git = "https://github.com/wasmerio/wasmer", branch = "main", optional = true }
 virtual-fs = { git = "https://github.com/wasmerio/wasmer", branch = "main" }
 virtual-mio = { git = "https://github.com/wasmerio/wasmer", branch = "main" }
 wasmer-cache = { git = "https://github.com/wasmerio/wasmer", branch = "main" }
@@ -31,7 +35,7 @@ wasmer-cache = { git = "https://github.com/wasmerio/wasmer", branch = "main" }
 # wasmer = { path = "/home/theduke/dev/github.com/wasmerio/wasmer/lib/api", features = ["llvm"] }
 # wasmer-compiler-llvm = { path = "/home/theduke/dev/github.com/wasmerio/wasmer/lib/compiler-llvm" }
 # wasmer-types = { path = "/home/theduke/dev/github.com/wasmerio/wasmer/lib/types" }
-# wasmer-wasix = { path = "/home/theduke/dev/github.com/wasmerio/wasmer/lib/wasix" }
+# wasmer-wasix = { path = "/home/theduke/dev/github.com/wasmerio/wasmer/lib/wasix", optional = true }
 # virtual-fs = { path = "/home/theduke/dev/github.com/wasmerio/wasmer/lib/virtual-fs" }
 # virtual-mio = { path = "/home/theduke/dev/github.com/wasmerio/wasmer/lib/virtual-io" }
 # wasmer-cache = { path = "/home/theduke/dev/github.com/wasmerio/wasmer/lib/cache" }
