@@ -142,6 +142,30 @@ void EnsureTicketCallback(SecureContextHolder* holder) {
   SSL_CTX_set_tlsext_ticket_key_cb(holder->ctx, TicketCompatibilityCallback);
   holder->ticket_callback_installed = true;
 }
+
+SSL_CTX* CreateConfiguredSecureContext(const SSL_METHOD* method) {
+  SSL_CTX* ctx = SSL_CTX_new(method);
+  if (ctx == nullptr) return nullptr;
+#if OPENSSL_VERSION_NUMBER >= 0x10100000L
+  // Match Node's effective TLS defaults more closely on distros whose shared
+  // OpenSSL raises the system security level above OpenSSL's upstream default.
+  SSL_CTX_set_security_level(ctx, 1);
+#endif
+  SSL_CTX_set_options(ctx, SSL_OP_NO_SSLv2);
+  SSL_CTX_set_options(ctx, SSL_OP_NO_SSLv3);
+#if OPENSSL_VERSION_MAJOR >= 3
+  SSL_CTX_set_options(ctx, SSL_OP_ALLOW_CLIENT_RENEGOTIATION);
+#endif
+  SSL_CTX_clear_mode(ctx, SSL_MODE_NO_AUTO_CHAIN);
+#ifdef SSL_SESS_CACHE_NO_INTERNAL
+  SSL_CTX_set_session_cache_mode(
+      ctx,
+      SSL_SESS_CACHE_CLIENT | SSL_SESS_CACHE_SERVER | SSL_SESS_CACHE_NO_INTERNAL | SSL_SESS_CACHE_NO_AUTO_CLEAR);
+#else
+  SSL_CTX_set_session_cache_mode(ctx, SSL_SESS_CACHE_CLIENT | SSL_SESS_CACHE_SERVER | SSL_SESS_CACHE_NO_AUTO_CLEAR);
+#endif
+  return ctx;
+}
 bool AppendUniquePemString(std::vector<std::string>* out, const std::string& pem);
 bool GetByteStringArray(napi_env env, napi_value value, std::vector<std::string>* out);
 bool GetEffectiveCaOptions(napi_env env, bool* use_openssl_ca, bool* use_system_ca);
@@ -1692,24 +1716,11 @@ napi_value CryptoParseCrl(napi_env env, napi_callback_info info) {
 
 napi_value CryptoSecureContextCreate(napi_env env, napi_callback_info info) {
   (void)info;
-  SSL_CTX* ctx = SSL_CTX_new(TLS_method());
+  SSL_CTX* ctx = CreateConfiguredSecureContext(TLS_method());
   if (ctx == nullptr) {
     ThrowLastOpenSslError(env, "ERR_TLS_INVALID_CONTEXT", "Failed to create secure context");
     return nullptr;
   }
-  SSL_CTX_set_options(ctx, SSL_OP_NO_SSLv2);
-  SSL_CTX_set_options(ctx, SSL_OP_NO_SSLv3);
-#if OPENSSL_VERSION_MAJOR >= 3
-  SSL_CTX_set_options(ctx, SSL_OP_ALLOW_CLIENT_RENEGOTIATION);
-#endif
-  SSL_CTX_clear_mode(ctx, SSL_MODE_NO_AUTO_CHAIN);
-#ifdef SSL_SESS_CACHE_NO_INTERNAL
-  SSL_CTX_set_session_cache_mode(
-      ctx,
-      SSL_SESS_CACHE_CLIENT | SSL_SESS_CACHE_SERVER | SSL_SESS_CACHE_NO_INTERNAL | SSL_SESS_CACHE_NO_AUTO_CLEAR);
-#else
-  SSL_CTX_set_session_cache_mode(ctx, SSL_SESS_CACHE_CLIENT | SSL_SESS_CACHE_SERVER | SSL_SESS_CACHE_NO_AUTO_CLEAR);
-#endif
   auto* holder = new SecureContextHolder(ctx);
   EnsureTicketCallback(holder);
   napi_value out = nullptr;
@@ -1734,6 +1745,7 @@ napi_value CryptoSecureContextInit(napi_env env, napi_callback_info info) {
   if (argc >= 3 && argv[2] != nullptr) napi_get_value_int32(env, argv[2], &min_version);
   if (argc >= 4 && argv[3] != nullptr) napi_get_value_int32(env, argv[3], &max_version);
   if (max_version == 0) max_version = TLS1_3_VERSION;
+  const SSL_METHOD* method = TLS_method();
 
   napi_valuetype protocol_type = napi_undefined;
   if (argc >= 2 && napi_typeof(env, argv[1], &protocol_type) == napi_ok && protocol_type == napi_string) {
@@ -1746,38 +1758,89 @@ napi_value CryptoSecureContextInit(napi_env env, napi_callback_info info) {
                ssl_method == "SSLv3_client_method") {
       ThrowError(env, "ERR_TLS_INVALID_PROTOCOL_METHOD", "SSLv3 methods disabled");
       return nullptr;
-    } else if (ssl_method == "SSLv23_method" || ssl_method == "SSLv23_server_method" ||
-               ssl_method == "SSLv23_client_method") {
+    } else if (ssl_method == "SSLv23_method") {
       max_version = TLS1_2_VERSION;
-    } else if (ssl_method == "TLS_method" || ssl_method == "TLS_server_method" ||
-               ssl_method == "TLS_client_method") {
+    } else if (ssl_method == "SSLv23_server_method") {
+      max_version = TLS1_2_VERSION;
+      method = TLS_server_method();
+    } else if (ssl_method == "SSLv23_client_method") {
+      max_version = TLS1_2_VERSION;
+      method = TLS_client_method();
+    } else if (ssl_method == "TLS_method") {
       min_version = 0;
       max_version = TLS1_3_VERSION;
-    } else if (ssl_method == "TLSv1_method" || ssl_method == "TLSv1_server_method" ||
-               ssl_method == "TLSv1_client_method") {
+    } else if (ssl_method == "TLS_server_method") {
+      min_version = 0;
+      max_version = TLS1_3_VERSION;
+      method = TLS_server_method();
+    } else if (ssl_method == "TLS_client_method") {
+      min_version = 0;
+      max_version = TLS1_3_VERSION;
+      method = TLS_client_method();
+    } else if (ssl_method == "TLSv1_method") {
       min_version = TLS1_VERSION;
       max_version = TLS1_VERSION;
-    } else if (ssl_method == "TLSv1_1_method" || ssl_method == "TLSv1_1_server_method" ||
-               ssl_method == "TLSv1_1_client_method") {
+    } else if (ssl_method == "TLSv1_server_method") {
+      min_version = TLS1_VERSION;
+      max_version = TLS1_VERSION;
+      method = TLS_server_method();
+    } else if (ssl_method == "TLSv1_client_method") {
+      min_version = TLS1_VERSION;
+      max_version = TLS1_VERSION;
+      method = TLS_client_method();
+    } else if (ssl_method == "TLSv1_1_method") {
       min_version = TLS1_1_VERSION;
       max_version = TLS1_1_VERSION;
-    } else if (ssl_method == "TLSv1_2_method" || ssl_method == "TLSv1_2_server_method" ||
-               ssl_method == "TLSv1_2_client_method") {
+    } else if (ssl_method == "TLSv1_1_server_method") {
+      min_version = TLS1_1_VERSION;
+      max_version = TLS1_1_VERSION;
+      method = TLS_server_method();
+    } else if (ssl_method == "TLSv1_1_client_method") {
+      min_version = TLS1_1_VERSION;
+      max_version = TLS1_1_VERSION;
+      method = TLS_client_method();
+    } else if (ssl_method == "TLSv1_2_method") {
       min_version = TLS1_2_VERSION;
       max_version = TLS1_2_VERSION;
+    } else if (ssl_method == "TLSv1_2_server_method") {
+      min_version = TLS1_2_VERSION;
+      max_version = TLS1_2_VERSION;
+      method = TLS_server_method();
+    } else if (ssl_method == "TLSv1_2_client_method") {
+      min_version = TLS1_2_VERSION;
+      max_version = TLS1_2_VERSION;
+      method = TLS_client_method();
     } else {
       const std::string message = std::string("Unknown method: ") + ssl_method;
       ThrowError(env, "ERR_TLS_INVALID_PROTOCOL_METHOD", message.c_str());
       return nullptr;
     }
   }
-  if (min_version > 0 && SSL_CTX_set_min_proto_version(holder->ctx, min_version) != 1) {
+
+  SSL_CTX* ctx = CreateConfiguredSecureContext(method);
+  if (ctx == nullptr) {
+    ThrowLastOpenSslError(env, "ERR_TLS_INVALID_CONTEXT", "Failed to create secure context");
+    return nullptr;
+  }
+  if (SSL_CTX_set_min_proto_version(ctx, min_version) != 1) {
+    SSL_CTX_free(ctx);
     ThrowLastOpenSslError(env, "ERR_TLS_INVALID_PROTOCOL_VERSION", "Failed to set min protocol version");
     return nullptr;
   }
-  if (max_version > 0 && SSL_CTX_set_max_proto_version(holder->ctx, max_version) != 1) {
+  if (SSL_CTX_set_max_proto_version(ctx, max_version) != 1) {
+    SSL_CTX_free(ctx);
     ThrowLastOpenSslError(env, "ERR_TLS_INVALID_PROTOCOL_VERSION", "Failed to set max protocol version");
     return nullptr;
+  }
+
+  ResetStoredCertificate(&holder->cert, nullptr);
+  ResetStoredCertificate(&holder->issuer, nullptr);
+  SSL_CTX* old_ctx = holder->ctx;
+  holder->ctx = ctx;
+  holder->ticket_callback_installed = false;
+  EnsureTicketCallback(holder);
+  if (old_ctx != nullptr) {
+    SSL_CTX_free(old_ctx);
   }
   napi_value true_v = nullptr;
   napi_get_boolean(env, true, &true_v);
@@ -1828,6 +1891,34 @@ napi_value CryptoSecureContextSetMaxProto(napi_env env, napi_callback_info info)
   napi_value true_v = nullptr;
   napi_get_boolean(env, true, &true_v);
   return true_v;
+}
+
+napi_value CryptoSecureContextGetMinProto(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1] = {nullptr};
+  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok || argc < 1) return nullptr;
+  SecureContextHolder* holder = nullptr;
+  if (!GetSecureContextHolder(env, argv[0], &holder) || holder == nullptr || holder->ctx == nullptr) {
+    ThrowError(env, "ERR_INVALID_ARG_TYPE", "context must be a secure context handle");
+    return nullptr;
+  }
+  napi_value out = nullptr;
+  napi_create_int32(env, SSL_CTX_get_min_proto_version(holder->ctx), &out);
+  return out;
+}
+
+napi_value CryptoSecureContextGetMaxProto(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1] = {nullptr};
+  if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok || argc < 1) return nullptr;
+  SecureContextHolder* holder = nullptr;
+  if (!GetSecureContextHolder(env, argv[0], &holder) || holder == nullptr || holder->ctx == nullptr) {
+    ThrowError(env, "ERR_INVALID_ARG_TYPE", "context must be a secure context handle");
+    return nullptr;
+  }
+  napi_value out = nullptr;
+  napi_create_int32(env, SSL_CTX_get_max_proto_version(holder->ctx), &out);
+  return out;
 }
 
 napi_value CryptoSecureContextSetOptions(napi_env env, napi_callback_info info) {
@@ -4208,6 +4299,8 @@ napi_value InstallCryptoBinding(napi_env env) {
   SetMethod(env, binding, "secureContextInit", CryptoSecureContextInit);
   SetMethod(env, binding, "secureContextSetMinProto", CryptoSecureContextSetMinProto);
   SetMethod(env, binding, "secureContextSetMaxProto", CryptoSecureContextSetMaxProto);
+  SetMethod(env, binding, "secureContextGetMinProto", CryptoSecureContextGetMinProto);
+  SetMethod(env, binding, "secureContextGetMaxProto", CryptoSecureContextGetMaxProto);
   SetMethod(env, binding, "secureContextSetOptions", CryptoSecureContextSetOptions);
   SetMethod(env, binding, "secureContextSetCiphers", CryptoSecureContextSetCiphers);
   SetMethod(env, binding, "secureContextSetCipherSuites", CryptoSecureContextSetCipherSuites);

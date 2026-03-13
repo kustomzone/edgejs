@@ -615,6 +615,23 @@ const char* MapOpenSslErrorCode(unsigned long err) {
   return nullptr;
 }
 
+bool IsOpenSslDecoderUnsupportedError(unsigned long err) {
+  if (err == 0) return false;
+  const char* library = ERR_lib_error_string(err);
+  const char* reason = ERR_reason_error_string(err);
+  return library != nullptr &&
+         reason != nullptr &&
+         std::strcmp(library, "DECODER routines") == 0 &&
+         std::strcmp(reason, "unsupported") == 0;
+}
+
+const char* MapOpenSslKeyParseErrorCode(unsigned long err, bool require_private) {
+  if (!require_private && IsOpenSslDecoderUnsupportedError(err)) {
+    return "ERR_OSSL_EVP_DECODE_ERROR";
+  }
+  return MapOpenSslErrorCode(err);
+}
+
 napi_value CreateOpenSslError(napi_env env,
                               const char* code,
                               unsigned long err,
@@ -717,6 +734,49 @@ void SetPreferredOpenSslError(std::string* code,
 
   if (selected != 0) {
     if (const char* mapped = MapOpenSslErrorCode(selected)) {
+      *code = mapped;
+    } else if (fallback_code != nullptr) {
+      *code = fallback_code;
+    } else {
+      code->clear();
+    }
+
+    char buf[256];
+    ERR_error_string_n(selected, buf, sizeof(buf));
+    *message = buf;
+    return;
+  }
+
+  *code = fallback_code != nullptr ? fallback_code : "";
+  *message = fallback_message != nullptr ? fallback_message : "OpenSSL error";
+}
+
+void ThrowLastOpenSslKeyParseError(napi_env env, bool require_private, const char* fallback_message) {
+  const unsigned long selected = ERR_get_error();
+  while (ERR_get_error() != 0) {
+  }
+  if (selected == 0) {
+    napi_throw_error(env, nullptr, fallback_message);
+    return;
+  }
+  napi_throw(
+      env,
+      CreateOpenSslError(env, MapOpenSslKeyParseErrorCode(selected, require_private), selected, fallback_message));
+}
+
+void SetPreferredOpenSslKeyParseError(std::string* code,
+                                      std::string* message,
+                                      bool require_private,
+                                      const char* fallback_code,
+                                      const char* fallback_message) {
+  if (code == nullptr || message == nullptr) return;
+
+  const unsigned long selected = ERR_get_error();
+  while (ERR_get_error() != 0) {
+  }
+
+  if (selected != 0) {
+    if (const char* mapped = MapOpenSslKeyParseErrorCode(selected, require_private)) {
       *code = mapped;
     } else if (fallback_code != nullptr) {
       *code = fallback_code;
@@ -3477,7 +3537,8 @@ napi_value KeyObjectInit(napi_env env, napi_callback_info info) {
     if (pkey == nullptr) {
       std::string error_code;
       std::string error_message;
-      SetPreferredOpenSslError(&error_code, &error_message, "ERR_CRYPTO_OPERATION_FAILED", "Failed to read key");
+      SetPreferredOpenSslKeyParseError(
+          &error_code, &error_message, source_wrap->key_type == kKeyTypePrivate, "ERR_CRYPTO_OPERATION_FAILED", "Failed to read key");
       napi_throw(env, CreateErrorWithCode(env, error_code.c_str(), error_message.c_str()));
       return nullptr;
     }
@@ -3549,7 +3610,7 @@ napi_value KeyObjectInit(napi_env env, napi_callback_info info) {
       }
     }
     if (pkey == nullptr) {
-      ThrowLastOpenSslMessage(env, "Failed to read public key");
+      ThrowLastOpenSslKeyParseError(env, false, "Failed to read public key");
       return nullptr;
     }
     EVP_PKEY_free(pkey);
@@ -4485,7 +4546,8 @@ napi_value SecureContextGetMinProto(napi_env env, napi_callback_info info) {
   napi_get_cb_info(env, info, &argc, nullptr, &this_arg, nullptr);
   SecureContextWrap* wrap = RequireSecureContext(env, this_arg);
   if (wrap == nullptr) return Undefined(env);
-  napi_value out = nullptr;
+  napi_value out = CallSecureContextBindingMethodReturningValue(env, wrap, "secureContextGetMinProto", 0, nullptr);
+  if (out != nullptr) return out;
   napi_create_int32(env, wrap->min_proto, &out);
   return out != nullptr ? out : Undefined(env);
 }
@@ -4496,7 +4558,8 @@ napi_value SecureContextGetMaxProto(napi_env env, napi_callback_info info) {
   napi_get_cb_info(env, info, &argc, nullptr, &this_arg, nullptr);
   SecureContextWrap* wrap = RequireSecureContext(env, this_arg);
   if (wrap == nullptr) return Undefined(env);
-  napi_value out = nullptr;
+  napi_value out = CallSecureContextBindingMethodReturningValue(env, wrap, "secureContextGetMaxProto", 0, nullptr);
+  if (out != nullptr) return out;
   napi_create_int32(env, wrap->max_proto, &out);
   return out != nullptr ? out : Undefined(env);
 }
@@ -5970,7 +6033,8 @@ EVP_PKEY* GetAsymmetricKeyFromValue(napi_env env,
     }
     EVP_PKEY* pkey = ParseKeyObjectAsymmetricKey(wrap);
     if (pkey == nullptr) {
-      SetPreferredOpenSslError(error_code, error_message, "ERR_CRYPTO_OPERATION_FAILED", "Failed to parse key");
+      SetPreferredOpenSslKeyParseError(
+          error_code, error_message, require_private, "ERR_CRYPTO_OPERATION_FAILED", "Failed to parse key");
     }
     return pkey;
   }
@@ -5993,7 +6057,8 @@ EVP_PKEY* GetAsymmetricKeyFromValue(napi_env env,
     pkey = ParseAnyKeyBytes(key_bytes, passphrase, has_passphrase);
   }
   if (pkey == nullptr) {
-    SetPreferredOpenSslError(error_code, error_message, "ERR_CRYPTO_OPERATION_FAILED", "Failed to parse key");
+    SetPreferredOpenSslKeyParseError(
+        error_code, error_message, require_private, "ERR_CRYPTO_OPERATION_FAILED", "Failed to parse key");
   }
   return pkey;
 }
@@ -8720,6 +8785,13 @@ napi_value ResolveCrypto(napi_env env, const ResolveOptions& options) {
       {"EVP_PKEY_ED448", 1088},
       {"EVP_PKEY_X25519", 1034},
       {"EVP_PKEY_X448", 1035},
+  };
+  for (const auto& [name, value] : constants) {
+    bool has = false;
+    if (napi_has_named_property(env, out, name, &has) == napi_ok && !has) SetNamedInt(env, out, name, value);
+  }
+#if OPENSSL_WITH_PQC
+  const std::pair<const char*, int32_t> pqc_constants[] = {
       {"EVP_PKEY_ML_DSA_44", 1457},
       {"EVP_PKEY_ML_DSA_65", 1458},
       {"EVP_PKEY_ML_DSA_87", 1459},
@@ -8739,10 +8811,11 @@ napi_value ResolveCrypto(napi_env env, const ResolveOptions& options) {
       {"EVP_PKEY_SLH_DSA_SHAKE_256S", 1470},
       {"EVP_PKEY_SLH_DSA_SHAKE_256F", 1471},
   };
-  for (const auto& [name, value] : constants) {
+  for (const auto& [name, value] : pqc_constants) {
     bool has = false;
     if (napi_has_named_property(env, out, name, &has) == napi_ok && !has) SetNamedInt(env, out, name, value);
   }
+#endif
 
   EnsurePropertyMethod(env, out, "oneShotDigest", CryptoOneShotDigest);
   EnsurePropertyMethod(env, out, "timingSafeEqual", CryptoTimingSafeEqual);
@@ -9128,6 +9201,7 @@ napi_value ResolveCrypto(napi_env env, const ResolveOptions& options) {
               {
                   {"run", nullptr, AESCipherJobRun, nullptr, nullptr, nullptr, napi_default, nullptr},
               });
+#if OPENSSL_VERSION_NUMBER >= 0x30200000L && !defined(OPENSSL_NO_ARGON2)
   EnsureClass(env,
               out,
               "Argon2Job",
@@ -9135,6 +9209,7 @@ napi_value ResolveCrypto(napi_env env, const ResolveOptions& options) {
               {
                   {"run", nullptr, Argon2JobRun, nullptr, nullptr, nullptr, napi_default, nullptr},
               });
+#endif
   EnsureClass(env,
               out,
               "ChaCha20Poly1305CipherJob",
@@ -9163,6 +9238,7 @@ napi_value ResolveCrypto(napi_env env, const ResolveOptions& options) {
               {
                   {"run", nullptr, HmacJobRun, nullptr, nullptr, nullptr, napi_default, nullptr},
               });
+#if OPENSSL_VERSION_MAJOR >= 3
   EnsureClass(env,
               out,
               "KEMDecapsulateJob",
@@ -9177,6 +9253,7 @@ napi_value ResolveCrypto(napi_env env, const ResolveOptions& options) {
               {
                   {"run", nullptr, KEMEncapsulateJobRun, nullptr, nullptr, nullptr, napi_default, nullptr},
               });
+#endif
   EnsureClass(env,
               out,
               "KmacJob",

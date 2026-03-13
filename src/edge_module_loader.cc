@@ -298,6 +298,11 @@ std::string LoadBuiltinsConfigJson(bool has_intl) {
   static std::array<std::string, 2> cached;
   std::string& cached_value = cached[has_intl ? 1 : 0];
   if (!cached_value.empty()) return cached_value;
+#if defined(EDGE_NODE_SHARED_OPENSSL)
+  constexpr bool kEdgeNodeSharedOpenSsl = EDGE_NODE_SHARED_OPENSSL != 0;
+#else
+  constexpr bool kEdgeNodeSharedOpenSsl = false;
+#endif
 
   auto append_candidate = [](std::vector<fs::path>* out, const fs::path& p) {
     if (out == nullptr) return;
@@ -339,6 +344,8 @@ std::string LoadBuiltinsConfigJson(bool has_intl) {
     // in the serialized config consumed by bootstrap/node.
     ReplaceJsonBooleanOrNumber(&body, "v8_enable_i18n_support", has_intl);
     EnsureVariablesField(&body, "node_is_edge", "true");
+    ReplaceJsonBooleanOrNumber(&body, "node_shared_openssl", kEdgeNodeSharedOpenSsl);
+    EnsureVariablesField(&body, "node_shared_openssl", kEdgeNodeSharedOpenSsl ? "1" : "0");
     ReplaceJsonBooleanOrNumber(&body,
                                "icu_small",
 #if defined(EDGE_HAS_SMALL_ICU)
@@ -355,6 +362,7 @@ std::string LoadBuiltinsConfigJson(bool has_intl) {
   cached_value = std::string("{") +
                  "\"variables\":{" +
                  "\"node_is_edge\":true," +
+                 "\"node_shared_openssl\":" + (kEdgeNodeSharedOpenSsl ? "1" : "0") + "," +
                  "\"v8_enable_i18n_support\":" + (has_intl ? "1" : "0") + "," +
                  "\"icu_small\":" +
 #if defined(EDGE_HAS_SMALL_ICU)

@@ -870,7 +870,7 @@ void NotifyTlsStreamClosed(TlsWrap* wrap) {
 void EmitOnReadData(TlsWrap* wrap, const uint8_t* data, size_t len) {
   if (wrap == nullptr || wrap->env == nullptr) return;
   size_t offset = 0;
-  while (offset < len) {
+  while (offset < len && wrap->ssl != nullptr) {
     uv_buf_t buf = uv_buf_init(nullptr, 0);
     if (!EdgeStreamEmitAlloc(&wrap->base.listener_state, len - offset, &buf) ||
         buf.base == nullptr ||
@@ -889,7 +889,7 @@ void EmitOnReadData(TlsWrap* wrap, const uint8_t* data, size_t len) {
       free(buf.base);
     }
     offset += chunk_len;
-    if (chunk_len == 0) return;
+    if (chunk_len == 0 || wrap->ssl == nullptr || wrap->base.destroy_notified) return;
   }
 }
 
@@ -2289,9 +2289,9 @@ bool WritePendingCleartextInput(TlsWrap* wrap) {
   QueueNewEncryptedBytes(wrap);
   const int err = SSL_get_error(wrap->ssl, rc);
   if (err == SSL_ERROR_SSL || err == SSL_ERROR_SYSCALL) {
+    const std::string error_string = PeekLastOpenSslErrorString("TLS write failed");
     wrap->pending_cleartext_input.clear();
     wrap->write_callback_scheduled = true;
-    const std::string error_string = PeekLastOpenSslErrorString("TLS write failed");
     InvokeQueued(wrap, UV_EPROTO, error_string.c_str());
     return true;
   }
@@ -2310,6 +2310,9 @@ bool ReadCleartext(TlsWrap* wrap) {
     if (rc > 0) {
       EmitOnReadData(wrap, reinterpret_cast<const uint8_t*>(buffer), static_cast<size_t>(rc));
       made_progress = true;
+      if (wrap->ssl == nullptr || wrap->base.destroy_notified) {
+        return made_progress;
+      }
       continue;
     }
     const int err = SSL_get_error(wrap->ssl, rc);
@@ -2323,10 +2326,11 @@ bool ReadCleartext(TlsWrap* wrap) {
       break;
     }
     if (err == SSL_ERROR_SSL || err == SSL_ERROR_SYSCALL) {
+      napi_value error = CreateLastOpenSslError(wrap->env, "ERR_TLS_READ", "TLS read failed");
       QueueNewEncryptedBytes(wrap);
       EncOut(wrap);
       made_progress = made_progress || wrap->parent_write_in_progress;
-      EmitError(wrap, CreateLastOpenSslError(wrap->env, "ERR_TLS_READ", "TLS read failed"));
+      EmitError(wrap, error);
       break;
     }
     break;

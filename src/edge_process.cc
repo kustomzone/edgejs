@@ -570,6 +570,14 @@ bool EnsureProcessConfigVariablesForEdge(napi_env env, napi_value config_obj) {
   if (!SetProcessConfigVariableInt(env, variables_obj, "v8_enable_i18n_support", has_intl) ||
       !SetProcessConfigVariableInt(env,
                                    variables_obj,
+                                   "node_shared_openssl",
+#if defined(EDGE_NODE_SHARED_OPENSSL)
+                                   EDGE_NODE_SHARED_OPENSSL) ||
+#else
+                                   0) ||
+#endif
+      !SetProcessConfigVariableInt(env,
+                                   variables_obj,
                                    "icu_small",
 #if defined(EDGE_HAS_SMALL_ICU)
                                    1) ||
@@ -612,9 +620,19 @@ napi_value BuildMinimalProcessConfigObject(napi_env env) {
   napi_value variables_obj = nullptr;
   if (napi_create_object(env, &variables_obj) != napi_ok || variables_obj == nullptr) return nullptr;
 
-  const char* int_var_keys[] = {"v8_enable_i18n_support", "node_quic", "asan", "node_shared_openssl"};
+  const char* int_var_keys[] = {"v8_enable_i18n_support", "node_quic", "asan"};
   for (const char* key : int_var_keys) {
     if (!SetProcessConfigVariableInt(env, variables_obj, key, 0)) return nullptr;
+  }
+  if (!SetProcessConfigVariableInt(env,
+                                   variables_obj,
+                                   "node_shared_openssl",
+#if defined(EDGE_NODE_SHARED_OPENSSL)
+                                   EDGE_NODE_SHARED_OPENSSL)) {
+#else
+                                   0)) {
+#endif
+    return nullptr;
   }
 
   napi_value shareable_builtins = nullptr;

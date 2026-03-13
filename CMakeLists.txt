@@ -656,10 +656,19 @@ target_link_libraries(edge_runtime
 if(EDGE_NAPI_PROVIDER STREQUAL "bundled-v8")
   target_link_libraries(edge_runtime PUBLIC napi_v8)
 endif()
+set(EDGE_NODE_SHARED_OPENSSL 0)
+if(NOT EDGE_IS_WASIX_TARGET)
+  if(DEFINED OPENSSL_USE_STATIC_LIBS AND OPENSSL_USE_STATIC_LIBS)
+    set(EDGE_NODE_SHARED_OPENSSL 0)
+  else()
+    set(EDGE_NODE_SHARED_OPENSSL 1)
+  endif()
+endif()
 target_compile_definitions(edge_runtime
   PRIVATE
     EDGE_HAS_ICU=1
     EDGE_HAS_SMALL_ICU=1
+    EDGE_NODE_SHARED_OPENSSL=${EDGE_NODE_SHARED_OPENSSL}
     EDGE_EMBEDDED_V8_VERSION="${EDGE_EMBEDDED_V8_VERSION}"
 )
 if(EDGE_IS_WASIX_TARGET)
