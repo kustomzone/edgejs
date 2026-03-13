@@ -175,9 +175,21 @@ download_file() {
   debug "Downloading file: $url -> $destination"
 
   if [ "$DOWNLOADER" = "curl" ]; then
-    curl -fL "$url" -o "$destination"
+    if [ -t 2 ]; then
+      curl --fail --location --progress-bar "$url" --output "$destination"
+    else
+      curl --fail --location --silent --show-error "$url" --output "$destination"
+    fi
   else
-    wget -O "$destination" "$url"
+    if [ -t 2 ]; then
+      if wget --help 2>/dev/null | grep -q -- '--show-progress'; then
+        wget -q --show-progress --progress=bar:force:noscroll -O "$destination" "$url"
+      else
+        wget -nv --progress=bar:force:noscroll -O "$destination" "$url"
+      fi
+    else
+      wget -nv -O "$destination" "$url"
+    fi
   fi
 }
 
@@ -638,7 +650,7 @@ install_edge() {
   debug "Artifact path: $artifact"
 
   status_downloading "$TARGET"
-  if ! download_file "$RESOLVED_DOWNLOAD_URL" "$artifact" >/dev/null 2>&1; then
+  if ! download_file "$RESOLVED_DOWNLOAD_URL" "$artifact"; then
     status_error "Failed to download $RESOLVED_ASSET_NAME"
     exit 1
   fi
