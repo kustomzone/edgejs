@@ -1,8 +1,0 @@
-{
-  "stdout_type": "fs",
-  "stdout_ctor": "SyncWriteStream",
-  "stdout_handle_keys": null,
-  "stderr_type": "fs",
-  "stderr_ctor": "SyncWriteStream",
-  "stderr_handle_keys": null
-}
