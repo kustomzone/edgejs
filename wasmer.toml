@@ -1,0 +1,19 @@
+[package]
+entrypoint = "edgejs"
+name = "wasmer/edgejs"
+version = "0.0.1"
+
+[fs]
+"/node-lib" = "./lib"
+
+[[module]]
+name = "edgejs"
+source = "./build-wasix/ubi.wasm"
+
+[[command]]
+name = "edgejs"
+module = "edgejs"
+runner = "https://webc.org/runner/wasi"
+
+[command.annotations.wasi]
+atom = "edgejs"
