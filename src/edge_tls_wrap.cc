@@ -1188,6 +1188,7 @@ bool SetSecureContextOnSsl(TlsWrap* wrap, edge::crypto::SecureContextHolder* hol
   SSL_CTX_set_tlsext_status_cb(holder->ctx, TLSExtStatusCallback);
   SSL_CTX_set_tlsext_status_arg(holder->ctx, nullptr);
   if (SSL_set_SSL_CTX(wrap->ssl, holder->ctx) == nullptr) return false;
+  SSL_set_options(wrap->ssl, SSL_CTX_get_options(holder->ctx));
   wrap->secure_context = holder;
   X509_STORE* store = SSL_CTX_get_cert_store(holder->ctx);
   if (store != nullptr && SSL_set1_verify_cert_store(wrap->ssl, store) != 1) return false;
@@ -2900,6 +2901,14 @@ napi_value TlsWrapRenegotiate(napi_env env, napi_callback_info info) {
     napi_throw(env, CreateLastOpenSslError(env, nullptr, "TLS renegotiation failed"));
     return nullptr;
   }
+  const int handshake_result = SSL_do_handshake(wrap->ssl);
+  if (handshake_result != 1) {
+    const int ssl_error = SSL_get_error(wrap->ssl, handshake_result);
+    if (ssl_error != SSL_ERROR_WANT_READ && ssl_error != SSL_ERROR_WANT_WRITE) {
+      napi_throw(env, CreateLastOpenSslError(env, nullptr, "TLS renegotiation failed"));
+      return nullptr;
+    }
+  }
 #endif
   return Undefined(env);
 }
@@ -3418,7 +3427,10 @@ napi_value BuildDetailedPeerCertificateObject(napi_env env, SSL* ssl, bool is_se
 napi_value TlsWrapVerifyError(napi_env env, napi_callback_info info) {
   TlsWrap* wrap = UnwrapThis(env, info, nullptr, nullptr, nullptr);
   if (wrap == nullptr || wrap->ssl == nullptr) return Null(env);
-  const long verify_error = SSL_get_verify_result(wrap->ssl);
+  ncrypto::SSLPointer ssl_view(wrap->ssl);
+  long verify_error = static_cast<long>(
+      ssl_view.verifyPeerCertificate().value_or(X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT));
+  ssl_view.release();
   if (verify_error == X509_V_OK) return Null(env);
   const char* code = ncrypto::X509Pointer::ErrorCode(static_cast<int32_t>(verify_error));
   const char* reason = X509_verify_cert_error_string(verify_error);

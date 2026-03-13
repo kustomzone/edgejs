@@ -831,6 +831,12 @@ void ThrowOpenSslError(napi_env env, const char* code, unsigned long err, const 
   if (effective_code != nullptr &&
       std::strcmp(effective_code, "ERR_CRYPTO_OPERATION_FAILED") == 0 &&
       reason != nullptr &&
+      std::strstr(reason, "operation not supported for this keytype") != nullptr) {
+    effective_code = "ERR_OSSL_EVP_OPERATION_NOT_SUPPORTED_FOR_THIS_KEYTYPE";
+  }
+  if (effective_code != nullptr &&
+      std::strcmp(effective_code, "ERR_CRYPTO_OPERATION_FAILED") == 0 &&
+      reason != nullptr &&
       std::strstr(reason, "wrong final block length") != nullptr) {
     effective_code = "ERR_OSSL_WRONG_FINAL_BLOCK_LENGTH";
   }
@@ -845,6 +851,12 @@ void ThrowOpenSslError(napi_env env, const char* code, unsigned long err, const 
       reason != nullptr &&
       std::strstr(reason, "oaep decoding error") != nullptr) {
     effective_code = "ERR_OSSL_RSA_OAEP_DECODING_ERROR";
+  }
+  if (effective_code != nullptr &&
+      std::strcmp(effective_code, "ERR_CRYPTO_OPERATION_FAILED") == 0 &&
+      reason != nullptr &&
+      std::strstr(reason, "digest too big for rsa key") != nullptr) {
+    effective_code = "ERR_OSSL_RSA_DIGEST_TOO_BIG_FOR_RSA_KEY";
   }
   if (effective_code != nullptr &&
       std::strcmp(effective_code, "ERR_CRYPTO_OPERATION_FAILED") == 0 &&
@@ -3776,8 +3788,10 @@ napi_value CryptoSignOneShot(napi_env env, napi_callback_info info) {
     }
   }
   if (ok && is_ed_key && !null_digest) {
-    ok = false;
+    EVP_MD_CTX_free(mctx);
+    EVP_PKEY_free(pkey);
     ThrowError(env, "ERR_CRYPTO_UNSUPPORTED_OPERATION", "Unsupported crypto operation");
+    return nullptr;
   }
   size_t sig_len = 0;
   std::vector<uint8_t> sig;

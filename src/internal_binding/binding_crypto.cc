@@ -64,6 +64,12 @@ constexpr int32_t kKeyVariantRSA_PSS = 1;
 constexpr int32_t kKeyVariantRSA_OAEP = 2;
 
 void ResetRef(napi_env env, napi_ref* ref_ptr);
+EVP_PKEY* GetAsymmetricKeyFromValue(napi_env env,
+                                    napi_value key_value,
+                                    napi_value key_passphrase_value,
+                                    bool require_private,
+                                    std::string* error_code,
+                                    std::string* error_message);
 
 struct CryptoBindingState {
   explicit CryptoBindingState(napi_env env_in) : env(env_in) {}
@@ -554,6 +560,10 @@ const char* MapOpenSslErrorCode(unsigned long err) {
   if (reason != nullptr &&
       std::strcmp(reason, "bad decrypt") == 0) {
     return "ERR_OSSL_BAD_DECRYPT";
+  }
+  if (reason != nullptr &&
+      std::strcmp(reason, "operation not supported for this keytype") == 0) {
+    return "ERR_OSSL_EVP_OPERATION_NOT_SUPPORTED_FOR_THIS_KEYTYPE";
   }
   if (reason != nullptr &&
       std::strcmp(reason, "wrong final block length") == 0) {
@@ -1476,6 +1486,42 @@ napi_value SignVerifyUpdate(napi_env env, napi_callback_info info) {
   return this_arg != nullptr ? this_arg : Undefined(env);
 }
 
+bool IsOneShotKeyType(const EVP_PKEY* pkey) {
+  if (pkey == nullptr) return false;
+  switch (EVP_PKEY_base_id(pkey)) {
+    case EVP_PKEY_ED25519:
+    case EVP_PKEY_ED448:
+#if OPENSSL_WITH_PQC
+    case EVP_PKEY_ML_DSA_44:
+    case EVP_PKEY_ML_DSA_65:
+    case EVP_PKEY_ML_DSA_87:
+#endif
+      return true;
+    default:
+      return false;
+  }
+}
+
+bool ShouldRejectStreamingForOneShotKey(napi_env env,
+                                        napi_value key_value,
+                                        napi_value key_passphrase_value,
+                                        bool require_private) {
+  std::string error_code;
+  std::string error_message;
+  EVP_PKEY* pkey =
+      GetAsymmetricKeyFromValue(env, key_value, key_passphrase_value, require_private, &error_code, &error_message);
+
+  if (pkey == nullptr) {
+    while (ERR_get_error() != 0) {
+    }
+    return false;
+  }
+
+  const bool is_one_shot_key = IsOneShotKeyType(pkey);
+  EVP_PKEY_free(pkey);
+  return is_one_shot_key;
+}
+
 napi_value SignSign(napi_env env, napi_callback_info info) {
   size_t argc = 7;
   napi_value argv[7] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
@@ -1498,6 +1544,10 @@ napi_value SignSign(napi_env env, napi_callback_info info) {
   napi_value padding = argc >= 5 ? argv[4] : Undefined(env);
   napi_value salt = argc >= 6 ? argv[5] : Undefined(env);
   napi_value dsa_sig_enc = argc >= 7 ? argv[6] : Undefined(env);
+  if (ShouldRejectStreamingForOneShotKey(env, key_data, key_passphrase, true)) {
+    napi_throw_error(env, "ERR_CRYPTO_UNSUPPORTED_OPERATION", "Unsupported crypto operation");
+    return nullptr;
+  }
   napi_value context = Undefined(env);
   napi_value call_argv[10] = {
       algorithm,
@@ -1540,6 +1590,10 @@ napi_value VerifyVerify(napi_env env, napi_callback_info info) {
   napi_value padding = argc >= 6 ? argv[5] : Undefined(env);
   napi_value salt = argc >= 7 ? argv[6] : Undefined(env);
   napi_value dsa_sig_enc = argc >= 8 ? argv[7] : Undefined(env);
+  if (ShouldRejectStreamingForOneShotKey(env, key_data, key_passphrase, false)) {
+    napi_throw_error(env, "ERR_CRYPTO_UNSUPPORTED_OPERATION", "Unsupported crypto operation");
+    return nullptr;
+  }
   napi_value context = Undefined(env);
   napi_value call_argv[11] = {
       algorithm,

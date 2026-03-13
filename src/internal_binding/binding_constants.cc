@@ -704,6 +704,12 @@ void NormalizeConstantsShape(napi_env env, napi_value constants) {
                      "SSL_OP_NO_TICKET",
                      static_cast<int64_t>(SSL_OP_NO_TICKET));
 #endif
+#ifdef SSL_OP_NO_SESSION_RESUMPTION_ON_RENEGOTIATION
+  EnsureInt64Default(env,
+                     crypto_obj,
+                     "SSL_OP_NO_SESSION_RESUMPTION_ON_RENEGOTIATION",
+                     static_cast<int64_t>(SSL_OP_NO_SESSION_RESUMPTION_ON_RENEGOTIATION));
+#endif
   EnsureStringDefault(env, crypto_obj, "defaultCoreCipherList", EDGE_DEFAULT_CIPHER_LIST_CORE);
   EnsureInt32Default(env, crypto_obj, "POINT_CONVERSION_COMPRESSED", POINT_CONVERSION_COMPRESSED);
   EnsureInt32Default(env, crypto_obj, "POINT_CONVERSION_UNCOMPRESSED", POINT_CONVERSION_UNCOMPRESSED);
