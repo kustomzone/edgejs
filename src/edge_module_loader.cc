@@ -2269,6 +2269,8 @@ static napi_value OptionsGetCLIOptionsInfoCallback(napi_env env, napi_callback_i
   for (const auto& opt : documented) add_option(opt);
 
   const std::vector<std::string> extras = {
+      // Keep alias targets present even when CLI docs are unavailable from cwd.
+      "--require",
       "--debug-arraybuffer-allocations",
       "--no-debug-arraybuffer-allocations",
       "--es-module-specifier-resolution",
