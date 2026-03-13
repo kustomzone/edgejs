@@ -12,3 +12,7 @@ v8-*.tar.xz
 /dist
 /v8-custom-builds
 /.vscode
+
+# direnv
+.envrc
+.direnv

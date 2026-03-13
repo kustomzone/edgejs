@@ -122,7 +122,7 @@ endif()
 if(NOT EXISTS "${EDGE_LIBUV_ROOT}/CMakeLists.txt")
   message(FATAL_ERROR
     "libuv CMake project not found at ${EDGE_LIBUV_ROOT}. "
-    "For WASIX, run scripts/setup-wasix-deps.sh first.")
+    "For WASIX, run wasix/setup-wasix-deps.sh first.")
 endif()
 
 set(LIBUV_BUILD_SHARED OFF CACHE BOOL "" FORCE)
@@ -142,6 +142,11 @@ set(BUILD_MINIZIP_BIN OFF CACHE BOOL "" FORCE)
 set(BUILD_ZPIPE OFF CACHE BOOL "" FORCE)
 set(BUILD_MINIGZIP OFF CACHE BOOL "" FORCE)
 add_subdirectory("${PROJECT_ROOT}/deps/zlib" "${CMAKE_CURRENT_BINARY_DIR}/deps/zlib")
+if(EDGE_IS_WASIX_TARGET AND TARGET zlib_bench)
+  # zlib_bench links against the shared zlib target, which fails under WASIX
+  # static-linking constraints. Keep the libraries but skip the benchmark tool.
+  set_target_properties(zlib_bench PROPERTIES EXCLUDE_FROM_ALL TRUE)
+endif()
 
 find_package(Threads REQUIRED)
 
@@ -287,7 +292,7 @@ if(EDGE_IS_WASIX_TARGET)
   if(NOT EXISTS "${_edge_openssl_include_dir}")
     message(FATAL_ERROR
       "OpenSSL include directory not found: ${_edge_openssl_include_dir}. "
-      "For WASIX, clone deps with scripts/setup-wasix-deps.sh.")
+      "For WASIX, clone deps with wasix/setup-wasix-deps.sh.")
   endif()
 
   set(_edge_openssl_crypto "")
@@ -359,10 +364,6 @@ add_library(edge_node_api STATIC
   src/node_api.cc
   src/unofficial_napi_testing_until_gc.cc
 )
-if(EDGE_NAPI_PROVIDER STREQUAL "imports")
-  set_source_files_properties(src/node_api.cc PROPERTIES
-    COMPILE_DEFINITIONS "NAPI_EXTERN=")
-endif()
 
 add_library(edge_environment_core STATIC
   src/edge_environment.cc
@@ -385,14 +386,15 @@ set(EDGE_ICU_INCLUDE_DIRS
   "${EDGE_ICU_ROOT}/source/stubdata"
 )
 set(EDGE_ICU_LINK_LIBS "")
-if(NOT EDGE_IS_WASIX_TARGET)
-  file(GLOB_RECURSE EDGE_ICU_COMMON_SOURCES CONFIGURE_DEPENDS
-    "${EDGE_ICU_ROOT}/source/common/*.cpp"
-  )
-  file(GLOB_RECURSE EDGE_ICU_I18N_SOURCES CONFIGURE_DEPENDS
-    "${EDGE_ICU_ROOT}/source/i18n/*.cpp"
-  )
-
+file(GLOB_RECURSE EDGE_ICU_COMMON_SOURCES CONFIGURE_DEPENDS
+  "${EDGE_ICU_ROOT}/source/common/*.cpp"
+)
+file(GLOB_RECURSE EDGE_ICU_I18N_SOURCES CONFIGURE_DEPENDS
+  "${EDGE_ICU_ROOT}/source/i18n/*.cpp"
+)
+if(EDGE_IS_WASIX_TARGET)
+  include("${PROJECT_ROOT}/wasix/cmake/icu_wasix.cmake")
+else()
   set(EDGE_ICU_BASE_DEFINES
     U_ATTRIBUTE_DEPRECATED=
     UCONFIG_NO_SERVICE=1
@@ -627,6 +629,7 @@ target_include_directories(edge_runtime
     "${EDGE_ROOT}/src"
   PRIVATE
     "${NAPI_INCLUDE_ROOT}"
+    "${CMAKE_CURRENT_BINARY_DIR}"
     "${PROJECT_ROOT}/deps"
     "${PROJECT_ROOT}/deps/llhttp/include"
     "${PROJECT_ROOT}/deps/ncrypto"
@@ -659,6 +662,11 @@ target_compile_definitions(edge_runtime
     EDGE_HAS_SMALL_ICU=1
     EDGE_EMBEDDED_V8_VERSION="${EDGE_EMBEDDED_V8_VERSION}"
 )
+if(EDGE_IS_WASIX_TARGET)
+  target_sources(edge_runtime PRIVATE
+    wasix/src/wasix_compat.cc
+  )
+endif()
 if(EDGE_NAPI_PROVIDER STREQUAL "bundled-v8")
   target_compile_definitions(edge_runtime PRIVATE EDGE_BUNDLED_NAPI_V8=1)
 endif()
@@ -682,8 +690,11 @@ target_link_libraries(edge_cli
 
 option(EDGE_BUILD_CLI "Build edge CLI binary" ON)
 if(EDGE_BUILD_CLI)
-  add_executable(edge
+  set(EDGE_CLI_SOURCES
     "${EDGE_ROOT}/src/edge_main.cc"
+  )
+  add_executable(edge
+    ${EDGE_CLI_SOURCES}
   )
   set_target_properties(edge PROPERTIES ENABLE_EXPORTS ON)
   target_include_directories(edge

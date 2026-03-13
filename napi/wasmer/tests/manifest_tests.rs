@@ -91,7 +91,7 @@ fn manifest_tests_match_native_and_wasix() {
         // Build and run WASIX test
         let wasix_path = build_wasix_test(&case.name);
         let (wasix_code, wasix_stdout) =
-            run_wasix_main_capture_stdout(&wasix_path, &[]).expect("failed to run WASIX test");
+            run_wasix_main_capture_stdout(&wasix_path, &[], &[]).expect("failed to run WASIX test");
         assert_eq!(wasix_code, 0, "wasix test exited non-zero: {}", case.name);
         if let Some(expected) = &case.expected_stdout {
             assert_eq!(

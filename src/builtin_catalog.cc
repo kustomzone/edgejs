@@ -93,6 +93,8 @@ std::vector<fs::path> NodeLibRootCandidates() {
   const fs::path source_root = fs::absolute(fs::path(__FILE__).parent_path() / "..").lexically_normal();
   std::vector<fs::path> candidates;
 
+  AppendPathCandidate(&candidates, fs::path("/node-lib"));
+
   const fs::path exec_path = fs::path(EdgeGetProcessExecPath()).lexically_normal();
   if (!exec_path.empty()) {
     const fs::path install_root = exec_path.parent_path().parent_path();

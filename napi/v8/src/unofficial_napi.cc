@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <ctime>
 #include <cstdio>
 #include <cstdlib>
@@ -159,12 +160,19 @@ bool CopyStringToMallocBuffer(const std::string& input, char** data_out, size_t*
 }
 
 uint64_t GenerateHashSeed() {
+  try {
+    std::random_device random_device;
+    const uint64_t high = static_cast<uint64_t>(random_device());
+    const uint64_t low = static_cast<uint64_t>(random_device());
+    const auto now = std::chrono::steady_clock::now().time_since_epoch();
+    const uint64_t monotonic_ticks = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(now).count());
+    const uint64_t mixed = (high << 32) ^ low ^ monotonic_ticks;
+    if (mixed != 0) return mixed;
+  } catch (...) {
+    // Fall back below if entropy is unavailable in this runtime.
+  }
   return 1;
-  // std::random_device random_device;
-  // const uint64_t high = static_cast<uint64_t>(random_device());
-  // const uint64_t low = static_cast<uint64_t>(random_device());
-  // const uint64_t mixed = (high << 32) ^ low ^ static_cast<uint64_t>(uv_hrtime());
-  // return mixed == 0 ? 1 : mixed;
 }
 
 void AppendEscapedJsonString(std::string* out, std::string_view input) {

@@ -60,6 +60,14 @@ struct napi_buffer_record__ {
 };
 using napi_buffer_record = napi_buffer_record__;
 
+struct napi_external_backing_store_hint__ {
+  napi_env env = nullptr;
+  void* external_data = nullptr;
+  node_api_basic_finalize finalize_cb = nullptr;
+  void* finalize_hint = nullptr;
+};
+using napi_external_backing_store_hint = napi_external_backing_store_hint__;
+
 struct WrapFinalizerRecord {
   napi_env env = nullptr;
   void* native_object = nullptr;
@@ -258,6 +266,18 @@ void BufferWeakCallback(const v8::WeakCallbackInfo<napi_buffer_record>& info) {
     delete record;
   }
   record->holder.Reset();
+}
+
+void ExternalBackingStoreDeleter(void* data,
+                                 size_t /*length*/,
+                                 void* deleter_data) {
+  auto* hint = static_cast<napi_external_backing_store_hint*>(deleter_data);
+  if (hint == nullptr) return;
+  if (hint->finalize_cb != nullptr) {
+    hint->finalize_cb(hint->env, hint->external_data != nullptr ? hint->external_data : data,
+                      hint->finalize_hint);
+  }
+  delete hint;
 }
 
 bool GetArrayBufferViewInfo(v8::Local<v8::Value> value, void** data, size_t* length) {
@@ -821,13 +841,19 @@ napi_status NAPI_CDECL napi_create_external_arraybuffer(
     out->Detach(v8::Local<v8::Value>()).FromMaybe(false);
   } else {
     if (external_data == nullptr) return napi_invalid_arg;
-    out = v8::ArrayBuffer::New(env->isolate, byte_length);
-    if (byte_length > 0) {
-      std::memcpy(out->Data(), external_data, byte_length);
+    auto* hint = new (std::nothrow) napi_external_backing_store_hint__();
+    if (hint == nullptr) return napi_generic_failure;
+    hint->env = env;
+    hint->external_data = external_data;
+    hint->finalize_cb = finalize_cb;
+    hint->finalize_hint = finalize_hint;
+    std::unique_ptr<v8::BackingStore> backing = v8::ArrayBuffer::NewBackingStore(
+        external_data, byte_length, ExternalBackingStoreDeleter, hint);
+    if (!backing) {
+      delete hint;
+      return napi_generic_failure;
     }
-    if (finalize_cb != nullptr) {
-      finalize_cb(env, external_data, finalize_hint);
-    }
+    out = v8::ArrayBuffer::New(env->isolate, std::move(backing));
   }
 
   *result = napi_v8_wrap_value(env, out);
@@ -2960,19 +2986,24 @@ napi_status NAPI_CDECL napi_create_external_buffer(napi_env env,
   v8::Local<v8::Context> context = env->context();
   v8::Context::Scope context_scope(context);
 
-  auto backing = v8::ArrayBuffer::NewBackingStore(env->isolate, length);
-  if (!backing) return napi_generic_failure;
-  if (length > 0) {
-    std::memcpy(backing->Data(), data, length);
+  auto* hint = new (std::nothrow) napi_external_backing_store_hint__();
+  if (hint == nullptr) return napi_generic_failure;
+  hint->env = env;
+  hint->external_data = data;
+  hint->finalize_cb = finalize_cb;
+  hint->finalize_hint = finalize_hint;
+
+  std::unique_ptr<v8::BackingStore> backing =
+      v8::ArrayBuffer::NewBackingStore(data, length, ExternalBackingStoreDeleter, hint);
+  if (!backing) {
+    delete hint;
+    return napi_generic_failure;
   }
 
   auto* record = new (std::nothrow) napi_buffer_record__();
   if (record == nullptr) return napi_generic_failure;
   record->env = env;
   record->backing_store = std::move(backing);
-  record->external_data = data;
-  record->finalize_cb = finalize_cb;
-  record->finalize_hint = finalize_hint;
 
   v8::Local<v8::Object> buffer_obj = CreateBufferObject(env, record->backing_store, 0, length);
   record->holder.Reset(env->isolate, buffer_obj);
