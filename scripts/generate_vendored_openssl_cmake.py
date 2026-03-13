@@ -55,6 +55,14 @@ def normalize_path(value: str, deps_root: pathlib.Path) -> str:
     return (deps_root / value).resolve().as_posix()
 
 
+def normalize_include_dir(value: str, base_dir: pathlib.Path) -> str:
+    if value == ".":
+        return base_dir.resolve().as_posix()
+    if value.startswith("./"):
+        value = value[2:]
+    return (base_dir / value).resolve().as_posix()
+
+
 def dedupe(items):
     seen = set()
     ordered = []
@@ -250,9 +258,10 @@ def main():
     base_link_libraries = dedupe(
         split_flag_groups(common["libraries"] + arch_block["libraries"])
     )
+    arch_include_base = arch_root / mode
     base_include_dirs = dedupe(
-        normalize_path(entry, deps_root)
-        for entry in (common["include_dirs"] + arch_block["include_dirs"])
+        [normalize_path(entry, deps_root) for entry in common["include_dirs"]]
+        + [normalize_include_dir(entry, arch_include_base) for entry in arch_block["include_dirs"]]
     )
     source_paths = dedupe(
         normalize_path(entry, deps_root) for entry in arch_block["sources"]
@@ -269,8 +278,9 @@ def main():
         split_flag_groups(common["libraries"] + arch_block["libraries"] + cli_block["libraries"])
     )
     cli_include_dirs = dedupe(
-        normalize_path(entry, deps_root)
-        for entry in (common["include_dirs"] + cli_block["include_dirs"] + ["openssl/apps/include"])
+        [normalize_path(entry, deps_root) for entry in common["include_dirs"]]
+        + [normalize_include_dir(entry, arch_include_base) for entry in cli_block["include_dirs"]]
+        + [normalize_path("openssl/apps/include", deps_root)]
     )
     cli_sources = dedupe(
         normalize_path(entry, deps_root) for entry in cli_block["sources"]
