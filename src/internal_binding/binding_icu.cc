@@ -5,7 +5,6 @@
 #include <cstdint>
 #include <cstring>
 #include <memory>
-#include <mutex>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -14,10 +13,8 @@
 
 #define U_DISABLE_RENAMING 1
 #include <unicode/uchar.h>
-#include <unicode/uclean.h>
 #include <unicode/ucnv.h>
 #include <unicode/ucnv_cb.h>
-#include <unicode/udata.h>
 #include <unicode/utf16.h>
 #include <unicode/utypes.h>
 
@@ -27,11 +24,6 @@
 namespace internal_binding {
 
 namespace {
-
-extern "C" {
-extern const unsigned char ubi_icudt78l_dat[];
-extern const size_t ubi_icudt78l_dat_len;
-}
 
 const char* ZeroLengthByteSentinel() {
   static const char sentinel = 0;
@@ -60,29 +52,6 @@ struct ConverterWrap {
   bool bom_seen = false;
   bool unicode = false;
 };
-
-std::once_flag g_icu_init_once;
-UErrorCode g_icu_init_status = U_ZERO_ERROR;
-
-void InitializeIcuData() {
-  UErrorCode status = U_ZERO_ERROR;
-  if (ubi_icudt78l_dat_len > 0) {
-    udata_setCommonData(static_cast<const void*>(ubi_icudt78l_dat), &status);
-  } else {
-    status = U_FILE_ACCESS_ERROR;
-  }
-  if (U_SUCCESS(status)) u_init(&status);
-  g_icu_init_status = status;
-}
-
-bool EnsureIcuReady(napi_env env) {
-  std::call_once(g_icu_init_once, InitializeIcuData);
-  if (U_FAILURE(g_icu_init_status)) {
-    napi_throw_error(env, "ERR_ICU_INITIALIZATION_FAILED", u_errorName(g_icu_init_status));
-    return false;
-  }
-  return true;
-}
 void DeleteRefIfPresent(napi_env env, napi_ref* ref) {
   if (env == nullptr || ref == nullptr || *ref == nullptr) return;
   napi_delete_reference(env, *ref);
@@ -682,7 +651,6 @@ bool SetFunction(napi_env env, napi_value object, const char* name, napi_callbac
 }  // namespace
 
 napi_value ResolveIcu(napi_env env, const ResolveOptions& /*options*/) {
-  if (!EnsureIcuReady(env)) return nullptr;
   auto* state = GetIcuState(env);
   if (state != nullptr && state->binding_ref != nullptr) {
     napi_value cached = nullptr;

@@ -33,9 +33,7 @@ fn main() {
     // V8 paths
     let v8_include = std::env::var("V8_INCLUDE_DIR")
         .or_else(|_| std::env::var("NAPI_V8_INCLUDE_DIR"))
-        .expect(
-            "V8 include directory not configured; set V8_INCLUDE_DIR or NAPI_V8_INCLUDE_DIR",
-        );
+        .expect("V8 include directory not configured; set V8_INCLUDE_DIR or NAPI_V8_INCLUDE_DIR");
     let v8_lib = std::env::var("V8_LIB_DIR").or_else(|_| {
         std::env::var("NAPI_V8_LIBRARY").map(|path| {
             std::path::Path::new(&path)
@@ -44,8 +42,8 @@ fn main() {
                 .unwrap_or(path)
         })
     });
-    let v8_lib = v8_lib
-        .expect("V8 library directory not configured; set V8_LIB_DIR or NAPI_V8_LIBRARY");
+    let v8_lib =
+        v8_lib.expect("V8 library directory not configured; set V8_LIB_DIR or NAPI_V8_LIBRARY");
 
     let v8_include_dir = std::path::Path::new(&v8_include);
     let v8_lib_dir = std::path::Path::new(&v8_lib);
