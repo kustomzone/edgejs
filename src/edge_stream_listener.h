@@ -21,6 +21,8 @@ using EdgeStreamOnAfterWrite = bool (*)(EdgeStreamListener* listener,
 using EdgeStreamOnAfterShutdown = bool (*)(EdgeStreamListener* listener,
                                           napi_value req_obj,
                                           int status);
+using EdgeStreamOnWantsWrite = bool (*)(EdgeStreamListener* listener,
+                                       size_t suggested_size);
 using EdgeStreamOnClose = void (*)(EdgeStreamListener* listener);
 
 struct EdgeStreamListener {
@@ -29,6 +31,7 @@ struct EdgeStreamListener {
   EdgeStreamOnRead on_read = nullptr;
   EdgeStreamOnAfterWrite on_after_write = nullptr;
   EdgeStreamOnAfterShutdown on_after_shutdown = nullptr;
+  EdgeStreamOnWantsWrite on_wants_write = nullptr;
   EdgeStreamOnClose on_close = nullptr;
   void* data = nullptr;
 };
@@ -55,12 +58,16 @@ bool EdgeStreamEmitAfterWrite(EdgeStreamListenerState* state,
 bool EdgeStreamEmitAfterShutdown(EdgeStreamListenerState* state,
                                 napi_value req_obj,
                                 int status);
+bool EdgeStreamEmitWantsWrite(EdgeStreamListenerState* state,
+                             size_t suggested_size);
 bool EdgeStreamPassAfterWrite(EdgeStreamListener* listener,
                              napi_value req_obj,
                              int status);
 bool EdgeStreamPassAfterShutdown(EdgeStreamListener* listener,
                                 napi_value req_obj,
                                 int status);
+bool EdgeStreamPassWantsWrite(EdgeStreamListener* listener,
+                             size_t suggested_size);
 void EdgeStreamNotifyClosed(EdgeStreamListenerState* state);
 
 #endif  // EDGE_STREAM_LISTENER_H_

@@ -1,6 +1,7 @@
 #include "internal_binding/dispatch.h"
 
 #include <algorithm>
+#include <cstddef>
 #include <cerrno>
 #include <cmath>
 #include <cstdint>
@@ -24,6 +25,8 @@
 #include "../edge_env_loop.h"
 #include "../edge_handle_wrap.h"
 #include "../edge_async_wrap.h"
+#include "../edge_stream_base.h"
+#include "../edge_stream_wrap.h"
 #include "../edge_module_loader.h"
 #include "../edge_path.h"
 #include "../edge_worker_env.h"
@@ -45,33 +48,17 @@ void FinishAsyncFsReq(AsyncFsReq* async_req, int result);
 
 struct FsBindingState {
   explicit FsBindingState(napi_env env_in) : env(env_in) {}
-  ~FsBindingState() {
-    for (auto& entry : raw_methods) {
-      ResetRef(env, &entry.second);
-    }
-    raw_methods.clear();
-    ResetRef(env, &binding_ref);
-    ResetRef(env, &file_handle_ctor_ref);
-    ResetRef(env, &fs_req_ctor_ref);
-    ResetRef(env, &stat_watcher_ctor_ref);
-    ResetRef(env, &k_use_promises_symbol_ref);
-    for (auto& entry : pending_fifo_writer_opens) {
-      for (auto* req : entry.second) {
-        DestroyAsyncFsReq(req);
-      }
-    }
-  }
+  ~FsBindingState();
 
   napi_env env = nullptr;
   napi_ref binding_ref = nullptr;
   std::unordered_map<std::string, napi_ref> raw_methods;
+  std::unordered_multimap<std::string, AsyncFsReq*> pending_fifo_writer_opens;
   napi_ref file_handle_ctor_ref = nullptr;
   napi_ref fs_req_ctor_ref = nullptr;
   napi_ref stat_watcher_ctor_ref = nullptr;
   napi_ref k_use_promises_symbol_ref = nullptr;
-  std::unordered_map<std::string, std::vector<AsyncFsReq*>> pending_fifo_writer_opens;
 };
-int64_t g_next_file_handle_async_id = 600000;
 int64_t g_next_stat_watcher_async_id = 700000;
 
 FsBindingState* GetState(napi_env env) {
@@ -950,24 +937,35 @@ napi_value CompleteVoidRawFsMethod(napi_env env,
   return out != nullptr ? out : Undefined(env);
 }
 
+struct FileHandleReadReq;
+
 struct FileHandleWrap {
   napi_env env = nullptr;
-  napi_ref wrapper_ref = nullptr;
+  EdgeStreamBase base{};
   napi_ref closing_promise_ref = nullptr;
-  napi_ref onread_ref = nullptr;
   napi_deferred closing_deferred = nullptr;
   int32_t fd = -1;
-  uint64_t bytes_read = 0;
-  uint64_t bytes_written = 0;
-  int64_t async_id = 0;
+  int64_t read_offset = -1;
+  int64_t read_length = -1;
+  FileHandleReadReq* current_read = nullptr;
+  bool reading = false;
   bool closing = false;
   bool closed = false;
+};
+
+struct FileHandleReadReq {
+  uv_fs_t req{};
+  FileHandleWrap* wrap = nullptr;
+  char* storage = nullptr;
+  uv_buf_t buf{};
 };
 
 struct FileHandleCloseReq {
   napi_env env = nullptr;
   FileHandleWrap* wrap = nullptr;
   uv_fs_t req{};
+  napi_ref req_ref = nullptr;
+  bool is_shutdown = false;
 };
 
 enum class AsyncFsResultKind {
@@ -983,7 +981,6 @@ struct AsyncFsReq {
   napi_ref oncomplete_ref = nullptr;
   napi_ref extra_ref = nullptr;
   napi_deferred deferred = nullptr;
-  uv_work_t work{};
   uv_fs_t req{};
   AsyncFsResultKind result_kind = AsyncFsResultKind::kUndefined;
   const char* syscall = nullptr;
@@ -994,38 +991,50 @@ struct AsyncFsReq {
   size_t nbufs = 0;
   bool track_unmanaged_fd = false;
   bool uses_uv_fs_req = false;
-  int open_flags = 0;
-  int open_mode = 0;
-  int open_result = 0;
-  bool defer_callback_completion = false;
-  bool hold_fifo_writer_completion = false;
-  bool fifo_read_open = false;
+  int32_t open_flags = 0;
+  bool is_open_req = false;
+  bool delayed_open_completion = false;
+  bool pending_fifo_writer_open = false;
+  struct DeferredOpenCompletionTask* deferred_open_task = nullptr;
 };
 
-void ReleasePendingFifoWriterOpens(napi_env env, const std::string& path) {
-  FsBindingState* st = GetState(env);
-  if (st == nullptr || path.empty()) return;
-  auto it = st->pending_fifo_writer_opens.find(path);
-  if (it == st->pending_fifo_writer_opens.end()) return;
-  std::vector<AsyncFsReq*> pending = std::move(it->second);
-  st->pending_fifo_writer_opens.erase(it);
-  for (AsyncFsReq* req : pending) {
-    if (req == nullptr) continue;
-    req->hold_fifo_writer_completion = false;
-    FinishAsyncFsReq(req, req->open_result);
+struct DeferredOpenCompletionTask {
+  napi_env env = nullptr;
+  AsyncFsReq* async_req = nullptr;
+};
+
+FsBindingState::~FsBindingState() {
+  for (auto& entry : pending_fifo_writer_opens) {
+    if (entry.second == nullptr) continue;
+    entry.second->pending_fifo_writer_open = false;
+    if (entry.second->deferred_open_task != nullptr) {
+      entry.second->deferred_open_task->async_req = nullptr;
+      entry.second->deferred_open_task = nullptr;
+    }
+    DestroyAsyncFsReq(entry.second);
   }
+  pending_fifo_writer_opens.clear();
+  for (auto& entry : raw_methods) {
+    ResetRef(env, &entry.second);
+  }
+  raw_methods.clear();
+  ResetRef(env, &binding_ref);
+  ResetRef(env, &file_handle_ctor_ref);
+  ResetRef(env, &fs_req_ctor_ref);
+  ResetRef(env, &stat_watcher_ctor_ref);
+  ResetRef(env, &k_use_promises_symbol_ref);
 }
 
 void HoldFileHandleRef(FileHandleWrap* wrap) {
-  if (wrap == nullptr || wrap->env == nullptr || wrap->wrapper_ref == nullptr) return;
+  if (wrap == nullptr || wrap->env == nullptr || wrap->base.wrapper_ref == nullptr) return;
   uint32_t ref_count = 0;
-  (void)napi_reference_ref(wrap->env, wrap->wrapper_ref, &ref_count);
+  (void)napi_reference_ref(wrap->env, wrap->base.wrapper_ref, &ref_count);
 }
 
 void ReleaseFileHandleRef(FileHandleWrap* wrap) {
-  if (wrap == nullptr || wrap->env == nullptr || wrap->wrapper_ref == nullptr) return;
+  if (wrap == nullptr || wrap->env == nullptr || wrap->base.wrapper_ref == nullptr) return;
   uint32_t ref_count = 0;
-  (void)napi_reference_unref(wrap->env, wrap->wrapper_ref, &ref_count);
+  (void)napi_reference_unref(wrap->env, wrap->base.wrapper_ref, &ref_count);
 }
 
 napi_value CreateUvExceptionValue(napi_env env, int errorno, const char* syscall);
@@ -1049,20 +1058,127 @@ void DestroyAsyncFsReq(AsyncFsReq* async_req) {
   if (async_req->uses_uv_fs_req) {
     uv_fs_req_cleanup(&async_req->req);
   }
+  if (async_req->deferred_open_task != nullptr) {
+    async_req->deferred_open_task->async_req = nullptr;
+    async_req->deferred_open_task = nullptr;
+  }
   delete async_req;
 }
 
-bool ShouldUseBlockingFifoOpen(const std::string& path, int flags) {
-#ifdef _WIN32
-  (void)path;
-  (void)flags;
-  return false;
-#else
-  if ((flags & O_NONBLOCK) != 0 || path.empty()) return false;
-  struct stat st;
-  if (lstat(path.c_str(), &st) != 0) return false;
-  return S_ISFIFO(st.st_mode);
-#endif
+int FsOpenAccessMode(int32_t flags) {
+  return flags & (UV_FS_O_RDONLY | UV_FS_O_WRONLY | UV_FS_O_RDWR);
+}
+
+bool ShouldDelayOpenCompletion(AsyncFsReq* async_req, int result) {
+  if (async_req == nullptr || result < 0 || !async_req->is_open_req) return false;
+  if (FsOpenAccessMode(async_req->open_flags) != UV_FS_O_WRONLY) return false;
+
+  uv_fs_t stat_req{};
+  const int stat_result = uv_fs_fstat(nullptr, &stat_req, result, nullptr);
+  bool is_fifo = false;
+  if (stat_result == 0) {
+    is_fifo = S_ISFIFO(stat_req.statbuf.st_mode);
+  }
+  uv_fs_req_cleanup(&stat_req);
+  return is_fifo;
+}
+
+void RunDeferredOpenCompletion(napi_env env, void* data) {
+  auto* task = static_cast<DeferredOpenCompletionTask*>(data);
+  if (task == nullptr) return;
+  auto* async_req = task->async_req;
+  if (async_req == nullptr || env == nullptr || async_req->env != env) {
+    delete task;
+    return;
+  }
+  FsBindingState* st = GetState(env);
+  if (st != nullptr && async_req->pending_fifo_writer_open) {
+    auto range = st->pending_fifo_writer_opens.equal_range(async_req->path_storage);
+    for (auto it = range.first; it != range.second; ++it) {
+      if (it->second == async_req) {
+        st->pending_fifo_writer_opens.erase(it);
+        break;
+      }
+    }
+  }
+  async_req->delayed_open_completion = false;
+  async_req->pending_fifo_writer_open = false;
+  async_req->deferred_open_task = nullptr;
+  task->async_req = nullptr;
+  delete task;
+  FinishAsyncFsReq(async_req, static_cast<int>(async_req->req.result));
+}
+
+napi_value DeferredOpenCompletionCallback(napi_env env, napi_callback_info info) {
+  void* data = nullptr;
+  size_t argc = 0;
+  napi_get_cb_info(env, info, &argc, nullptr, nullptr, &data);
+  auto* async_req = static_cast<AsyncFsReq*>(data);
+  RunDeferredOpenCompletion(env, async_req);
+  return Undefined(env);
+}
+
+bool ScheduleDeferredOpenCompletion(AsyncFsReq* async_req) {
+  if (async_req == nullptr || async_req->env == nullptr) return false;
+  napi_env env = async_req->env;
+  auto* task = new DeferredOpenCompletionTask();
+  task->env = env;
+  task->async_req = async_req;
+  napi_value callback = nullptr;
+  if (napi_create_function(env,
+                           "__ubiFsDeferredOpenComplete",
+                           NAPI_AUTO_LENGTH,
+                           DeferredOpenCompletionCallback,
+                           task,
+                           &callback) != napi_ok ||
+      callback == nullptr) {
+    delete task;
+    return false;
+  }
+  napi_value global = GetGlobal(env);
+  napi_value set_timeout = nullptr;
+  napi_valuetype set_timeout_type = napi_undefined;
+  if (global == nullptr ||
+      napi_get_named_property(env, global, "setTimeout", &set_timeout) != napi_ok ||
+      set_timeout == nullptr ||
+      napi_typeof(env, set_timeout, &set_timeout_type) != napi_ok ||
+      set_timeout_type != napi_function) {
+    delete task;
+    return false;
+  }
+  napi_value delay = nullptr;
+  napi_create_int32(env, 50, &delay);
+  napi_value argv[2] = {callback, delay != nullptr ? delay : Undefined(env)};
+  napi_value ignored = nullptr;
+  if (napi_call_function(env, global, set_timeout, 2, argv, &ignored) != napi_ok) {
+    delete task;
+    return false;
+  }
+  async_req->deferred_open_task = task;
+  return true;
+}
+
+void ReleasePendingFifoWriterOpens(napi_env env, const std::string& path) {
+  FsBindingState* st = GetState(env);
+  if (st == nullptr || path.empty()) return;
+
+  std::vector<AsyncFsReq*> pending;
+  auto range = st->pending_fifo_writer_opens.equal_range(path);
+  for (auto it = range.first; it != range.second; ++it) {
+    if (it->second != nullptr) pending.push_back(it->second);
+  }
+  st->pending_fifo_writer_opens.erase(range.first, range.second);
+
+  for (AsyncFsReq* async_req : pending) {
+    if (async_req == nullptr) continue;
+    async_req->pending_fifo_writer_open = false;
+    async_req->delayed_open_completion = false;
+    if (async_req->deferred_open_task != nullptr) {
+      async_req->deferred_open_task->async_req = nullptr;
+      async_req->deferred_open_task = nullptr;
+    }
+    FinishAsyncFsReq(async_req, static_cast<int>(async_req->req.result));
+  }
 }
 
 bool IsNullOrUndefined(napi_env env, napi_value value) {
@@ -1357,12 +1473,6 @@ void FinishAsyncFsReq(AsyncFsReq* async_req, int result) {
     value = MakeAsyncFsResultValue(async_req, result);
   }
 
-  if (result >= 0 && async_req->hold_fifo_writer_completion) {
-    FsBindingState& st = EnsureState(env);
-    st.pending_fifo_writer_opens[async_req->path_storage].push_back(async_req);
-    return;
-  }
-
   if (async_req->req_kind == ReqKind::kPromise && async_req->deferred != nullptr) {
     if (result < 0) {
       (void)napi_reject_deferred(env, async_req->deferred, err != nullptr ? err : Undefined(env));
@@ -1370,9 +1480,6 @@ void FinishAsyncFsReq(AsyncFsReq* async_req, int result) {
       (void)napi_resolve_deferred(env, async_req->deferred, value != nullptr ? value : Undefined(env));
     }
     (void)EdgeRunCallbackScopeCheckpoint(env);
-    if (result >= 0 && async_req->fifo_read_open) {
-      ReleasePendingFifoWriterOpens(env, async_req->path_storage);
-    }
     DestroyAsyncFsReq(async_req);
     return;
   }
@@ -1393,26 +1500,8 @@ void FinishAsyncFsReq(AsyncFsReq* async_req, int result) {
         argv[1] = value;
         argc = (extra != nullptr && !IsUndefined(env, extra)) ? 3 : 2;
       }
-      if (async_req->defer_callback_completion &&
-          ScheduleDeferredReqCompletion(env,
-                                        req,
-                                        oncomplete,
-                                        result < 0 ? (argc >= 1 ? argv[0] : nullptr) : nullptr,
-                                        result >= 0 && argc >= 2 ? argv[1] : nullptr,
-                                        argc >= 3 ? argv[2] : nullptr,
-                                        true)) {
-        if (result >= 0 && async_req->fifo_read_open) {
-          ReleasePendingFifoWriterOpens(env, async_req->path_storage);
-        }
-        DestroyAsyncFsReq(async_req);
-        return;
-      }
       InvokeFsReqCallback(env, req, oncomplete, argc, argv);
     }
-  }
-
-  if (result >= 0 && async_req->fifo_read_open) {
-    ReleasePendingFifoWriterOpens(env, async_req->path_storage);
   }
 
   DestroyAsyncFsReq(async_req);
@@ -1421,28 +1510,30 @@ void FinishAsyncFsReq(AsyncFsReq* async_req, int result) {
 void AfterAsyncFsReq(uv_fs_t* req) {
   auto* async_req = static_cast<AsyncFsReq*>(req != nullptr ? req->data : nullptr);
   if (async_req == nullptr) return;
-  FinishAsyncFsReq(async_req, static_cast<int>(req->result));
-}
-
-void BlockingOpenWork(uv_work_t* work) {
-  auto* async_req = static_cast<AsyncFsReq*>(work != nullptr ? work->data : nullptr);
-  if (async_req == nullptr) return;
-#ifdef _WIN32
-  async_req->open_result = UV_ENOSYS;
-#else
-  const int fd = ::open(async_req->path_storage.c_str(), async_req->open_flags, async_req->open_mode);
-  async_req->open_result = fd >= 0 ? fd : uv_translate_sys_error(errno);
-#endif
-}
-
-void AfterBlockingOpenWork(uv_work_t* work, int status) {
-  auto* async_req = static_cast<AsyncFsReq*>(work != nullptr ? work->data : nullptr);
-  if (async_req == nullptr) return;
-  if (status < 0) {
-    FinishAsyncFsReq(async_req, status);
-    return;
+  if (!async_req->delayed_open_completion &&
+      ShouldDelayOpenCompletion(async_req, static_cast<int>(req->result))) {
+    async_req->delayed_open_completion = true;
+    async_req->pending_fifo_writer_open = true;
+    FsBindingState* st = GetState(async_req->env);
+    if (st != nullptr) {
+      st->pending_fifo_writer_opens.emplace(async_req->path_storage, async_req);
+    }
+    if (ScheduleDeferredOpenCompletion(async_req)) {
+      return;
+    }
+    if (st != nullptr) {
+      auto range = st->pending_fifo_writer_opens.equal_range(async_req->path_storage);
+      for (auto it = range.first; it != range.second; ++it) {
+        if (it->second == async_req) {
+          st->pending_fifo_writer_opens.erase(it);
+          break;
+        }
+      }
+    }
+    async_req->pending_fifo_writer_open = false;
+    async_req->delayed_open_completion = false;
   }
-  FinishAsyncFsReq(async_req, async_req->open_result);
+  FinishAsyncFsReq(async_req, static_cast<int>(req->result));
 }
 
 AsyncFsReq* CreateAsyncFsReq(napi_env env,
@@ -1598,26 +1689,55 @@ void FinishFileHandleClose(FileHandleCloseReq* close_req, int result) {
   FileHandleWrap* wrap = close_req->wrap;
   napi_env env = close_req->env;
 
+  auto delete_close_req = [env](FileHandleCloseReq* req) {
+    if (req == nullptr) return;
+    if (env != nullptr) ResetRef(env, &req->req_ref);
+    uv_fs_req_cleanup(&req->req);
+    delete req;
+  };
+
+  auto after_close = [](FileHandleWrap* handle) {
+    if (handle == nullptr) return;
+    const bool emit_eof = handle->reading;
+    handle->closing = false;
+    handle->closed = true;
+    handle->reading = false;
+    handle->fd = -1;
+    EdgeStreamBaseSetReading(&handle->base, false);
+    if (emit_eof) {
+      (void)EdgeStreamBaseEmitEOF(&handle->base);
+    }
+  };
+
   if (env != nullptr && EdgeWorkerEnvStopRequested(env)) {
     if (wrap != nullptr) {
-      wrap->closing = false;
-      wrap->closed = true;
-      wrap->fd = -1;
+      after_close(wrap);
       wrap->closing_deferred = nullptr;
       ResetRef(env, &wrap->closing_promise_ref);
       ReleaseFileHandleRef(wrap);
     }
-    uv_fs_req_cleanup(&close_req->req);
-    delete close_req;
+    delete_close_req(close_req);
     return;
   }
 
   if (wrap != nullptr) {
-    wrap->closing = false;
     if (result >= 0) {
-      wrap->closed = true;
-      wrap->fd = -1;
+      after_close(wrap);
+    } else {
+      wrap->closing = false;
     }
+  }
+
+  if (close_req->is_shutdown) {
+    napi_value req_obj = env != nullptr ? GetRefValue(env, close_req->req_ref) : nullptr;
+    if (wrap != nullptr && req_obj != nullptr) {
+      EdgeStreamBaseEmitAfterShutdown(&wrap->base, req_obj, result);
+    }
+    if (wrap != nullptr) {
+      ReleaseFileHandleRef(wrap);
+    }
+    delete_close_req(close_req);
+    return;
   }
 
   if (env != nullptr && wrap != nullptr && wrap->closing_deferred != nullptr) {
@@ -1636,8 +1756,7 @@ void FinishFileHandleClose(FileHandleCloseReq* close_req, int result) {
     ReleaseFileHandleRef(wrap);
   }
 
-  uv_fs_req_cleanup(&close_req->req);
-  delete close_req;
+  delete_close_req(close_req);
 }
 
 void AfterFileHandleClose(uv_fs_t* req) {
@@ -1645,6 +1764,180 @@ void AfterFileHandleClose(uv_fs_t* req) {
   if (close_req == nullptr) return;
   FinishFileHandleClose(close_req, static_cast<int>(req->result));
 }
+
+FileHandleWrap* FileHandleFromBase(EdgeStreamBase* base) {
+  if (base == nullptr) return nullptr;
+  return reinterpret_cast<FileHandleWrap*>(reinterpret_cast<char*>(base) - offsetof(FileHandleWrap, base));
+}
+
+void DestroyFileHandleBase(EdgeStreamBase* base) {
+  delete FileHandleFromBase(base);
+}
+
+int FileHandleReadStopInternal(FileHandleWrap* wrap);
+
+void AfterFileHandleRead(uv_fs_t* req) {
+  auto* read_req = static_cast<FileHandleReadReq*>(req != nullptr ? req->data : nullptr);
+  if (read_req == nullptr) return;
+
+  FileHandleWrap* wrap = read_req->wrap;
+  ssize_t result = req->result;
+  uv_fs_req_cleanup(req);
+
+  if (wrap != nullptr && wrap->current_read == read_req) {
+    wrap->current_read = nullptr;
+  }
+
+  uv_buf_t buf = uv_buf_init(read_req->storage, read_req->buf.len);
+  read_req->storage = nullptr;
+
+  if (wrap != nullptr && result >= 0) {
+    if (wrap->read_length >= 0 && static_cast<int64_t>(result) > wrap->read_length) {
+      result = wrap->read_length;
+    }
+    if (wrap->read_length >= 0) {
+      wrap->read_length -= result;
+    }
+    if (wrap->read_offset >= 0) {
+      wrap->read_offset += result;
+    }
+  }
+
+  if (result == 0) result = UV_EOF;
+
+  if (wrap != nullptr) {
+    if (result > 0) {
+      buf.len = static_cast<unsigned int>(result);
+      EdgeStreamBaseOnUvRead(&wrap->base, result, &buf);
+    } else {
+      if (buf.base != nullptr) free(buf.base);
+      EdgeStreamBaseOnUvRead(&wrap->base, result, nullptr);
+    }
+    ReleaseFileHandleRef(wrap);
+    if (result > 0 && wrap->reading && !wrap->closing && !wrap->closed) {
+      (void)EdgeStreamBaseReadStart(&wrap->base);
+    }
+  } else if (buf.base != nullptr) {
+    free(buf.base);
+  }
+
+  delete read_req;
+}
+
+int FileHandleReadStartInternal(FileHandleWrap* wrap) {
+  if (wrap == nullptr) return UV_EBADF;
+  if (wrap->fd < 0 || wrap->closed || wrap->closing) return UV_EOF;
+
+  wrap->reading = true;
+  EdgeStreamBaseSetReading(&wrap->base, true);
+
+  if (wrap->current_read != nullptr) return 0;
+
+  if (wrap->read_length == 0) {
+    (void)EdgeStreamBaseEmitEOF(&wrap->base);
+    return 0;
+  }
+
+  size_t suggested = 65536;
+  if (wrap->read_length >= 0 && wrap->read_length < static_cast<int64_t>(suggested)) {
+    suggested = static_cast<size_t>(wrap->read_length);
+  }
+  if (suggested == 0) suggested = 1;
+
+  auto* read_req = new FileHandleReadReq();
+  read_req->wrap = wrap;
+  read_req->storage = static_cast<char*>(malloc(suggested));
+  if (read_req->storage == nullptr) {
+    delete read_req;
+    return UV_ENOMEM;
+  }
+  read_req->buf = uv_buf_init(read_req->storage, static_cast<unsigned int>(suggested));
+  read_req->req.data = read_req;
+
+  uv_loop_t* loop = EdgeGetEnvLoop(wrap->env);
+  if (loop == nullptr) {
+    free(read_req->storage);
+    delete read_req;
+    return UV_EINVAL;
+  }
+
+  wrap->current_read = read_req;
+  HoldFileHandleRef(wrap);
+  const int rc = uv_fs_read(loop,
+                            &read_req->req,
+                            wrap->fd,
+                            &read_req->buf,
+                            1,
+                            wrap->read_offset,
+                            AfterFileHandleRead);
+  if (rc < 0) {
+    wrap->current_read = nullptr;
+    ReleaseFileHandleRef(wrap);
+    free(read_req->storage);
+    delete read_req;
+    return rc;
+  }
+
+  return 0;
+}
+
+int FileHandleReadStartOp(EdgeStreamBase* base) {
+  return FileHandleReadStartInternal(FileHandleFromBase(base));
+}
+
+int FileHandleReadStopInternal(FileHandleWrap* wrap) {
+  if (wrap == nullptr) return UV_EBADF;
+  wrap->reading = false;
+  EdgeStreamBaseSetReading(&wrap->base, false);
+  return 0;
+}
+
+int FileHandleReadStopOp(EdgeStreamBase* base) {
+  return FileHandleReadStopInternal(FileHandleFromBase(base));
+}
+
+int FileHandleShutdownOp(EdgeStreamBase* base, napi_value req_obj) {
+  FileHandleWrap* wrap = FileHandleFromBase(base);
+  if (wrap == nullptr || req_obj == nullptr) return UV_EINVAL;
+  if (wrap->closing || wrap->closed || wrap->fd < 0) {
+    EdgeStreamBaseInvokeReqOnComplete(wrap->env, req_obj, 0, nullptr, 0);
+    return 1;
+  }
+
+  auto* close_req = new FileHandleCloseReq();
+  close_req->env = wrap->env;
+  close_req->wrap = wrap;
+  close_req->is_shutdown = true;
+  close_req->req.data = close_req;
+  if (napi_create_reference(wrap->env, req_obj, 1, &close_req->req_ref) != napi_ok) {
+    delete close_req;
+    return UV_EINVAL;
+  }
+
+  wrap->closing = true;
+  EdgeStreamReqActivate(wrap->env, req_obj, kEdgeProviderShutdownWrap, wrap->base.async_id);
+  HoldFileHandleRef(wrap);
+
+  uv_loop_t* loop = EdgeGetEnvLoop(wrap->env);
+  const int rc = loop != nullptr ? uv_fs_close(loop, &close_req->req, wrap->fd, AfterFileHandleClose)
+                                 : UV_EINVAL;
+  if (rc < 0) {
+    FinishFileHandleClose(close_req, rc);
+  }
+  return rc;
+}
+
+const EdgeStreamBaseOps kFileHandleStreamOps = {
+    nullptr,
+    nullptr,
+    nullptr,
+    DestroyFileHandleBase,
+    nullptr,
+    FileHandleReadStartOp,
+    FileHandleReadStopOp,
+    FileHandleShutdownOp,
+    nullptr,
+};
 
 FileHandleWrap* UnwrapFileHandle(napi_env env, napi_value this_arg) {
   if (this_arg == nullptr) return nullptr;
@@ -1656,10 +1949,13 @@ FileHandleWrap* UnwrapFileHandle(napi_env env, napi_value this_arg) {
 void FileHandleFinalize(napi_env env, void* data, void* /*hint*/) {
   auto* wrap = static_cast<FileHandleWrap*>(data);
   if (wrap == nullptr) return;
+  if (wrap->fd >= 0 && !wrap->closed && !wrap->closing) {
+    (void)::close(wrap->fd);
+    wrap->fd = -1;
+    wrap->closed = true;
+  }
   ResetRef(env, &wrap->closing_promise_ref);
-  ResetRef(env, &wrap->onread_ref);
-  ResetRef(env, &wrap->wrapper_ref);
-  delete wrap;
+  EdgeStreamBaseFinalize(&wrap->base);
 }
 
 napi_value FileHandleCtor(napi_env env, napi_callback_info info) {
@@ -1670,17 +1966,24 @@ napi_value FileHandleCtor(napi_env env, napi_callback_info info) {
   if (this_arg == nullptr) return nullptr;
   auto* wrap = new FileHandleWrap();
   wrap->env = env;
-  wrap->async_id = g_next_file_handle_async_id++;
   if (argc >= 1 && argv[0] != nullptr) napi_get_value_int32(env, argv[0], &wrap->fd);
-  int64_t offset = 0;
+  int64_t offset = -1;
   int64_t length = -1;
   if (argc >= 2 && argv[1] != nullptr) (void)napi_get_value_int64(env, argv[1], &offset);
   if (argc >= 3 && argv[2] != nullptr) (void)napi_get_value_int64(env, argv[2], &length);
+  wrap->read_offset = offset;
+  wrap->read_length = length;
+  EdgeStreamBaseInit(&wrap->base, env, &kFileHandleStreamOps, kEdgeProviderNone);
   napi_value offset_value = nullptr;
   napi_value length_value = nullptr;
   napi_create_int64(env, offset, &offset_value);
   napi_create_int64(env, length, &length_value);
-  napi_wrap(env, this_arg, wrap, FileHandleFinalize, nullptr, &wrap->wrapper_ref);
+  if (napi_wrap(env, this_arg, wrap, FileHandleFinalize, nullptr, &wrap->base.wrapper_ref) != napi_ok) {
+    delete wrap;
+    return nullptr;
+  }
+  EdgeStreamBaseSetWrapperRef(&wrap->base, wrap->base.wrapper_ref);
+  EdgeStreamBaseSetInitialStreamProperties(&wrap->base, false, false);
   if (offset_value != nullptr) napi_set_named_property(env, this_arg, "offset", offset_value);
   if (length_value != nullptr) napi_set_named_property(env, this_arg, "length", length_value);
   return this_arg;
@@ -1701,9 +2004,7 @@ napi_value FileHandleGetBytesRead(napi_env env, napi_callback_info info) {
   size_t argc = 0;
   napi_get_cb_info(env, info, &argc, nullptr, &this_arg, nullptr);
   FileHandleWrap* wrap = UnwrapFileHandle(env, this_arg);
-  napi_value out = nullptr;
-  napi_create_double(env, wrap == nullptr ? 0 : static_cast<double>(wrap->bytes_read), &out);
-  return out != nullptr ? out : Undefined(env);
+  return wrap != nullptr ? EdgeStreamBaseGetBytesRead(&wrap->base) : Undefined(env);
 }
 
 napi_value FileHandleGetBytesWritten(napi_env env, napi_callback_info info) {
@@ -1711,9 +2012,7 @@ napi_value FileHandleGetBytesWritten(napi_env env, napi_callback_info info) {
   size_t argc = 0;
   napi_get_cb_info(env, info, &argc, nullptr, &this_arg, nullptr);
   FileHandleWrap* wrap = UnwrapFileHandle(env, this_arg);
-  napi_value out = nullptr;
-  napi_create_double(env, wrap == nullptr ? 0 : static_cast<double>(wrap->bytes_written), &out);
-  return out != nullptr ? out : Undefined(env);
+  return wrap != nullptr ? EdgeStreamBaseGetBytesWritten(&wrap->base) : Undefined(env);
 }
 
 napi_value FileHandleGetExternalStream(napi_env env, napi_callback_info info) {
@@ -1721,11 +2020,7 @@ napi_value FileHandleGetExternalStream(napi_env env, napi_callback_info info) {
   size_t argc = 0;
   napi_get_cb_info(env, info, &argc, nullptr, &this_arg, nullptr);
   FileHandleWrap* wrap = UnwrapFileHandle(env, this_arg);
-  napi_value out = nullptr;
-  if (wrap != nullptr) {
-    napi_create_external(env, wrap, nullptr, nullptr, &out);
-  }
-  return out != nullptr ? out : Undefined(env);
+  return wrap != nullptr ? EdgeStreamBaseGetExternal(&wrap->base) : Undefined(env);
 }
 
 napi_value FileHandleGetAsyncId(napi_env env, napi_callback_info info) {
@@ -1733,9 +2028,7 @@ napi_value FileHandleGetAsyncId(napi_env env, napi_callback_info info) {
   size_t argc = 0;
   napi_get_cb_info(env, info, &argc, nullptr, &this_arg, nullptr);
   FileHandleWrap* wrap = UnwrapFileHandle(env, this_arg);
-  napi_value out = nullptr;
-  napi_create_int64(env, wrap == nullptr ? -1 : wrap->async_id, &out);
-  return out != nullptr ? out : Undefined(env);
+  return wrap != nullptr ? EdgeStreamBaseGetAsyncId(&wrap->base) : Undefined(env);
 }
 
 napi_value FileHandleGetOnread(napi_env env, napi_callback_info info) {
@@ -1743,8 +2036,7 @@ napi_value FileHandleGetOnread(napi_env env, napi_callback_info info) {
   size_t argc = 0;
   napi_get_cb_info(env, info, &argc, nullptr, &this_arg, nullptr);
   FileHandleWrap* wrap = UnwrapFileHandle(env, this_arg);
-  napi_value value = wrap == nullptr ? nullptr : GetRefValue(env, wrap->onread_ref);
-  return value != nullptr ? value : Undefined(env);
+  return wrap != nullptr ? EdgeStreamBaseGetOnRead(&wrap->base) : Undefined(env);
 }
 
 napi_value FileHandleSetOnread(napi_env env, napi_callback_info info) {
@@ -1754,11 +2046,7 @@ napi_value FileHandleSetOnread(napi_env env, napi_callback_info info) {
   napi_get_cb_info(env, info, &argc, argv, &this_arg, nullptr);
   FileHandleWrap* wrap = UnwrapFileHandle(env, this_arg);
   if (wrap == nullptr) return Undefined(env);
-  ResetRef(env, &wrap->onread_ref);
-  if (argc >= 1 && argv[0] != nullptr && !IsUndefined(env, argv[0])) {
-    napi_create_reference(env, argv[0], 1, &wrap->onread_ref);
-  }
-  return Undefined(env);
+  return EdgeStreamBaseSetOnRead(&wrap->base, argc >= 1 ? argv[0] : Undefined(env));
 }
 
 napi_value FileHandleClose(napi_env env, napi_callback_info info) {
@@ -1769,6 +2057,9 @@ napi_value FileHandleClose(napi_env env, napi_callback_info info) {
   if (wrap == nullptr) return Undefined(env);
 
   if (wrap->fd < 0 || wrap->closed) return MakeResolvedPromise(env, Undefined(env));
+  if (wrap->current_read != nullptr) {
+    return MakeRejectedPromise(env, CreateUvExceptionValue(env, UV_EBUSY, "close"));
+  }
 
   napi_value closing_promise = GetRefValue(env, wrap->closing_promise_ref);
   if (closing_promise != nullptr && wrap->closing) return closing_promise;
@@ -1780,6 +2071,8 @@ napi_value FileHandleClose(napi_env env, napi_callback_info info) {
   napi_create_reference(env, promise, 1, &wrap->closing_promise_ref);
   wrap->closing_deferred = deferred;
   wrap->closing = true;
+  wrap->reading = false;
+  EdgeStreamBaseSetReading(&wrap->base, false);
 
   auto* close_req = new FileHandleCloseReq();
   close_req->env = env;
@@ -1804,9 +2097,15 @@ napi_value FileHandleReleaseFD(napi_env env, napi_callback_info info) {
   FileHandleWrap* wrap = UnwrapFileHandle(env, this_arg);
   int32_t old_fd = wrap == nullptr ? -1 : wrap->fd;
   if (wrap != nullptr) {
+    const bool emit_eof = wrap->reading;
     wrap->fd = -1;
     wrap->closing = false;
     wrap->closed = true;
+    wrap->reading = false;
+    EdgeStreamBaseSetReading(&wrap->base, false);
+    if (emit_eof) {
+      (void)EdgeStreamBaseEmitEOF(&wrap->base);
+    }
   }
   napi_value out = nullptr;
   napi_create_int32(env, old_fd, &out);
@@ -1814,25 +2113,39 @@ napi_value FileHandleReleaseFD(napi_env env, napi_callback_info info) {
 }
 
 napi_value FileHandleReadStart(napi_env env, napi_callback_info info) {
-  napi_value out = nullptr;
-  napi_create_int32(env, 0, &out);
-  return out != nullptr ? out : Undefined(env);
+  napi_value this_arg = nullptr;
+  size_t argc = 0;
+  napi_get_cb_info(env, info, &argc, nullptr, &this_arg, nullptr);
+  FileHandleWrap* wrap = UnwrapFileHandle(env, this_arg);
+  return MakeInt32(env, FileHandleReadStartInternal(wrap));
 }
 
 napi_value FileHandleReadStop(napi_env env, napi_callback_info info) {
-  napi_value out = nullptr;
-  napi_create_int32(env, 0, &out);
-  return out != nullptr ? out : Undefined(env);
+  napi_value this_arg = nullptr;
+  size_t argc = 0;
+  napi_get_cb_info(env, info, &argc, nullptr, &this_arg, nullptr);
+  FileHandleWrap* wrap = UnwrapFileHandle(env, this_arg);
+  return MakeInt32(env, FileHandleReadStopInternal(wrap));
 }
 
 napi_value FileHandleShutdown(napi_env env, napi_callback_info info) {
-  return Undefined(env);
+  size_t argc = 1;
+  napi_value argv[1] = {nullptr};
+  napi_value this_arg = nullptr;
+  napi_get_cb_info(env, info, &argc, argv, &this_arg, nullptr);
+  FileHandleWrap* wrap = UnwrapFileHandle(env, this_arg);
+  return MakeInt32(env, wrap != nullptr ? FileHandleShutdownOp(&wrap->base, argc >= 1 ? argv[0] : nullptr)
+                                        : UV_EINVAL);
 }
 
 napi_value FileHandleUseUserBuffer(napi_env env, napi_callback_info info) {
-  napi_value out = nullptr;
-  napi_get_boolean(env, false, &out);
-  return out != nullptr ? out : Undefined(env);
+  size_t argc = 1;
+  napi_value argv[1] = {nullptr};
+  napi_value this_arg = nullptr;
+  napi_get_cb_info(env, info, &argc, argv, &this_arg, nullptr);
+  FileHandleWrap* wrap = UnwrapFileHandle(env, this_arg);
+  return wrap != nullptr ? EdgeStreamBaseUseUserBuffer(&wrap->base, argc >= 1 ? argv[0] : Undefined(env))
+                         : Undefined(env);
 }
 
 napi_value CallBindingMethodByName(napi_env env, napi_value binding, const char* name, size_t argc, napi_value* argv) {
@@ -1922,9 +2235,11 @@ napi_value FileHandleWriteLatin1String(napi_env env, napi_callback_info info) {
 }
 
 napi_value FileHandleIsStreamBase(napi_env env, napi_callback_info info) {
-  napi_value out = nullptr;
-  napi_get_boolean(env, true, &out);
-  return out != nullptr ? out : Undefined(env);
+  napi_value this_arg = nullptr;
+  size_t argc = 0;
+  napi_get_cb_info(env, info, &argc, nullptr, &this_arg, nullptr);
+  FileHandleWrap* wrap = UnwrapFileHandle(env, this_arg);
+  return wrap != nullptr ? EdgeStreamBaseMakeBool(env, true) : Undefined(env);
 }
 
 struct StatWatcherWrap {
@@ -2836,30 +3151,22 @@ napi_value FsOpen(napi_env env, napi_callback_info info) {
       async_req->result_kind = AsyncFsResultKind::kInt64;
       async_req->track_unmanaged_fd = true;
       async_req->path_storage = std::move(path);
+      async_req->open_flags = flags;
+      async_req->is_open_req = true;
 
       uv_loop_t* loop = EdgeGetEnvLoop(env);
-      int rc = UV_EINVAL;
-      if (loop != nullptr) {
-        if (ShouldUseBlockingFifoOpen(async_req->path_storage, flags)) {
-          const int access_mode = flags & O_ACCMODE;
-          async_req->defer_callback_completion = true;
-          async_req->hold_fifo_writer_completion = access_mode == O_WRONLY;
-          async_req->fifo_read_open = access_mode == O_RDONLY;
-          async_req->open_flags = flags;
-          async_req->open_mode = mode;
-          async_req->work.data = async_req;
-          rc = uv_queue_work(loop, &async_req->work, BlockingOpenWork, AfterBlockingOpenWork);
-        } else {
-          async_req->uses_uv_fs_req = true;
-          rc = uv_fs_open(loop,
-                          &async_req->req,
-                          async_req->path_storage.c_str(),
-                          flags,
-                          mode,
-                          AfterAsyncFsReq);
-        }
-      }
+      async_req->uses_uv_fs_req = true;
+      const int rc = loop != nullptr ? uv_fs_open(loop,
+                                                  &async_req->req,
+                                                  async_req->path_storage.c_str(),
+                                                  flags,
+                                                  mode,
+                                                  AfterAsyncFsReq)
+                                     : UV_EINVAL;
       if (rc < 0) FinishAsyncFsReq(async_req, rc);
+      if (rc >= 0 && FsOpenAccessMode(flags) != UV_FS_O_WRONLY) {
+        ReleasePendingFifoWriterOpens(env, async_req->path_storage);
+      }
       return req_kind == ReqKind::kPromise ? promise : Undefined(env);
     }
   }
@@ -3355,29 +3662,21 @@ napi_value FsOpenFileHandle(napi_env env, napi_callback_info info) {
       async_req->syscall = "open";
       async_req->result_kind = AsyncFsResultKind::kFileHandle;
       async_req->path_storage = std::move(path);
+      async_req->open_flags = flags;
+      async_req->is_open_req = true;
       uv_loop_t* loop = EdgeGetEnvLoop(env);
-      int rc = UV_EINVAL;
-      if (loop != nullptr) {
-        if (ShouldUseBlockingFifoOpen(async_req->path_storage, flags)) {
-          const int access_mode = flags & O_ACCMODE;
-          async_req->defer_callback_completion = true;
-          async_req->hold_fifo_writer_completion = access_mode == O_WRONLY;
-          async_req->fifo_read_open = access_mode == O_RDONLY;
-          async_req->open_flags = flags;
-          async_req->open_mode = mode;
-          async_req->work.data = async_req;
-          rc = uv_queue_work(loop, &async_req->work, BlockingOpenWork, AfterBlockingOpenWork);
-        } else {
-          async_req->uses_uv_fs_req = true;
-          rc = uv_fs_open(loop,
-                          &async_req->req,
-                          async_req->path_storage.c_str(),
-                          flags,
-                          mode,
-                          AfterAsyncFsReq);
-        }
-      }
+      async_req->uses_uv_fs_req = true;
+      const int rc = loop != nullptr ? uv_fs_open(loop,
+                                                  &async_req->req,
+                                                  async_req->path_storage.c_str(),
+                                                  flags,
+                                                  mode,
+                                                  AfterAsyncFsReq)
+                                     : UV_EINVAL;
       if (rc < 0) FinishAsyncFsReq(async_req, rc);
+      if (rc >= 0 && FsOpenAccessMode(flags) != UV_FS_O_WRONLY) {
+        ReleasePendingFifoWriterOpens(env, async_req->path_storage);
+      }
       return req_kind == ReqKind::kPromise ? promise : Undefined(env);
     }
   }

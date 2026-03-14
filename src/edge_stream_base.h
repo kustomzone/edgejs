@@ -18,6 +18,9 @@ struct EdgeStreamBaseOps {
   uv_close_cb on_close = nullptr;
   void (*destroy_self)(EdgeStreamBase* base) = nullptr;
   napi_value (*accept_pending_handle)(EdgeStreamBase* base) = nullptr;
+  int (*read_start)(EdgeStreamBase* base) = nullptr;
+  int (*read_stop)(EdgeStreamBase* base) = nullptr;
+  int (*shutdown_direct)(EdgeStreamBase* base, napi_value req_obj) = nullptr;
   int (*write_buffer_direct)(EdgeStreamBase* base,
                              napi_value req_obj,
                              napi_value payload,
@@ -67,6 +70,7 @@ void EdgeStreamBaseFinalize(EdgeStreamBase* base);
 void EdgeStreamBaseOnClosed(EdgeStreamBase* base);
 void EdgeStreamBaseEmitAfterWrite(EdgeStreamBase* base, napi_value req_obj, int status);
 void EdgeStreamBaseEmitAfterShutdown(EdgeStreamBase* base, napi_value req_obj, int status);
+void EdgeStreamBaseEmitWantsWrite(EdgeStreamBase* base, size_t suggested_size);
 bool EdgeStreamBaseEmitReadBuffer(EdgeStreamBase* base, const uint8_t* data, size_t len);
 bool EdgeStreamBaseEmitEOF(EdgeStreamBase* base);
 
@@ -112,6 +116,9 @@ void EdgeStreamBaseInvokeReqOnComplete(napi_env env,
                                       int status,
                                       napi_value* argv,
                                       size_t argc);
+int EdgeStreamBaseReadStart(EdgeStreamBase* base);
+int EdgeStreamBaseReadStop(EdgeStreamBase* base);
+int EdgeStreamBaseShutdownDirect(EdgeStreamBase* base, napi_value req_obj);
 int EdgeStreamBaseWriteBufferDirect(EdgeStreamBase* base,
                                    napi_value req_obj,
                                    napi_value payload,

@@ -324,6 +324,29 @@ bool IsFunction(napi_env env, napi_value value) {
   return napi_typeof(env, value, &type) == napi_ok && type == napi_function;
 }
 
+int CallStreamIntMethod(EdgeStreamBase* base,
+                        const char* name,
+                        size_t argc,
+                        napi_value* argv) {
+  if (base == nullptr || base->env == nullptr || name == nullptr) return UV_EBADF;
+  napi_value self = EdgeStreamBaseGetWrapper(base);
+  if (self == nullptr) return UV_EBADF;
+
+  napi_value method = nullptr;
+  if (napi_get_named_property(base->env, self, name, &method) != napi_ok || !IsFunction(base->env, method)) {
+    return UV_EBADF;
+  }
+
+  napi_value result = nullptr;
+  if (napi_call_function(base->env, self, method, argc, argv, &result) != napi_ok || result == nullptr) {
+    return UV_EPROTO;
+  }
+
+  int32_t status = UV_EPROTO;
+  if (napi_get_value_int32(base->env, result, &status) != napi_ok) return UV_EPROTO;
+  return status;
+}
+
 void DefineValueProperty(napi_env env,
                          napi_value object,
                          const char* name,
@@ -881,6 +904,11 @@ void EdgeStreamBaseEmitAfterShutdown(EdgeStreamBase* base, napi_value req_obj, i
   }
 }
 
+void EdgeStreamBaseEmitWantsWrite(EdgeStreamBase* base, size_t suggested_size) {
+  if (base == nullptr) return;
+  (void)EdgeStreamEmitWantsWrite(&base->listener_state, suggested_size);
+}
+
 bool EdgeStreamBaseEmitReadBuffer(EdgeStreamBase* base, const uint8_t* data, size_t len) {
   if (base == nullptr || data == nullptr || len == 0) return false;
   char* copy = static_cast<char*>(malloc(len));
@@ -1194,6 +1222,31 @@ void EdgeStreamBaseInvokeReqOnComplete(napi_env env,
                            &ignored,
                            kEdgeMakeCallbackNone);
   EdgeStreamReqMarkDone(env, req_obj);
+}
+
+int EdgeStreamBaseReadStart(EdgeStreamBase* base) {
+  if (base == nullptr) return UV_EBADF;
+  if (base->ops != nullptr && base->ops->read_start != nullptr) {
+    return base->ops->read_start(base);
+  }
+  return CallStreamIntMethod(base, "readStart", 0, nullptr);
+}
+
+int EdgeStreamBaseReadStop(EdgeStreamBase* base) {
+  if (base == nullptr) return UV_EBADF;
+  if (base->ops != nullptr && base->ops->read_stop != nullptr) {
+    return base->ops->read_stop(base);
+  }
+  return CallStreamIntMethod(base, "readStop", 0, nullptr);
+}
+
+int EdgeStreamBaseShutdownDirect(EdgeStreamBase* base, napi_value req_obj) {
+  if (base == nullptr) return UV_EBADF;
+  if (base->ops != nullptr && base->ops->shutdown_direct != nullptr) {
+    return base->ops->shutdown_direct(base, req_obj);
+  }
+  napi_value argv[1] = {req_obj};
+  return CallStreamIntMethod(base, "shutdown", 1, argv);
 }
 
 int EdgeStreamBaseWriteBufferDirect(EdgeStreamBase* base,

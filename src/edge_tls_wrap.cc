@@ -370,6 +370,9 @@ const EdgeStreamBaseOps kTlsWrapOps = {
     nullptr,
     nullptr,
     nullptr,
+    nullptr,
+    nullptr,
+    nullptr,
     TlsWrapStreamBaseWriteBuffer,
 };
 

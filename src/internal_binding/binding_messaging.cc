@@ -2,8 +2,10 @@
 #include "internal_binding/dispatch.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <iostream>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -27,6 +29,9 @@
 #include "edge_worker_env.h"
 
 namespace internal_binding {
+
+napi_value EdgeCryptoCreateNativeKeyObjectCloneData(napi_env env, napi_value value);
+napi_value EdgeCryptoCreateKeyObjectFromCloneData(napi_env env, napi_value data);
 
 struct MessagePortWrap;
 struct BroadcastChannelGroup;
@@ -70,6 +75,19 @@ struct MessagePortWrap {
 };
 
 namespace {
+
+bool DebugMessagingEnabled() {
+  static const bool enabled = []() {
+    const char* value = std::getenv("EDGE_DEBUG_MESSAGING");
+    return value != nullptr && value[0] != '\0' && value[0] != '0';
+  }();
+  return enabled;
+}
+
+void DebugMessagingLog(const std::string& message) {
+  if (!DebugMessagingEnabled()) return;
+  std::cerr << "[edge-messaging] " << message << std::endl;
+}
 
 void DeleteRefIfPresent(napi_env env, napi_ref* ref);
 
@@ -316,6 +334,9 @@ void ThrowTypeErrorWithCode(napi_env env, const char* code, const char* message)
 }
 
 napi_value CreateDataCloneError(napi_env env, const char* message) {
+  if (DebugMessagingEnabled()) {
+    DebugMessagingLog(std::string("CreateDataCloneError: ") + (message != nullptr ? message : "<null>"));
+  }
   napi_value dom_exception = ResolveDOMExceptionValue(env);
   if (IsFunction(env, dom_exception)) {
     napi_value argv[2] = {nullptr, nullptr};
@@ -526,6 +547,22 @@ std::string TryGetStructuredCloneErrorMessage(napi_env env, napi_value value) {
 
   napi_value message = GetNamed(env, err, "message");
   return message != nullptr ? ValueToUtf8(env, message) : std::string();
+}
+
+napi_value CallStructuredClone(napi_env env, napi_value value) {
+  if (env == nullptr || value == nullptr) return nullptr;
+
+  napi_value global = GetGlobal(env);
+  napi_value structured_clone = GetNamed(env, global, "structuredClone");
+  if (!IsFunction(env, structured_clone)) return nullptr;
+
+  napi_value cloned = nullptr;
+  napi_value argv[1] = {value};
+  if (napi_call_function(env, global, structured_clone, 1, argv, &cloned) != napi_ok || cloned == nullptr) {
+    return nullptr;
+  }
+
+  return cloned;
 }
 
 bool ThrowDirectCloneFailureIfDetected(napi_env env, napi_value value) {
@@ -835,48 +872,8 @@ bool IsFileHandleCloneMarker(napi_env env, napi_value value, napi_value* data_ou
 
 napi_value CreateCryptoKeyObjectCloneMarker(napi_env env, napi_value value) {
   if (!IsCryptoKeyObjectValue(env, value)) return nullptr;
-
-  napi_value type_value = GetNamed(env, value, "type");
-  napi_value export_fn = GetNamed(env, value, "export");
-  if (type_value == nullptr || !IsFunction(env, export_fn)) return nullptr;
-
-  const std::string key_type = ValueToUtf8(env, type_value);
-  napi_value export_result = nullptr;
-
-  if (key_type == "secret") {
-    if (napi_call_function(env, value, export_fn, 0, nullptr, &export_result) != napi_ok || export_result == nullptr) {
-      return nullptr;
-    }
-  } else {
-    napi_value options = nullptr;
-    napi_value format = nullptr;
-    napi_value type = nullptr;
-    const char* export_type = key_type == "public" ? "spki" : "pkcs8";
-    if ((key_type != "public" && key_type != "private") ||
-        napi_create_object(env, &options) != napi_ok || options == nullptr ||
-        napi_create_string_utf8(env, "der", NAPI_AUTO_LENGTH, &format) != napi_ok || format == nullptr ||
-        napi_create_string_utf8(env, export_type, NAPI_AUTO_LENGTH, &type) != napi_ok || type == nullptr ||
-        napi_set_named_property(env, options, "format", format) != napi_ok ||
-        napi_set_named_property(env, options, "type", type) != napi_ok) {
-      return nullptr;
-    }
-
-    napi_value argv[1] = {options};
-    if (napi_call_function(env, value, export_fn, 1, argv, &export_result) != napi_ok || export_result == nullptr) {
-      return nullptr;
-    }
-  }
-
-  napi_value data = nullptr;
-  napi_value type_string = nullptr;
-  if (napi_create_object(env, &data) != napi_ok || data == nullptr ||
-      napi_create_string_utf8(env, key_type.c_str(), NAPI_AUTO_LENGTH, &type_string) != napi_ok ||
-      type_string == nullptr ||
-      napi_set_named_property(env, data, "type", type_string) != napi_ok ||
-      napi_set_named_property(env, data, "data", export_result) != napi_ok) {
-    return nullptr;
-  }
-
+  napi_value data = EdgeCryptoCreateNativeKeyObjectCloneData(env, value);
+  if (data == nullptr) return nullptr;
   return CreateHandleCloneMarker(env, "__ubiCryptoKeyObjectCloneMarker", data);
 }
 
@@ -954,10 +951,32 @@ napi_value CreateJSTransferableCloneMarker(napi_env env, napi_value value);
 napi_value DeserializeJSTransferableCloneMarker(napi_env env, napi_value data, napi_value deserialize_info);
 napi_value CloneRootJSTransferableValueForQueue(napi_env env, napi_value value);
 bool IsPlainObjectContainer(napi_env env, napi_value value);
+napi_value CreateGlobalInstance(napi_env env, const char* ctor_name);
+napi_value CreateCloneTargetObject(napi_env env, napi_value source);
+napi_value FindTransformedValue(napi_env env,
+                                napi_value source,
+                                const std::vector<ValueTransformPair>& pairs);
+bool IsCloneByReferenceValue(napi_env env, napi_value value);
+bool TransferListContainsValue(napi_env env, napi_value transfer_list, napi_value candidate);
 napi_value TransformTransferredPortsForQueue(
     napi_env env,
     napi_value value,
     const std::vector<QueuedMessage::TransferredPortEntry>& transferred_ports,
+    std::vector<ValueTransformPair>* seen_pairs);
+bool AppendTransferredPortsForQueue(
+    napi_env env,
+    std::vector<QueuedMessage::TransferredPortEntry>* target,
+    std::vector<QueuedMessage::TransferredPortEntry>* source);
+bool CreateTransferredJSTransferableMarkerForQueue(
+    napi_env env,
+    napi_value value,
+    napi_value* marker_out,
+    std::vector<QueuedMessage::TransferredPortEntry>* transferred_ports_out);
+napi_value TransformTransferredValuesForQueue(
+    napi_env env,
+    napi_value value,
+    napi_value transfer_list,
+    std::vector<QueuedMessage::TransferredPortEntry>* transferred_ports,
     std::vector<ValueTransformPair>* seen_pairs);
 bool CollectTransferredPorts(
     napi_env env,
@@ -1158,51 +1177,7 @@ napi_value CreateFileHandleFromCloneData(napi_env env, napi_value fd_value) {
 }
 
 napi_value CreateCryptoKeyObjectFromCloneData(napi_env env, napi_value data) {
-  if (data == nullptr) return nullptr;
-
-  napi_value type_value = GetNamed(env, data, "type");
-  napi_value key_value = GetNamed(env, data, "data");
-  if (type_value == nullptr || key_value == nullptr) return nullptr;
-
-  const std::string key_type = ValueToUtf8(env, type_value);
-  napi_value crypto_module = GetCryptoModuleValue(env);
-  if (crypto_module == nullptr) return nullptr;
-
-  if (key_type == "secret") {
-    napi_value create_secret_key = GetNamed(env, crypto_module, "createSecretKey");
-    if (!IsFunction(env, create_secret_key)) return nullptr;
-    napi_value argv[1] = {key_value};
-    napi_value out = nullptr;
-    if (napi_call_function(env, crypto_module, create_secret_key, 1, argv, &out) != napi_ok || out == nullptr) {
-      return nullptr;
-    }
-    return out;
-  }
-
-  const char* method_name = key_type == "public" ? "createPublicKey" : "createPrivateKey";
-  const char* import_type = key_type == "public" ? "spki" : "pkcs8";
-  if (key_type != "public" && key_type != "private") return nullptr;
-
-  napi_value create_key = GetNamed(env, crypto_module, method_name);
-  napi_value options = nullptr;
-  napi_value format = nullptr;
-  napi_value type = nullptr;
-  if (!IsFunction(env, create_key) ||
-      napi_create_object(env, &options) != napi_ok || options == nullptr ||
-      napi_create_string_utf8(env, "der", NAPI_AUTO_LENGTH, &format) != napi_ok || format == nullptr ||
-      napi_create_string_utf8(env, import_type, NAPI_AUTO_LENGTH, &type) != napi_ok || type == nullptr ||
-      napi_set_named_property(env, options, "key", key_value) != napi_ok ||
-      napi_set_named_property(env, options, "format", format) != napi_ok ||
-      napi_set_named_property(env, options, "type", type) != napi_ok) {
-    return nullptr;
-  }
-
-  napi_value argv[1] = {options};
-  napi_value out = nullptr;
-  if (napi_call_function(env, crypto_module, create_key, 1, argv, &out) != napi_ok || out == nullptr) {
-    return nullptr;
-  }
-  return out;
+  return EdgeCryptoCreateKeyObjectFromCloneData(env, data);
 }
 
 napi_value RestoreTransferableDataAfterStructuredClone(napi_env env, napi_value value) {
@@ -1420,6 +1395,245 @@ napi_value CloneRootJSTransferableValueForQueue(napi_env env, napi_value value) 
   }
 
   return cloned;
+}
+
+bool AppendTransferredPortsForQueue(
+    napi_env env,
+    std::vector<QueuedMessage::TransferredPortEntry>* target,
+    std::vector<QueuedMessage::TransferredPortEntry>* source) {
+  if (target == nullptr || source == nullptr) return false;
+  if (source->empty()) return true;
+  target->reserve(target->size() + source->size());
+  for (auto& entry : *source) {
+    target->push_back(std::move(entry));
+  }
+  source->clear();
+  return true;
+}
+
+bool CreateTransferredJSTransferableMarkerForQueue(
+    napi_env env,
+    napi_value value,
+    napi_value* marker_out,
+    std::vector<QueuedMessage::TransferredPortEntry>* transferred_ports_out) {
+  if (marker_out != nullptr) *marker_out = nullptr;
+  if (transferred_ports_out == nullptr) return false;
+
+  napi_value transfer_data = nullptr;
+  napi_value deserialize_info = nullptr;
+  napi_value nested_transfer_list = nullptr;
+  if (!PrepareJSTransferableTransferData(
+          env, value, &transfer_data, &deserialize_info, &nested_transfer_list) ||
+      transfer_data == nullptr ||
+      deserialize_info == nullptr) {
+    DebugMessagingLog("PrepareJSTransferableTransferData failed");
+    return false;
+  }
+  DebugMessagingLog("Prepared nested transferable marker");
+
+  std::vector<QueuedMessage::TransferredPortEntry> nested_ports;
+  if (!CollectTransferredPorts(env, nested_transfer_list, &nested_ports)) {
+    DeleteTransferredPortRefs(env, &nested_ports);
+    return false;
+  }
+
+  std::vector<ValueTransformPair> nested_seen_pairs;
+  napi_value transformed_data =
+      TransformTransferredPortsForQueue(env, transfer_data, nested_ports, &nested_seen_pairs);
+  if (transformed_data == nullptr) {
+    DebugMessagingLog("TransformTransferredPortsForQueue failed for nested transferable");
+    DeleteTransferredPortRefs(env, &nested_ports);
+    return false;
+  }
+
+  napi_value prepared_data = PrepareTransferableDataForStructuredClone(env, transformed_data, true);
+  if (prepared_data == nullptr) {
+    DebugMessagingLog("PrepareTransferableDataForStructuredClone failed for nested transferable");
+    DeleteTransferredPortRefs(env, &nested_ports);
+    return false;
+  }
+
+  napi_value marker = nullptr;
+  if (napi_create_object(env, &marker) != napi_ok || marker == nullptr) {
+    DebugMessagingLog("Failed to create nested transferable marker object");
+    DeleteTransferredPortRefs(env, &nested_ports);
+    return false;
+  }
+
+  napi_value true_value = nullptr;
+  if (napi_get_boolean(env, true, &true_value) != napi_ok || true_value == nullptr ||
+      napi_set_named_property(env, marker, "__ubiJSTransferableCloneMarker", true_value) != napi_ok ||
+      napi_set_named_property(env, marker, "data", prepared_data) != napi_ok ||
+      napi_set_named_property(env, marker, "deserializeInfo", deserialize_info) != napi_ok) {
+    DebugMessagingLog("Failed to populate nested transferable marker object");
+    DeleteTransferredPortRefs(env, &nested_ports);
+    return false;
+  }
+
+  if (!AppendTransferredPortsForQueue(env, transferred_ports_out, &nested_ports)) {
+    DebugMessagingLog("Failed to append nested transferred ports");
+    DeleteTransferredPortRefs(env, &nested_ports);
+    return false;
+  }
+
+  napi_value cloned_marker = nullptr;
+  if (unofficial_napi_structured_clone(env, marker, &cloned_marker) != napi_ok || cloned_marker == nullptr) {
+    DebugMessagingLog("Failed to structured-clone nested transferable marker");
+    return false;
+  }
+
+  DebugMessagingLog("Created nested transferable marker successfully");
+  if (marker_out != nullptr) *marker_out = cloned_marker;
+  return true;
+}
+
+napi_value TransformTransferredValuesForQueue(
+    napi_env env,
+    napi_value value,
+    napi_value transfer_list,
+    std::vector<QueuedMessage::TransferredPortEntry>* transferred_ports,
+    std::vector<ValueTransformPair>* seen_pairs) {
+  if (transfer_list != nullptr &&
+      IsTransferableValue(env, value)) {
+    DebugMessagingLog("TransformTransferredValuesForQueue: found transferable value");
+    napi_value marker = nullptr;
+    if (CreateTransferredJSTransferableMarkerForQueue(env, value, &marker, transferred_ports) && marker != nullptr) {
+      DebugMessagingLog("TransformTransferredValuesForQueue: replaced transferable value with marker");
+      return marker;
+    }
+    DebugMessagingLog("TransformTransferredValuesForQueue: failed to replace transferable value");
+    return nullptr;
+  }
+
+  if (value == nullptr || IsNullOrUndefinedValue(env, value) || IsCloneByReferenceValue(env, value)) {
+    return value;
+  }
+  if (IsCloneableTransferableValue(env, value) || IsTransferableValue(env, value)) {
+    return value;
+  }
+
+  napi_valuetype type = napi_undefined;
+  if (napi_typeof(env, value, &type) != napi_ok || (type != napi_object && type != napi_function)) {
+    return value;
+  }
+
+  if (seen_pairs != nullptr) {
+    napi_value existing = FindTransformedValue(env, value, *seen_pairs);
+    if (existing != nullptr) return existing;
+  }
+
+  bool is_array = false;
+  if (napi_is_array(env, value, &is_array) == napi_ok && is_array) {
+    uint32_t length = 0;
+    if (napi_get_array_length(env, value, &length) != napi_ok) return value;
+    napi_value out = nullptr;
+    if (napi_create_array_with_length(env, length, &out) != napi_ok || out == nullptr) return value;
+    if (seen_pairs != nullptr) seen_pairs->push_back({value, out});
+    for (uint32_t i = 0; i < length; ++i) {
+      napi_value item = nullptr;
+      if (napi_get_element(env, value, i, &item) != napi_ok || item == nullptr) continue;
+      napi_value transformed =
+          TransformTransferredValuesForQueue(env, item, transfer_list, transferred_ports, seen_pairs);
+      if (transformed == nullptr) return nullptr;
+      napi_set_element(env, out, i, transformed);
+    }
+    return out;
+  }
+
+  if (IsMapValue(env, value)) {
+    napi_value entries = nullptr;
+    napi_value global = GetGlobal(env);
+    napi_value array_ctor = GetNamed(env, global, "Array");
+    napi_value from_fn = GetNamed(env, array_ctor, "from");
+    napi_value out = CreateGlobalInstance(env, "Map");
+    napi_value set_fn = GetNamed(env, out, "set");
+    if (!IsFunction(env, from_fn) || out == nullptr || !IsFunction(env, set_fn)) return value;
+    if (seen_pairs != nullptr) seen_pairs->push_back({value, out});
+    napi_value argv[1] = {value};
+    if (napi_call_function(env, array_ctor, from_fn, 1, argv, &entries) != napi_ok || entries == nullptr) {
+      ClearPendingException(env);
+      return out;
+    }
+    uint32_t length = 0;
+    if (napi_get_array_length(env, entries, &length) != napi_ok) return out;
+    for (uint32_t i = 0; i < length; ++i) {
+      napi_value pair = nullptr;
+      if (napi_get_element(env, entries, i, &pair) != napi_ok || pair == nullptr) continue;
+      napi_value key = nullptr;
+      napi_value map_value = nullptr;
+      if (napi_get_element(env, pair, 0, &key) != napi_ok || key == nullptr) continue;
+      if (napi_get_element(env, pair, 1, &map_value) != napi_ok) map_value = Undefined(env);
+      napi_value transformed_key =
+          TransformTransferredValuesForQueue(env, key, transfer_list, transferred_ports, seen_pairs);
+      napi_value transformed_value =
+          TransformTransferredValuesForQueue(env, map_value, transfer_list, transferred_ports, seen_pairs);
+      if (transformed_key == nullptr || transformed_value == nullptr) return nullptr;
+      napi_value set_argv[2] = {transformed_key, transformed_value};
+      napi_value ignored = nullptr;
+      if (napi_call_function(env, out, set_fn, 2, set_argv, &ignored) != napi_ok) {
+        ClearPendingException(env);
+      }
+    }
+    return out;
+  }
+
+  if (IsSetValue(env, value)) {
+    napi_value entries = nullptr;
+    napi_value global = GetGlobal(env);
+    napi_value array_ctor = GetNamed(env, global, "Array");
+    napi_value from_fn = GetNamed(env, array_ctor, "from");
+    napi_value out = CreateGlobalInstance(env, "Set");
+    napi_value add_fn = GetNamed(env, out, "add");
+    if (!IsFunction(env, from_fn) || out == nullptr || !IsFunction(env, add_fn)) return value;
+    if (seen_pairs != nullptr) seen_pairs->push_back({value, out});
+    napi_value argv[1] = {value};
+    if (napi_call_function(env, array_ctor, from_fn, 1, argv, &entries) != napi_ok || entries == nullptr) {
+      ClearPendingException(env);
+      return out;
+    }
+    uint32_t length = 0;
+    if (napi_get_array_length(env, entries, &length) != napi_ok) return out;
+    for (uint32_t i = 0; i < length; ++i) {
+      napi_value item = nullptr;
+      if (napi_get_element(env, entries, i, &item) != napi_ok || item == nullptr) continue;
+      napi_value transformed =
+          TransformTransferredValuesForQueue(env, item, transfer_list, transferred_ports, seen_pairs);
+      if (transformed == nullptr) return nullptr;
+      napi_value add_argv[1] = {transformed};
+      napi_value ignored = nullptr;
+      if (napi_call_function(env, out, add_fn, 1, add_argv, &ignored) != napi_ok) {
+        ClearPendingException(env);
+      }
+    }
+    return out;
+  }
+
+  if (!IsPlainObjectContainer(env, value)) {
+    return value;
+  }
+
+  napi_value out = CreateCloneTargetObject(env, value);
+  if (out == nullptr) return value;
+  if (seen_pairs != nullptr) seen_pairs->push_back({value, out});
+
+  napi_value keys = nullptr;
+  if (unofficial_napi_get_own_non_index_properties(env, value, napi_key_all_properties, &keys) != napi_ok ||
+      keys == nullptr) {
+    return out;
+  }
+  uint32_t key_count = 0;
+  if (napi_get_array_length(env, keys, &key_count) != napi_ok) return out;
+  for (uint32_t i = 0; i < key_count; ++i) {
+    napi_value key = nullptr;
+    if (napi_get_element(env, keys, i, &key) != napi_ok || key == nullptr) continue;
+    napi_value child = nullptr;
+    if (napi_get_property(env, value, key, &child) != napi_ok || child == nullptr) continue;
+    napi_value transformed =
+        TransformTransferredValuesForQueue(env, child, transfer_list, transferred_ports, seen_pairs);
+    if (transformed == nullptr) return nullptr;
+    napi_set_property(env, out, key, transformed);
+  }
+  return out;
 }
 
 bool TransferRootJSTransferableValueForQueue(
@@ -2439,8 +2653,20 @@ napi_value CloneMessageValue(napi_env env, napi_value value, napi_value transfer
   if (clone_input == nullptr) return nullptr;
 
   napi_value cloned = StructuredCloneJSTransferableValue(env, clone_input);
-  const napi_status clone_status =
-      cloned != nullptr ? napi_ok : unofficial_napi_structured_clone(env, clone_input, &cloned);
+  napi_status clone_status = napi_generic_failure;
+  if (cloned != nullptr) {
+    clone_status = napi_ok;
+  } else {
+    cloned = CallStructuredClone(env, clone_input);
+    clone_status = cloned != nullptr ? napi_ok : napi_generic_failure;
+  }
+  if (clone_status != napi_ok || cloned == nullptr) {
+    bool had_pending = false;
+    if (napi_is_exception_pending(env, &had_pending) == napi_ok && had_pending) {
+      ClearPendingException(env);
+    }
+    clone_status = unofficial_napi_structured_clone(env, clone_input, &cloned);
+  }
   if (clone_status != napi_ok || cloned == nullptr) {
     bool has_pending = false;
     if (napi_is_exception_pending(env, &has_pending) == napi_ok && has_pending) {
@@ -3041,10 +3267,9 @@ void EnqueueMessageToPort(napi_env env,
   queued.close_source_wrap = close_source_wrap;
   queued.transferred_ports = std::move(transferred_ports);
   if (!is_close && payload != nullptr) {
-    napi_value serialized_payload = PrepareTransferableDataForStructuredClone(env, payload, false);
-    if (serialized_payload == nullptr ||
-        unofficial_napi_serialize_value(env, serialized_payload, &queued.payload_data) != napi_ok ||
+    if (unofficial_napi_serialize_value(env, payload, &queued.payload_data) != napi_ok ||
         queued.payload_data == nullptr) {
+      ClearPendingException(env);
       for (auto& entry : queued.transferred_ports) {
         DeleteRefIfPresent(env, &entry.source_port_ref);
       }
@@ -3511,20 +3736,29 @@ napi_value MessagePortPostMessageCallback(napi_env env, napi_callback_info info)
       return nullptr;
     }
 
+    std::vector<ValueTransformPair> transferred_value_pairs;
+    napi_value transferred_payload =
+        TransformTransferredValuesForQueue(env, payload, transfer_list, &transferred_ports, &transferred_value_pairs);
+    if (transferred_payload == nullptr) {
+      DeleteTransferredPortRefs(env, &transferred_ports);
+      return nullptr;
+    }
+
     std::vector<ValueTransformPair> seen_pairs;
     napi_value transformed_payload =
-        TransformTransferredPortsForQueue(env, payload, transferred_ports, &seen_pairs);
+        TransformTransferredPortsForQueue(env, transferred_payload, transferred_ports, &seen_pairs);
 
     if (IsCloneableTransferableValue(env, transformed_payload)) {
       cloned_payload = CloneRootJSTransferableValueForQueue(env, transformed_payload);
     } else {
-      cloned_payload = CloneMessageValue(env, transformed_payload, normalized_transfer_arg);
+      cloned_payload = PrepareTransferableDataForStructuredClone(env, transformed_payload, true);
     }
     if (cloned_payload == nullptr) {
       DeleteTransferredPortRefs(env, &transferred_ports);
       return nullptr;
     }
   }
+  ClearPendingException(env);
   if (normalized_transfer_arg != nullptr && !ApplyArrayBufferTransfers(env, normalized_transfer_arg)) {
     DeleteTransferredPortRefs(env, &transferred_ports);
     return nullptr;

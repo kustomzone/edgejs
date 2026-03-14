@@ -35,6 +35,10 @@ const EdgeStreamBaseOps kJsStreamOps = {
     nullptr,
     JsStreamDestroy,
     nullptr,
+    nullptr,
+    nullptr,
+    nullptr,
+    nullptr,
 };
 
 bool GetThisAndWrap(napi_env env,

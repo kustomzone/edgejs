@@ -94,6 +94,10 @@ const EdgeStreamBaseOps kPipeOps = {
     PipeAfterClose,
     PipeDestroy,
     AcceptPendingHandleForIpc,
+    nullptr,
+    nullptr,
+    nullptr,
+    nullptr,
 };
 
 napi_value GetRefValue(napi_env env, napi_ref ref) {

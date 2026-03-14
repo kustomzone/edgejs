@@ -97,6 +97,14 @@ bool EmitAfterShutdownFrom(EdgeStreamListener* listener,
   return false;
 }
 
+bool EmitWantsWriteFrom(EdgeStreamListener* listener, size_t suggested_size) {
+  for (; listener != nullptr; listener = listener->previous) {
+    if (listener->on_wants_write == nullptr) continue;
+    if (listener->on_wants_write(listener, suggested_size)) return true;
+  }
+  return false;
+}
+
 }  // namespace
 
 bool EdgeStreamEmitAfterWrite(EdgeStreamListenerState* state,
@@ -113,6 +121,11 @@ bool EdgeStreamEmitAfterShutdown(EdgeStreamListenerState* state,
   return EmitAfterShutdownFrom(state->current, req_obj, status);
 }
 
+bool EdgeStreamEmitWantsWrite(EdgeStreamListenerState* state, size_t suggested_size) {
+  if (state == nullptr) return false;
+  return EmitWantsWriteFrom(state->current, suggested_size);
+}
+
 bool EdgeStreamPassAfterWrite(EdgeStreamListener* listener,
                              napi_value req_obj,
                              int status) {
@@ -123,6 +136,10 @@ bool EdgeStreamPassAfterShutdown(EdgeStreamListener* listener,
                                 napi_value req_obj,
                                 int status) {
   return EmitAfterShutdownFrom(listener != nullptr ? listener->previous : nullptr, req_obj, status);
+}
+
+bool EdgeStreamPassWantsWrite(EdgeStreamListener* listener, size_t suggested_size) {
+  return EmitWantsWriteFrom(listener != nullptr ? listener->previous : nullptr, suggested_size);
 }
 
 void EdgeStreamNotifyClosed(EdgeStreamListenerState* state) {

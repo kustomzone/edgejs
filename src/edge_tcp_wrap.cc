@@ -92,6 +92,10 @@ const EdgeStreamBaseOps kTcpOps = {
     TcpAfterClose,
     TcpDestroy,
     nullptr,
+    nullptr,
+    nullptr,
+    nullptr,
+    nullptr,
 };
 
 napi_value GetRefValue(napi_env env, napi_ref ref) {

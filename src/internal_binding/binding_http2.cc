@@ -25,6 +25,7 @@
 #include "internal_binding/helpers.h"
 #include "../edge_async_wrap.h"
 #include "../edge_runtime.h"
+#include "../edge_runtime_platform.h"
 #include "../edge_stream_base.h"
 #include "../edge_stream_wrap.h"
 
@@ -360,7 +361,7 @@ int Http2StreamWriteBufferDirect(EdgeStreamBase* base,
                                  napi_value req_obj,
                                  napi_value payload,
                                  bool* async_out) {
-  if (async_out != nullptr) *async_out = true;
+  if (async_out != nullptr) *async_out = false;
   if (base == nullptr || base->env == nullptr) return UV_EBADF;
 
   napi_value self = EdgeStreamBaseGetWrapper(base);
@@ -389,6 +390,9 @@ int Http2StreamWriteBufferDirect(EdgeStreamBase* base,
 const EdgeStreamBaseOps kHttp2StreamOps = {
     Http2StreamGetHandle,
     Http2StreamGetLibuvStream,
+    nullptr,
+    nullptr,
+    nullptr,
     nullptr,
     nullptr,
     nullptr,
@@ -1446,6 +1450,7 @@ void MaybeInvokeGracefulClose(Http2SessionWrap* session) {
 
 int FlushSessionOutput(Http2SessionWrap* session, napi_value req_obj = nullptr);
 void MaybeScheduleSessionFlush(Http2SessionWrap* session);
+void ScheduleSessionFlush(Http2SessionWrap* session);
 
 bool SessionHasPendingDataNow(Http2SessionWrap* session) {
   if (session == nullptr || session->session == nullptr) return false;
@@ -1455,9 +1460,6 @@ bool SessionHasPendingDataNow(Http2SessionWrap* session) {
   }
   const int want_write = nghttp2_session_want_write(session->session);
   const int want_read = nghttp2_session_want_read(session->session);
-  if (session->wants_graceful_close && session->streams.empty() && want_write == 0) {
-    return false;
-  }
   return want_write != 0 || want_read != 0;
 }
 
@@ -1868,6 +1870,9 @@ void MaybeStopParentReading(Http2SessionWrap* session) {
   if (!session->parent_write_in_progress && want_read != 0) {
     return;
   }
+  if (!session->parent_write_in_progress && want_read == 0 && session->streams.empty()) {
+    return;
+  }
   if (!IsParentReading(session)) {
     session->parent_reading_stopped = true;
     return;
@@ -1899,11 +1904,14 @@ void MaybeResumeParentReading(Http2SessionWrap* session) {
   }
 }
 
-napi_value DeferredFlushSessionOutput(napi_env env, napi_callback_info info) {
+napi_value DeferredFlushSessionOutputCallback(napi_env env, napi_callback_info info) {
+  napi_value self = nullptr;
   void* data = nullptr;
-  (void)napi_get_cb_info(env, info, nullptr, nullptr, nullptr, &data);
+  size_t argc = 0;
+  napi_get_cb_info(env, info, &argc, nullptr, &self, &data);
   auto* session = static_cast<Http2SessionWrap*>(data);
-  if (session == nullptr || session->destroyed || session->parent_write_in_progress || !session->write_scheduled) {
+  if (session == nullptr || env == nullptr || session->env != env || session->destroyed ||
+      session->parent_write_in_progress || !session->write_scheduled) {
     return Undefined(env);
   }
   session->write_scheduled = false;
@@ -1925,16 +1933,6 @@ void MaybeScheduleSessionFlush(Http2SessionWrap* session) {
 
 void ScheduleSessionFlush(Http2SessionWrap* session) {
   if (session == nullptr || session->env == nullptr) return;
-  napi_value callback = nullptr;
-  if (napi_create_function(session->env,
-                           "__ubiHttp2DeferredFlush",
-                           NAPI_AUTO_LENGTH,
-                           DeferredFlushSessionOutput,
-                           session,
-                           &callback) != napi_ok ||
-      callback == nullptr) {
-    return;
-  }
   napi_value global = GetGlobal(session->env);
   napi_value set_immediate = nullptr;
   napi_valuetype set_immediate_type = napi_undefined;
@@ -1943,11 +1941,30 @@ void ScheduleSessionFlush(Http2SessionWrap* session) {
       set_immediate == nullptr ||
       napi_typeof(session->env, set_immediate, &set_immediate_type) != napi_ok ||
       set_immediate_type != napi_function) {
+    session->write_scheduled = false;
+    (void)FlushSessionOutput(session);
     return;
   }
+
+  napi_value callback = nullptr;
+  if (napi_create_function(session->env,
+                           "__edgeHttp2DeferredFlushSessionOutput",
+                           NAPI_AUTO_LENGTH,
+                           DeferredFlushSessionOutputCallback,
+                           session,
+                           &callback) != napi_ok ||
+      callback == nullptr) {
+    session->write_scheduled = false;
+    (void)FlushSessionOutput(session);
+    return;
+  }
+
   napi_value argv[1] = {callback};
   napi_value ignored = nullptr;
-  (void)napi_call_function(session->env, global, set_immediate, 1, argv, &ignored);
+  if (napi_call_function(session->env, global, set_immediate, 1, argv, &ignored) != napi_ok) {
+    session->write_scheduled = false;
+    (void)FlushSessionOutput(session);
+  }
 }
 
 napi_value DeferredDestroyStreamCallback(napi_env env, napi_callback_info info) {
@@ -2106,6 +2123,9 @@ bool ParentStreamOnRead(EdgeStreamListener* listener, ssize_t nread, const uv_bu
     return nread >= 0;
   }
   if (nread < 0) {
+    session->parent_closed = true;
+    session->parent_stream_base = nullptr;
+    session->write_scheduled = false;
     ReleaseParentReadBuffer(buf);
     return false;
   }
@@ -2396,6 +2416,10 @@ ssize_t OnDataSourceRead(nghttp2_session*,
       CompleteStreamReq(stream, &stream->shutdown_req_ref, 0, true);
       return 0;
     }
+    EdgeStreamBaseEmitWantsWrite(&stream->base, length);
+    if (stream->available_outbound_length > 0 || stream->shutdown_requested) {
+      return OnDataSourceRead(nullptr, 0, buf, length, data_flags, source, nullptr);
+    }
     return NGHTTP2_ERR_DEFERRED;
   }
 
@@ -2614,17 +2638,9 @@ int OnFrameRecv(nghttp2_session*, const nghttp2_frame* frame, void* user_data) {
       if (pending_it == session->pending_headers.end()) break;
       PendingHeaderBlock pending_block = std::move(pending_it->second);
       session->pending_headers.erase(pending_it);
-      napi_value stream_obj = nullptr;
-      Http2StreamWrap* stream = nullptr;
       auto stream_it = session->streams.find(frame_id);
-      if (stream_it == session->streams.end()) {
-        if (!CreateStreamHandle(session, frame_id, pending_block.category, &stream_obj, &stream)) {
-          break;
-        }
-      } else {
-        stream = stream_it->second;
-        stream_obj = GetRefValue(session->env, stream != nullptr ? stream->wrapper_ref : nullptr);
-      }
+      Http2StreamWrap* stream = stream_it != session->streams.end() ? stream_it->second : nullptr;
+      napi_value stream_obj = GetRefValue(session->env, stream != nullptr ? stream->wrapper_ref : nullptr);
       if (stream == nullptr || stream_obj == nullptr) break;
       stream->current_category = pending_block.category;
       napi_value headers = nullptr;
@@ -2939,14 +2955,15 @@ napi_value SessionDestroy(napi_env env, napi_callback_info info) {
     bool socket_closed = false;
     if (argc >= 1) (void)napi_get_value_uint32(env, argv[0], &code);
     if (argc >= 2) (void)napi_get_value_bool(env, argv[1], &socket_closed);
+    const bool parent_gone = socket_closed || wrap->parent_closed;
     MaybeStopParentReading(wrap);
     ClearPendingParentRead(wrap);
-    if (socket_closed && wrap->parent_stream_base != nullptr) {
+    if (parent_gone && wrap->parent_stream_base != nullptr) {
       (void)EdgeStreamBaseRemoveListener(wrap->parent_stream_base, &wrap->parent_stream_listener);
       wrap->parent_stream_base = nullptr;
     }
-    if (socket_closed) wrap->parent_closed = true;
-    if (!socket_closed && wrap->session != nullptr) {
+    if (parent_gone) wrap->parent_closed = true;
+    if (!parent_gone && wrap->session != nullptr) {
       (void)nghttp2_session_terminate_session(wrap->session, code);
       (void)FlushSessionOutput(wrap);
     }
@@ -2957,7 +2974,7 @@ napi_value SessionDestroy(napi_env env, napi_callback_info info) {
       CompletePendingPing(env, &pending, false);
     }
     if (!wrap->parent_write_in_progress || wrap->parent_handle_ref == nullptr) {
-      NotifySessionDone(wrap, !socket_closed);
+      NotifySessionDone(wrap, !parent_gone);
     }
   }
   return Undefined(env);
@@ -3350,7 +3367,13 @@ napi_value SessionSetGracefulClose(napi_env env, napi_callback_info info) {
   Http2SessionWrap* wrap = UnwrapSession(env, self);
   if (wrap != nullptr) {
     wrap->wants_graceful_close = true;
-    MaybeResumeParentReading(wrap);
+    if (wrap->parent_reading_stopped && !wrap->destroyed && !wrap->parent_write_in_progress &&
+        wrap->parent_stream_base != nullptr) {
+      const int rc = EdgeStreamBaseReadStart(wrap->parent_stream_base);
+      if (rc == 0 || rc == UV_EALREADY) {
+        wrap->parent_reading_stopped = false;
+      }
+    }
     MaybeNotifyGracefulCloseComplete(wrap);
   }
   return Undefined(env);

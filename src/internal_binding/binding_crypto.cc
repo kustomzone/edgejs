@@ -38,6 +38,7 @@
 #include "edge_environment.h"
 #include "crypto/edge_secure_context_bridge.h"
 #include "edge_async_wrap.h"
+#include "edge_module_loader.h"
 #include "edge_runtime.h"
 #include "edge_runtime_platform.h"
 
@@ -75,10 +76,18 @@ struct CryptoBindingState {
   explicit CryptoBindingState(napi_env env_in) : env(env_in) {}
   ~CryptoBindingState() {
     ResetRef(env, &binding_ref);
+    ResetRef(env, &native_key_object_ctor_ref);
+    ResetRef(env, &secret_key_object_ctor_ref);
+    ResetRef(env, &public_key_object_ctor_ref);
+    ResetRef(env, &private_key_object_ctor_ref);
   }
 
   napi_env env = nullptr;
   napi_ref binding_ref = nullptr;
+  napi_ref native_key_object_ctor_ref = nullptr;
+  napi_ref secret_key_object_ctor_ref = nullptr;
+  napi_ref public_key_object_ctor_ref = nullptr;
+  napi_ref private_key_object_ctor_ref = nullptr;
   int32_t fips_mode = 0;
 };
 
@@ -3227,6 +3236,19 @@ struct KeyObjectWrap {
   bool has_key_passphrase = false;
 };
 
+struct NativeKeyObjectWrap {
+  napi_ref wrapper_ref = nullptr;
+  int32_t key_type = kKeyTypeSecret;
+  EVP_PKEY* native_pkey = nullptr;
+  std::vector<uint8_t> key_data;
+  std::vector<uint8_t> key_passphrase;
+  bool has_key_passphrase = false;
+};
+
+std::vector<uint8_t> ExportPublicDerSpki(EVP_PKEY* pkey);
+std::vector<uint8_t> ExportPrivateDerPkcs8(EVP_PKEY* pkey);
+napi_value CreateKeyObjectHandleValue(napi_env env, int32_t key_type, const std::vector<uint8_t>& key_data);
+
 std::vector<uint8_t> ExportPublicDerSpki(EVP_PKEY* pkey);
 std::vector<uint8_t> ExportPrivateDerPkcs8(EVP_PKEY* pkey);
 napi_value ExportJwkPublic(napi_env env,
@@ -3251,11 +3273,29 @@ void KeyObjectFinalize(napi_env env, void* data, void* /*hint*/) {
   delete wrap;
 }
 
+void NativeKeyObjectFinalize(napi_env env, void* data, void* /*hint*/) {
+  auto* wrap = static_cast<NativeKeyObjectWrap*>(data);
+  if (wrap == nullptr) return;
+  if (wrap->native_pkey != nullptr) {
+    EVP_PKEY_free(wrap->native_pkey);
+    wrap->native_pkey = nullptr;
+  }
+  ResetRef(env, &wrap->wrapper_ref);
+  delete wrap;
+}
+
 KeyObjectWrap* UnwrapKeyObject(napi_env env, napi_value this_arg) {
   if (this_arg == nullptr) return nullptr;
   void* data = nullptr;
   if (napi_unwrap(env, this_arg, &data) != napi_ok || data == nullptr) return nullptr;
   return static_cast<KeyObjectWrap*>(data);
+}
+
+NativeKeyObjectWrap* UnwrapNativeKeyObject(napi_env env, napi_value this_arg) {
+  if (this_arg == nullptr) return nullptr;
+  void* data = nullptr;
+  if (napi_unwrap(env, this_arg, &data) != napi_ok || data == nullptr) return nullptr;
+  return static_cast<NativeKeyObjectWrap*>(data);
 }
 
 bool GetNamedProperty(napi_env env, napi_value obj, const char* name, napi_value* out) {
@@ -3300,6 +3340,143 @@ void SetObjectInt32(napi_env env, napi_value obj, const char* name, int32_t valu
   if (napi_create_int32(env, value, &out) == napi_ok && out != nullptr) {
     napi_set_named_property(env, obj, name, out);
   }
+}
+
+bool ExtractNormalizedKeyCloneData(int32_t source_key_type,
+                                   EVP_PKEY* source_native_pkey,
+                                   const std::vector<uint8_t>& source_key_data,
+                                   const std::vector<uint8_t>& source_key_passphrase,
+                                   bool source_has_key_passphrase,
+                                   int32_t* key_type_out,
+                                   std::vector<uint8_t>* key_data_out) {
+  if (key_type_out != nullptr) *key_type_out = kKeyTypeSecret;
+  if (key_data_out != nullptr) key_data_out->clear();
+  if (key_type_out == nullptr || key_data_out == nullptr) return false;
+
+  *key_type_out = source_key_type;
+  if (source_key_type == kKeyTypeSecret) {
+    *key_data_out = source_key_data;
+    return true;
+  }
+
+  EVP_PKEY* pkey = nullptr;
+  if (source_native_pkey != nullptr) {
+    if (EVP_PKEY_up_ref(source_native_pkey) != 1) return false;
+    pkey = source_native_pkey;
+  } else if (source_key_type == kKeyTypePrivate) {
+    pkey = ParsePrivateKeyBytesWithPassphrase(
+        source_key_data.data(),
+        source_key_data.size(),
+        source_key_passphrase.data(),
+        source_key_passphrase.size(),
+        source_has_key_passphrase);
+  } else {
+    pkey = ParsePublicKeyBytes(source_key_data.data(), source_key_data.size());
+  }
+  if (pkey == nullptr) return false;
+
+  std::vector<uint8_t> normalized =
+      source_key_type == kKeyTypePublic ? ExportPublicDerSpki(pkey) : ExportPrivateDerPkcs8(pkey);
+  EVP_PKEY_free(pkey);
+  if (normalized.empty()) return false;
+  *key_data_out = std::move(normalized);
+  return true;
+}
+
+bool ExtractNormalizedKeyCloneData(KeyObjectWrap* source,
+                                   int32_t* key_type_out,
+                                   std::vector<uint8_t>* key_data_out) {
+  if (source == nullptr) return false;
+  return ExtractNormalizedKeyCloneData(source->key_type,
+                                       source->native_pkey,
+                                       source->key_data,
+                                       source->key_passphrase,
+                                       source->has_key_passphrase,
+                                       key_type_out,
+                                       key_data_out);
+}
+
+bool StoreNativeKeyObjectConstructorsFromExports(napi_env env, napi_value exports) {
+  if (env == nullptr || exports == nullptr) return false;
+  auto& state = EnsureState(env);
+  bool is_array = false;
+  if (napi_is_array(env, exports, &is_array) != napi_ok || !is_array) return false;
+
+  auto store_ctor = [&](uint32_t index, napi_ref* slot) -> bool {
+    napi_value ctor = nullptr;
+    napi_valuetype type = napi_undefined;
+    if (napi_get_element(env, exports, index, &ctor) != napi_ok ||
+        ctor == nullptr ||
+        napi_typeof(env, ctor, &type) != napi_ok ||
+        type != napi_function) {
+      return false;
+    }
+    ResetRef(env, slot);
+    return napi_create_reference(env, ctor, 1, slot) == napi_ok && *slot != nullptr;
+  };
+
+  return store_ctor(0, &state.native_key_object_ctor_ref) &&
+         store_ctor(1, &state.secret_key_object_ctor_ref) &&
+         store_ctor(2, &state.public_key_object_ctor_ref) &&
+         store_ctor(3, &state.private_key_object_ctor_ref);
+}
+
+bool EnsureNativeKeyObjectConstructorsLoaded(napi_env env) {
+  CryptoBindingState& state = EnsureState(env);
+  if (state.secret_key_object_ctor_ref != nullptr &&
+      state.public_key_object_ctor_ref != nullptr &&
+      state.private_key_object_ctor_ref != nullptr) {
+    return true;
+  }
+
+  napi_value ignored = nullptr;
+  if (!EdgeRequireBuiltin(env, "internal/crypto/keys", &ignored)) {
+    return false;
+  }
+
+  return state.secret_key_object_ctor_ref != nullptr &&
+         state.public_key_object_ctor_ref != nullptr &&
+         state.private_key_object_ctor_ref != nullptr;
+}
+
+napi_value CreateKeyObjectHandleValueFromCloneData(napi_env env, int32_t key_type, const std::vector<uint8_t>& key_data) {
+  return CreateKeyObjectHandleValue(env, key_type, key_data);
+}
+
+napi_value InstantiateKeyObjectFromCloneData(napi_env env, int32_t key_type, const std::vector<uint8_t>& key_data) {
+  if (!EnsureNativeKeyObjectConstructorsLoaded(env)) return nullptr;
+
+  CryptoBindingState& state = EnsureState(env);
+  napi_ref ctor_ref = nullptr;
+  switch (key_type) {
+    case kKeyTypeSecret:
+      ctor_ref = state.secret_key_object_ctor_ref;
+      break;
+    case kKeyTypePublic:
+      ctor_ref = state.public_key_object_ctor_ref;
+      break;
+    case kKeyTypePrivate:
+      ctor_ref = state.private_key_object_ctor_ref;
+      break;
+    default:
+      return nullptr;
+  }
+
+  napi_value ctor = GetRefValue(env, ctor_ref);
+  napi_valuetype ctor_type = napi_undefined;
+  if (ctor == nullptr || napi_typeof(env, ctor, &ctor_type) != napi_ok || ctor_type != napi_function) {
+    return nullptr;
+  }
+
+  napi_value handle = CreateKeyObjectHandleValueFromCloneData(env, key_type, key_data);
+  if (handle == nullptr || IsUndefined(env, handle)) return nullptr;
+
+  napi_value argv[1] = {handle};
+  napi_value out = nullptr;
+  if (napi_new_instance(env, ctor, 1, argv, &out) != napi_ok || out == nullptr) {
+    return nullptr;
+  }
+  return out;
 }
 
 std::string NormalizeDigestName(std::string in) {
@@ -8668,8 +8845,26 @@ napi_value CryptoCreateNativeKeyObjectClass(napi_env env, napi_callback_info inf
     napi_value argv[1] = {nullptr};
     napi_value this_arg = nullptr;
     napi_get_cb_info(env, info, &argc, argv, &this_arg, nullptr);
-    if (this_arg != nullptr && argc >= 1 && argv[0] != nullptr) {
-      napi_set_named_property(env, this_arg, "handle", argv[0]);
+    if (this_arg == nullptr) return Undefined(env);
+    auto* wrap = new NativeKeyObjectWrap();
+    if (napi_wrap(env, this_arg, wrap, NativeKeyObjectFinalize, nullptr, &wrap->wrapper_ref) != napi_ok) {
+      delete wrap;
+      return Undefined(env);
+    }
+
+    if (argc >= 1 && argv[0] != nullptr) {
+      KeyObjectWrap* handle = UnwrapKeyObject(env, argv[0]);
+      if (handle == nullptr) {
+        napi_throw(env, CreateErrorWithCode(env, "ERR_CRYPTO_OPERATION_FAILED", "Failed to clone key object"));
+        return nullptr;
+      }
+      wrap->key_type = handle->key_type;
+      wrap->key_data = handle->key_data;
+      wrap->key_passphrase = handle->key_passphrase;
+      wrap->has_key_passphrase = handle->has_key_passphrase;
+      if (handle->native_pkey != nullptr && EVP_PKEY_up_ref(handle->native_pkey) == 1) {
+        wrap->native_pkey = handle->native_pkey;
+      }
     }
     return this_arg != nullptr ? this_arg : Undefined(env);
   };
@@ -8691,6 +8886,7 @@ napi_value CryptoCreateNativeKeyObjectClass(napi_env env, napi_callback_info inf
   if (napi_call_function(env, global, argv[0], 1, call_argv, &out) != napi_ok || out == nullptr) {
     return Undefined(env);
   }
+  (void)StoreNativeKeyObjectConstructorsFromExports(env, out);
   return out;
 }
 
@@ -9335,6 +9531,56 @@ bool EdgeCryptoGetSecureContextHolderFromObject(napi_env env,
   if (wrap == nullptr) return false;
   *out = GetSecureContextHolderFromWrap(env, wrap);
   return *out != nullptr;
+}
+
+napi_value EdgeCryptoCreateNativeKeyObjectCloneData(napi_env env, napi_value value) {
+  NativeKeyObjectWrap* wrap = UnwrapNativeKeyObject(env, value);
+  if (wrap == nullptr) return nullptr;
+
+  int32_t key_type_value = kKeyTypeSecret;
+  std::vector<uint8_t> key_bytes;
+  if (!ExtractNormalizedKeyCloneData(wrap->key_type,
+                                     wrap->native_pkey,
+                                     wrap->key_data,
+                                     wrap->key_passphrase,
+                                     wrap->has_key_passphrase,
+                                     &key_type_value,
+                                     &key_bytes)) {
+    return nullptr;
+  }
+
+  napi_value data = nullptr;
+  napi_value key_type = nullptr;
+  napi_value key_data = nullptr;
+  if (napi_create_object(env, &data) != napi_ok || data == nullptr ||
+      napi_create_int32(env, key_type_value, &key_type) != napi_ok || key_type == nullptr ||
+      napi_set_named_property(env, data, "type", key_type) != napi_ok) {
+    return nullptr;
+  }
+
+  key_data = BytesToBuffer(env, key_bytes);
+  if (key_data == nullptr || napi_set_named_property(env, data, "data", key_data) != napi_ok) {
+    return nullptr;
+  }
+
+  return data;
+}
+
+napi_value EdgeCryptoCreateKeyObjectFromCloneData(napi_env env, napi_value data) {
+  if (data == nullptr) return nullptr;
+
+  napi_value type_value = nullptr;
+  napi_value key_value = nullptr;
+  int32_t key_type = kKeyTypeSecret;
+  if (napi_get_named_property(env, data, "type", &type_value) != napi_ok ||
+      type_value == nullptr ||
+      napi_get_value_int32(env, type_value, &key_type) != napi_ok ||
+      napi_get_named_property(env, data, "data", &key_value) != napi_ok ||
+      key_value == nullptr) {
+    return nullptr;
+  }
+
+  return InstantiateKeyObjectFromCloneData(env, key_type, ValueToBytes(env, key_value));
 }
 
 }  // namespace internal_binding

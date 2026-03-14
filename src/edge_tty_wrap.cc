@@ -74,6 +74,10 @@ const EdgeStreamBaseOps kTtyOps = {
     TtyAfterClose,
     TtyDestroy,
     nullptr,
+    nullptr,
+    nullptr,
+    nullptr,
+    nullptr,
 };
 
 napi_value GetThis(napi_env env,

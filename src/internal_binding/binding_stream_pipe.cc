@@ -2,29 +2,22 @@
 
 #include <algorithm>
 #include <cstdint>
-#include <cstring>
-#include <cstdio>
 #include <cstdlib>
-#include <fcntl.h>
-#include <sys/stat.h>
-#include <unordered_map>
-#include <vector>
 
 #include "edge_environment.h"
 #include "internal_binding/helpers.h"
+#include "../edge_stream_base.h"
 #include "../edge_stream_wrap.h"
-#include "uv.h"
 
 namespace internal_binding {
 
 namespace {
 
-bool IsStreamPipeDebugEnabled() {
-  const char* value = std::getenv("EDGE_STREAM_PIPE_DEBUG");
-  return value != nullptr && *value != '\0' && std::strcmp(value, "0") != 0;
+void DeleteRefIfPresent(napi_env env, napi_ref* ref) {
+  if (env == nullptr || ref == nullptr || *ref == nullptr) return;
+  napi_delete_reference(env, *ref);
+  *ref = nullptr;
 }
-
-void DeleteRefIfPresent(napi_env env, napi_ref* ref);
 
 struct StreamPipeBindingState {
   explicit StreamPipeBindingState(napi_env env_in) : env(env_in) {}
@@ -41,20 +34,21 @@ struct StreamPipeWrap {
   napi_ref wrapper_ref = nullptr;
   napi_ref source_ref = nullptr;
   napi_ref sink_ref = nullptr;
-  bool closed = false;
-  bool pump_scheduled = false;
-  bool source_kind_known = false;
-  bool source_is_fifo = false;
-  bool saw_source_data = false;
-  bool eof_pending = false;
+  EdgeStreamBase* source_base = nullptr;
+  EdgeStreamBase* sink_base = nullptr;
+  EdgeStreamListener readable_listener{};
+  EdgeStreamListener writable_listener{};
+  bool is_closed = true;
+  bool is_reading = false;
+  bool is_eof = false;
+  bool source_destroyed = false;
+  bool sink_destroyed = false;
+  bool source_listener_attached = false;
+  bool sink_listener_attached = false;
+  bool onunpipe_scheduled = false;
   uint32_t pending_writes = 0;
+  size_t wanted_data = 65536;
 };
-
-void DeleteRefIfPresent(napi_env env, napi_ref* ref) {
-  if (env == nullptr || ref == nullptr || *ref == nullptr) return;
-  napi_delete_reference(env, *ref);
-  *ref = nullptr;
-}
 
 StreamPipeBindingState& EnsureState(napi_env env) {
   return EdgeEnvironmentGetOrCreateSlotData<StreamPipeBindingState>(
@@ -69,47 +63,9 @@ napi_value GetRefValue(napi_env env, napi_ref ref) {
 }
 
 bool IsFunction(napi_env env, napi_value value) {
-  if (value == nullptr) return false;
+  if (env == nullptr || value == nullptr) return false;
   napi_valuetype type = napi_undefined;
   return napi_typeof(env, value, &type) == napi_ok && type == napi_function;
-}
-
-bool GetInt32Property(napi_env env, napi_value obj, const char* name, int32_t* out) {
-  if (out == nullptr) return false;
-  *out = 0;
-  if (env == nullptr || obj == nullptr || name == nullptr) return false;
-  napi_value value = nullptr;
-  return napi_get_named_property(env, obj, name, &value) == napi_ok &&
-         value != nullptr &&
-         napi_get_value_int32(env, value, out) == napi_ok;
-}
-
-bool GetInt64Property(napi_env env, napi_value obj, const char* name, int64_t* out) {
-  if (out == nullptr) return false;
-  *out = 0;
-  if (env == nullptr || obj == nullptr || name == nullptr) return false;
-  napi_value value = nullptr;
-  return napi_get_named_property(env, obj, name, &value) == napi_ok &&
-         value != nullptr &&
-         napi_get_value_int64(env, value, out) == napi_ok;
-}
-
-bool CallNamedIntMethod(napi_env env,
-                        napi_value recv,
-                        const char* name,
-                        size_t argc,
-                        napi_value* argv,
-                        int32_t* out) {
-  if (out == nullptr) return false;
-  *out = 0;
-  if (env == nullptr || recv == nullptr || name == nullptr) return false;
-  napi_value fn = nullptr;
-  napi_value result = nullptr;
-  return napi_get_named_property(env, recv, name, &fn) == napi_ok &&
-         IsFunction(env, fn) &&
-         napi_call_function(env, recv, fn, argc, argv, &result) == napi_ok &&
-         result != nullptr &&
-         napi_get_value_int32(env, result, out) == napi_ok;
 }
 
 StreamPipeWrap* UnwrapPipe(napi_env env, napi_value value) {
@@ -119,262 +75,312 @@ StreamPipeWrap* UnwrapPipe(napi_env env, napi_value value) {
   return wrap;
 }
 
-void StreamPipeFinalize(napi_env env, void* data, void* /*hint*/) {
-  auto* wrap = static_cast<StreamPipeWrap*>(data);
-  if (wrap == nullptr) return;
-  DeleteRefIfPresent(env, &wrap->source_ref);
-  DeleteRefIfPresent(env, &wrap->sink_ref);
-  DeleteRefIfPresent(env, &wrap->wrapper_ref);
-  delete wrap;
+void FreeOwnedBuffer(napi_env /*env*/, void* data, void* /*hint*/) {
+  free(data);
 }
 
-void CallOnUnpipe(napi_env env, napi_value self) {
-  if (env == nullptr || self == nullptr) return;
-  napi_value onunpipe = nullptr;
-  if (napi_get_named_property(env, self, "onunpipe", &onunpipe) != napi_ok || !IsFunction(env, onunpipe)) return;
-  napi_value ignored = nullptr;
-  (void)napi_call_function(env, self, onunpipe, 0, nullptr, &ignored);
-}
-
-void ClearLinks(napi_env env, napi_value self, StreamPipeWrap* wrap) {
-  napi_value null_value = nullptr;
-  napi_get_null(env, &null_value);
-  if (self != nullptr) {
+void ClearLinks(napi_env env, napi_value self, StreamPipeWrap* wrap, bool clear_js_links) {
+  if (clear_js_links && env != nullptr && self != nullptr) {
+    napi_value null_value = nullptr;
+    napi_get_null(env, &null_value);
+    napi_value source = nullptr;
+    napi_value sink = nullptr;
+    (void)napi_get_named_property(env, self, "source", &source);
+    (void)napi_get_named_property(env, self, "sink", &sink);
     (void)napi_set_named_property(env, self, "source", null_value);
     (void)napi_set_named_property(env, self, "sink", null_value);
+    if (source != nullptr && !IsUndefined(env, source)) {
+      (void)napi_set_named_property(env, source, "pipeTarget", null_value);
+    }
+    if (sink != nullptr && !IsUndefined(env, sink)) {
+      (void)napi_set_named_property(env, sink, "pipeSource", null_value);
+    }
   }
   if (wrap == nullptr) return;
   DeleteRefIfPresent(env, &wrap->source_ref);
   DeleteRefIfPresent(env, &wrap->sink_ref);
 }
 
-void ClosePipe(napi_env env, napi_value self, StreamPipeWrap* wrap) {
-  if (wrap == nullptr || wrap->closed) return;
-  wrap->closed = true;
-  wrap->pump_scheduled = false;
-  CallOnUnpipe(env, self);
-  ClearLinks(env, self, wrap);
+napi_value DeferredOnUnpipeCallback(napi_env env, napi_callback_info info) {
+  napi_value self = nullptr;
+  void* data = nullptr;
+  size_t argc = 0;
+  napi_get_cb_info(env, info, &argc, nullptr, &self, &data);
+  auto* wrap = static_cast<StreamPipeWrap*>(data);
+  if (wrap == nullptr || wrap->env != env) return Undefined(env);
+  wrap->onunpipe_scheduled = false;
+
+  napi_value pipe_self = GetRefValue(env, wrap->wrapper_ref);
+  if (pipe_self == nullptr) return Undefined(env);
+
+  napi_value onunpipe = nullptr;
+  if (napi_get_named_property(env, pipe_self, "onunpipe", &onunpipe) == napi_ok && IsFunction(env, onunpipe)) {
+    napi_value ignored = nullptr;
+    (void)napi_call_function(env, pipe_self, onunpipe, 0, nullptr, &ignored);
+  }
+  ClearLinks(env, pipe_self, wrap, true);
+  return Undefined(env);
 }
 
-void NotifySourceRead(napi_env env, napi_value source, int32_t status) {
-  if (env == nullptr || source == nullptr) return;
-  if (IsStreamPipeDebugEnabled()) {
-    std::fprintf(stderr, "STREAM_PIPE notify source status=%d\n", status);
-  }
-  int32_t* state = EdgeGetStreamBaseState(env);
-  if (state != nullptr) {
-    state[kEdgeReadBytesOrError] = status;
-    state[kEdgeArrayBufferOffset] = 0;
-  }
-  napi_value onread = nullptr;
-  if (napi_get_named_property(env, source, "onread", &onread) != napi_ok || !IsFunction(env, onread)) return;
-  napi_value ignored = nullptr;
-  (void)napi_call_function(env, source, onread, 0, nullptr, &ignored);
-}
-
-void MaybeFinishPipeAfterWrites(napi_env env, napi_value self, StreamPipeWrap* wrap) {
-  if (env == nullptr || self == nullptr || wrap == nullptr || wrap->closed || !wrap->eof_pending ||
-      wrap->pending_writes != 0) {
+void ScheduleOnUnpipe(napi_env env, StreamPipeWrap* wrap) {
+  if (env == nullptr || wrap == nullptr || wrap->onunpipe_scheduled) return;
+  napi_value global = GetGlobal(env);
+  napi_value set_immediate = nullptr;
+  napi_valuetype set_immediate_type = napi_undefined;
+  if (global == nullptr ||
+      napi_get_named_property(env, global, "setImmediate", &set_immediate) != napi_ok ||
+      set_immediate == nullptr ||
+      napi_typeof(env, set_immediate, &set_immediate_type) != napi_ok ||
+      set_immediate_type != napi_function) {
+    napi_value pipe_self = GetRefValue(env, wrap->wrapper_ref);
+    if (pipe_self != nullptr) ClearLinks(env, pipe_self, wrap, true);
     return;
   }
-  napi_value sink = GetRefValue(env, wrap->sink_ref);
-  napi_value source = GetRefValue(env, wrap->source_ref);
-  int32_t rc = 0;
-  if (sink != nullptr) {
-    napi_value shutdown_req = EdgeCreateStreamReqObject(env);
-    napi_value argv[1] = {shutdown_req != nullptr ? shutdown_req : Undefined(env)};
-    (void)CallNamedIntMethod(env, sink, "shutdown", 1, argv, &rc);
-  }
-  if (source != nullptr) {
-    NotifySourceRead(env, source, UV_EOF);
-  }
-  ClosePipe(env, self, wrap);
-}
 
-napi_value StreamPipeWriteComplete(napi_env env, napi_callback_info info) {
-  void* data = nullptr;
-  napi_value self = nullptr;
-  napi_get_cb_info(env, info, nullptr, nullptr, &self, &data);
-  auto* wrap = static_cast<StreamPipeWrap*>(data);
-  if (wrap == nullptr || wrap->pending_writes == 0) return Undefined(env);
-  wrap->pending_writes--;
-  napi_value pipe_self = GetRefValue(env, wrap->wrapper_ref);
-  if (pipe_self == nullptr) pipe_self = self;
-  MaybeFinishPipeAfterWrites(env, pipe_self, wrap);
-  return Undefined(env);
-}
-
-bool PipeFileHandleToHttp2Stream(napi_env env, napi_value source, napi_value sink, napi_value self, StreamPipeWrap* wrap) {
-  if (env == nullptr || source == nullptr || sink == nullptr || self == nullptr || wrap == nullptr) return false;
-
-  int32_t fd = -1;
-  int64_t offset = 0;
-  int64_t remaining = -1;
-  if (!GetInt32Property(env, source, "fd", &fd) || fd < 0) {
-    ClosePipe(env, self, wrap);
-    return false;
-  }
-  if (!wrap->source_kind_known) {
-    struct stat st;
-    if (fstat(fd, &st) == 0) {
-      wrap->source_is_fifo = S_ISFIFO(st.st_mode);
-    }
-    wrap->source_kind_known = true;
-  }
-  (void)GetInt64Property(env, source, "offset", &offset);
-  (void)GetInt64Property(env, source, "length", &remaining);
-
-  int flags = fcntl(fd, F_GETFL, 0);
-  if (flags >= 0) {
-    (void)fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-  }
-
-  constexpr size_t kChunkSize = 64 * 1024;
-  int32_t rc = 0;
-  for (;;) {
-    if (wrap->closed) return true;
-    size_t read_len = kChunkSize;
-    if (remaining >= 0) {
-      if (remaining == 0) break;
-      read_len = static_cast<size_t>(std::min<int64_t>(remaining, static_cast<int64_t>(kChunkSize)));
-    }
-
-    std::vector<char> storage(read_len);
-    uv_buf_t buf = uv_buf_init(storage.data(), static_cast<unsigned int>(storage.size()));
-    uv_fs_t req;
-    std::memset(&req, 0, sizeof(req));
-    const int64_t read_offset = wrap->source_is_fifo ? -1 : offset;
-    const int read_rc = static_cast<int>(uv_fs_read(nullptr, &req, fd, &buf, 1, read_offset, nullptr));
-    uv_fs_req_cleanup(&req);
-    if (read_rc == UV_EAGAIN) {
-      if (IsStreamPipeDebugEnabled()) {
-        std::fprintf(stderr, "STREAM_PIPE read rc=UV_EAGAIN offset=%lld remaining=%lld saw_data=%d fifo=%d\n",
-                     static_cast<long long>(offset),
-                     static_cast<long long>(remaining),
-                     wrap->saw_source_data ? 1 : 0,
-                     wrap->source_is_fifo ? 1 : 0);
-      }
-      return true;
-    }
-    if (read_rc < 0) {
-      if (IsStreamPipeDebugEnabled()) {
-        std::fprintf(stderr, "STREAM_PIPE read rc=%d offset=%lld remaining=%lld\n",
-                     read_rc,
-                     static_cast<long long>(offset),
-                     static_cast<long long>(remaining));
-      }
-      NotifySourceRead(env, source, read_rc);
-      ClosePipe(env, self, wrap);
-      return false;
-    }
-    if (read_rc == 0) {
-      if (IsStreamPipeDebugEnabled()) {
-        std::fprintf(stderr, "STREAM_PIPE read rc=0 offset=%lld remaining=%lld saw_data=%d fifo=%d\n",
-                     static_cast<long long>(offset),
-                     static_cast<long long>(remaining),
-                     wrap->saw_source_data ? 1 : 0,
-                     wrap->source_is_fifo ? 1 : 0);
-      }
-      if (wrap->source_is_fifo && !wrap->saw_source_data) {
-        return true;
-      }
-      break;
-    }
-
-    if (!wrap->source_is_fifo) {
-      offset += read_rc;
-    }
-    if (remaining >= 0) remaining -= read_rc;
-    wrap->saw_source_data = true;
-
-    napi_value req_obj = EdgeCreateStreamReqObject(env);
-    napi_value chunk = nullptr;
-    void* copy = nullptr;
-    napi_value oncomplete = nullptr;
-    if (req_obj == nullptr ||
-        napi_create_function(env,
-                             "__ubiStreamPipeWriteComplete",
-                             NAPI_AUTO_LENGTH,
-                             StreamPipeWriteComplete,
-                             wrap,
-                             &oncomplete) != napi_ok ||
-        oncomplete == nullptr ||
-        napi_set_named_property(env, req_obj, "oncomplete", oncomplete) != napi_ok ||
-        napi_create_buffer_copy(env, read_rc, storage.data(), &copy, &chunk) != napi_ok ||
-        chunk == nullptr) {
-      ClosePipe(env, self, wrap);
-      return false;
-    }
-    wrap->pending_writes++;
-    napi_value argv[2] = {req_obj, chunk};
-    if (!CallNamedIntMethod(env, sink, "writeBuffer", 2, argv, &rc) || rc < 0) {
-      if (IsStreamPipeDebugEnabled()) {
-        std::fprintf(stderr, "STREAM_PIPE sink write rc=%d\n", rc);
-      }
-      if (wrap->pending_writes > 0) wrap->pending_writes--;
-      NotifySourceRead(env, source, rc < 0 ? rc : UV_EIO);
-      ClosePipe(env, self, wrap);
-      return false;
-    }
-    int32_t* state = EdgeGetStreamBaseState(env);
-    if (state == nullptr || state[kEdgeLastWriteWasAsync] == 0) {
-      if (wrap->pending_writes > 0) wrap->pending_writes--;
-    }
-  }
-
-  wrap->eof_pending = true;
-  MaybeFinishPipeAfterWrites(env, self, wrap);
-  return true;
-}
-
-void SchedulePipePump(StreamPipeWrap* wrap);
-
-napi_value DeferredPipePump(napi_env env, napi_callback_info info) {
-  void* data = nullptr;
-  napi_get_cb_info(env, info, nullptr, nullptr, nullptr, &data);
-  auto* wrap = static_cast<StreamPipeWrap*>(data);
-  if (wrap == nullptr || wrap->closed) return Undefined(env);
-  wrap->pump_scheduled = false;
-  napi_value self = GetRefValue(env, wrap->wrapper_ref);
-  napi_value source = GetRefValue(env, wrap->source_ref);
-  napi_value sink = GetRefValue(env, wrap->sink_ref);
-  if (self == nullptr || source == nullptr || sink == nullptr) {
-    ClosePipe(env, self, wrap);
-    return Undefined(env);
-  }
-  const bool done = PipeFileHandleToHttp2Stream(env, source, sink, self, wrap);
-  if (!wrap->closed && !wrap->eof_pending && done) {
-    SchedulePipePump(wrap);
-  }
-  return Undefined(env);
-}
-
-void SchedulePipePump(StreamPipeWrap* wrap) {
-  if (wrap == nullptr || wrap->closed || wrap->pump_scheduled || wrap->env == nullptr) return;
   napi_value callback = nullptr;
-  if (napi_create_function(wrap->env,
-                           "__ubiStreamPipePump",
+  if (napi_create_function(env,
+                           "__edgeStreamPipeDeferredOnUnpipe",
                            NAPI_AUTO_LENGTH,
-                           DeferredPipePump,
+                           DeferredOnUnpipeCallback,
                            wrap,
                            &callback) != napi_ok ||
       callback == nullptr) {
+    napi_value pipe_self = GetRefValue(env, wrap->wrapper_ref);
+    if (pipe_self != nullptr) ClearLinks(env, pipe_self, wrap, true);
     return;
   }
-  napi_value global = GetGlobal(wrap->env);
-  napi_value set_immediate = nullptr;
-  napi_valuetype type = napi_undefined;
-  if (global == nullptr ||
-      napi_get_named_property(wrap->env, global, "setImmediate", &set_immediate) != napi_ok ||
-      set_immediate == nullptr ||
-      napi_typeof(wrap->env, set_immediate, &type) != napi_ok ||
-      type != napi_function) {
-    return;
-  }
-  wrap->pump_scheduled = true;
+
+  wrap->onunpipe_scheduled = true;
   napi_value argv[1] = {callback};
   napi_value ignored = nullptr;
-  (void)napi_call_function(wrap->env, global, set_immediate, 1, argv, &ignored);
+  (void)napi_call_function(env, global, set_immediate, 1, argv, &ignored);
+}
+
+void RemoveListeners(StreamPipeWrap* wrap) {
+  if (wrap == nullptr) return;
+  if (wrap->source_listener_attached && wrap->source_base != nullptr) {
+    (void)EdgeStreamBaseRemoveListener(wrap->source_base, &wrap->readable_listener);
+    wrap->source_listener_attached = false;
+  }
+  if (wrap->sink_listener_attached && wrap->sink_base != nullptr && wrap->pending_writes == 0) {
+    (void)EdgeStreamBaseRemoveListener(wrap->sink_base, &wrap->writable_listener);
+    wrap->sink_listener_attached = false;
+  }
+}
+
+void UnpipeInternal(napi_env env, napi_value self, StreamPipeWrap* wrap, bool in_deletion) {
+  if (wrap == nullptr || wrap->is_closed) return;
+
+  if (!wrap->source_destroyed && wrap->source_base != nullptr) {
+    (void)EdgeStreamBaseReadStop(wrap->source_base);
+  }
+
+  wrap->is_closed = true;
+  wrap->is_reading = false;
+  RemoveListeners(wrap);
+
+  if (in_deletion) {
+    ClearLinks(env, nullptr, wrap, false);
+    return;
+  }
+
+  ScheduleOnUnpipe(env, wrap);
+}
+
+bool MakeBufferFromOwnedBytes(napi_env env, char* data, size_t len, napi_value* out) {
+  if (out == nullptr) return false;
+  *out = nullptr;
+  if (env == nullptr || data == nullptr) return false;
+
+  if (napi_create_external_buffer(env, len, data, FreeOwnedBuffer, nullptr, out) == napi_ok && *out != nullptr) {
+    return true;
+  }
+
+  void* copy = nullptr;
+  if (napi_create_buffer_copy(env, len, data, &copy, out) == napi_ok && *out != nullptr) {
+    free(data);
+    return true;
+  }
+
+  free(data);
+  return false;
+}
+
+void ShutdownSinkAndUnpipe(StreamPipeWrap* wrap, napi_value self) {
+  if (wrap == nullptr || wrap->env == nullptr) return;
+  if (wrap->sink_base != nullptr) {
+    napi_value req_obj = EdgeCreateStreamReqObject(wrap->env);
+    if (req_obj != nullptr) {
+      const int rc = EdgeStreamBaseShutdownDirect(wrap->sink_base, req_obj);
+      if (rc != 0 && rc != 1 && rc != UV_ENOTCONN) {
+        EdgeStreamBaseInvokeReqOnComplete(wrap->env, req_obj, rc, nullptr, 0);
+      }
+    }
+  }
+  UnpipeInternal(wrap->env, self, wrap, false);
+}
+
+bool ReadableOnRead(EdgeStreamListener* listener, ssize_t nread, const uv_buf_t* buf);
+
+void StartReading(StreamPipeWrap* wrap, size_t suggested_size) {
+  if (wrap == nullptr || wrap->is_closed || wrap->source_base == nullptr || wrap->source_destroyed ||
+      wrap->sink_destroyed || wrap->pending_writes != 0 || wrap->is_reading) {
+    return;
+  }
+
+  wrap->wanted_data = suggested_size;
+  wrap->is_reading = true;
+  const int rc = EdgeStreamBaseReadStart(wrap->source_base);
+  if (rc == 0) return;
+
+  wrap->is_reading = false;
+  ReadableOnRead(&wrap->readable_listener, rc == 1 ? UV_EOF : rc, nullptr);
+}
+
+uv_buf_t ReadableAlloc(size_t suggested_size) {
+  char* storage = static_cast<char*>(malloc(suggested_size));
+  if (storage == nullptr && suggested_size > 0) return uv_buf_init(nullptr, 0);
+  return uv_buf_init(storage, static_cast<unsigned int>(suggested_size));
+}
+
+bool ReadableOnAlloc(EdgeStreamListener* listener, size_t suggested_size, uv_buf_t* out) {
+  if (listener == nullptr || out == nullptr) return false;
+  auto* wrap = static_cast<StreamPipeWrap*>(listener->data);
+  if (wrap == nullptr) return false;
+  const size_t wanted = wrap->wanted_data == 0 ? suggested_size : std::min(suggested_size, wrap->wanted_data);
+  *out = ReadableAlloc(wanted == 0 ? suggested_size : wanted);
+  return out->base != nullptr || out->len == 0;
+}
+
+bool WritableOnAfterWrite(EdgeStreamListener* listener, napi_value req_obj, int status);
+bool WritableOnWantsWrite(EdgeStreamListener* listener, size_t suggested_size);
+
+bool ProcessData(StreamPipeWrap* wrap, ssize_t nread, const uv_buf_t* buf) {
+  if (wrap == nullptr || wrap->env == nullptr || wrap->sink_base == nullptr || buf == nullptr || buf->base == nullptr ||
+      nread <= 0) {
+    return false;
+  }
+
+  napi_value payload = nullptr;
+  if (!MakeBufferFromOwnedBytes(wrap->env, buf->base, static_cast<size_t>(nread), &payload)) {
+    return false;
+  }
+
+  napi_value req_obj = EdgeCreateStreamReqObject(wrap->env);
+  if (req_obj == nullptr) return false;
+
+  bool async = false;
+  wrap->pending_writes++;
+  const int rc = EdgeStreamBaseWriteBufferDirect(wrap->sink_base, req_obj, payload, &async);
+  if (!async) {
+    return WritableOnAfterWrite(&wrap->writable_listener, req_obj, rc);
+  }
+
+  wrap->is_reading = false;
+  if (wrap->source_base != nullptr) {
+    (void)EdgeStreamBaseReadStop(wrap->source_base);
+  }
+  return rc == 0;
+}
+
+bool ReadableOnRead(EdgeStreamListener* listener, ssize_t nread, const uv_buf_t* buf) {
+  if (listener == nullptr) return false;
+  auto* wrap = static_cast<StreamPipeWrap*>(listener->data);
+  if (wrap == nullptr || wrap->env == nullptr) return false;
+
+  if (nread < 0) {
+    wrap->is_reading = false;
+    wrap->is_eof = true;
+    if (buf != nullptr && buf->base != nullptr) free(buf->base);
+    if (listener->previous != nullptr && listener->previous->on_read != nullptr) {
+      uv_buf_t empty = uv_buf_init(nullptr, 0);
+      (void)listener->previous->on_read(listener->previous, nread, &empty);
+    }
+    if (wrap->pending_writes == 0) {
+      napi_value self = GetRefValue(wrap->env, wrap->wrapper_ref);
+      ShutdownSinkAndUnpipe(wrap, self);
+    }
+    return true;
+  }
+
+  return ProcessData(wrap, nread, buf);
+}
+
+bool WritableOnAfterWrite(EdgeStreamListener* listener, napi_value req_obj, int status) {
+  if (listener == nullptr) return false;
+  auto* wrap = static_cast<StreamPipeWrap*>(listener->data);
+  if (wrap == nullptr || wrap->env == nullptr) return false;
+
+  if (wrap->pending_writes > 0) wrap->pending_writes--;
+
+  if (wrap->is_closed) {
+    RemoveListeners(wrap);
+    return true;
+  }
+
+  if (wrap->is_eof) {
+    napi_value self = GetRefValue(wrap->env, wrap->wrapper_ref);
+    ShutdownSinkAndUnpipe(wrap, self);
+    return true;
+  }
+
+  if (status != 0) {
+    (void)EdgeStreamPassAfterWrite(listener, req_obj, status);
+    napi_value self = GetRefValue(wrap->env, wrap->wrapper_ref);
+    UnpipeInternal(wrap->env, self, wrap, false);
+    return true;
+  }
+
+  StartReading(wrap, 65536);
+  return true;
+}
+
+bool WritableOnAfterShutdown(EdgeStreamListener* listener, napi_value req_obj, int status) {
+  if (listener == nullptr) return false;
+  auto* wrap = static_cast<StreamPipeWrap*>(listener->data);
+  if (wrap == nullptr) return false;
+  (void)EdgeStreamPassAfterShutdown(listener, req_obj, status);
+  napi_value self = GetRefValue(wrap->env, wrap->wrapper_ref);
+  UnpipeInternal(wrap->env, self, wrap, false);
+  return true;
+}
+
+bool WritableOnWantsWrite(EdgeStreamListener* listener, size_t suggested_size) {
+  if (listener == nullptr) return false;
+  auto* wrap = static_cast<StreamPipeWrap*>(listener->data);
+  if (wrap == nullptr) return false;
+  wrap->wanted_data = suggested_size;
+  StartReading(wrap, suggested_size);
+  return true;
+}
+
+void ReadableOnClose(EdgeStreamListener* listener) {
+  if (listener == nullptr) return;
+  auto* wrap = static_cast<StreamPipeWrap*>(listener->data);
+  if (wrap == nullptr) return;
+  wrap->source_destroyed = true;
+  if (!wrap->is_eof) {
+    (void)ReadableOnRead(listener, UV_EPIPE, nullptr);
+  }
+}
+
+void WritableOnClose(EdgeStreamListener* listener) {
+  if (listener == nullptr) return;
+  auto* wrap = static_cast<StreamPipeWrap*>(listener->data);
+  if (wrap == nullptr) return;
+  wrap->sink_destroyed = true;
+  wrap->is_eof = true;
+  wrap->pending_writes = 0;
+  napi_value self = GetRefValue(wrap->env, wrap->wrapper_ref);
+  UnpipeInternal(wrap->env, self, wrap, false);
+}
+
+void StreamPipeFinalize(napi_env env, void* data, void* /*hint*/) {
+  auto* wrap = static_cast<StreamPipeWrap*>(data);
+  if (wrap == nullptr) return;
+  UnpipeInternal(env, nullptr, wrap, true);
+  DeleteRefIfPresent(env, &wrap->wrapper_ref);
+  delete wrap;
 }
 
 napi_value StreamPipeCtor(napi_env env, napi_callback_info info) {
@@ -385,6 +391,16 @@ napi_value StreamPipeCtor(napi_env env, napi_callback_info info) {
 
   auto* wrap = new StreamPipeWrap();
   wrap->env = env;
+  wrap->readable_listener.on_alloc = ReadableOnAlloc;
+  wrap->readable_listener.on_read = ReadableOnRead;
+  wrap->readable_listener.on_close = ReadableOnClose;
+  wrap->readable_listener.data = wrap;
+  wrap->writable_listener.on_after_write = WritableOnAfterWrite;
+  wrap->writable_listener.on_after_shutdown = WritableOnAfterShutdown;
+  wrap->writable_listener.on_wants_write = WritableOnWantsWrite;
+  wrap->writable_listener.on_close = WritableOnClose;
+  wrap->writable_listener.data = wrap;
+
   if (napi_wrap(env, self, wrap, StreamPipeFinalize, nullptr, &wrap->wrapper_ref) != napi_ok) {
     delete wrap;
     return nullptr;
@@ -396,32 +412,48 @@ napi_value StreamPipeCtor(napi_env env, napi_callback_info info) {
   napi_value sink = argc >= 2 && argv[1] != nullptr ? argv[1] : null_value;
   if (source != nullptr && !IsUndefined(env, source)) {
     (void)napi_create_reference(env, source, 1, &wrap->source_ref);
+    wrap->source_base = EdgeStreamBaseFromValue(env, source);
   }
   if (sink != nullptr && !IsUndefined(env, sink)) {
     (void)napi_create_reference(env, sink, 1, &wrap->sink_ref);
+    wrap->sink_base = EdgeStreamBaseFromValue(env, sink);
   }
+
+  if (wrap->source_base != nullptr) {
+    (void)EdgeStreamBasePushListener(wrap->source_base, &wrap->readable_listener);
+    wrap->source_listener_attached = true;
+  }
+  if (wrap->sink_base != nullptr) {
+    (void)EdgeStreamBasePushListener(wrap->sink_base, &wrap->writable_listener);
+    wrap->sink_listener_attached = true;
+  }
+
   (void)napi_set_named_property(env, self, "source", source != nullptr ? source : null_value);
   (void)napi_set_named_property(env, self, "sink", sink != nullptr ? sink : null_value);
+  if (source != nullptr && !IsUndefined(env, source)) {
+    (void)napi_set_named_property(env, source, "pipeTarget", self);
+  }
+  if (sink != nullptr && !IsUndefined(env, sink)) {
+    (void)napi_set_named_property(env, sink, "pipeSource", self);
+  }
   (void)napi_set_named_property(env, self, "onunpipe", Undefined(env));
   return self;
 }
 
- napi_value StreamPipeStart(napi_env env, napi_callback_info info) {
+napi_value StreamPipeStart(napi_env env, napi_callback_info info) {
   napi_value self = nullptr;
   size_t argc = 0;
   napi_get_cb_info(env, info, &argc, nullptr, &self, nullptr);
   StreamPipeWrap* wrap = UnwrapPipe(env, self);
-  if (wrap == nullptr || wrap->closed) return Undefined(env);
-  napi_value source = GetRefValue(env, wrap->source_ref);
-  napi_value sink = GetRefValue(env, wrap->sink_ref);
-  if (source == nullptr || sink == nullptr) {
-    ClosePipe(env, self, wrap);
+  if (wrap == nullptr) return Undefined(env);
+
+  wrap->is_closed = false;
+  if (wrap->source_base == nullptr || wrap->sink_base == nullptr) {
+    UnpipeInternal(env, self, wrap, false);
     return Undefined(env);
   }
-  const bool needs_retry = PipeFileHandleToHttp2Stream(env, source, sink, self, wrap);
-  if (!wrap->closed && !wrap->eof_pending && needs_retry) {
-    SchedulePipePump(wrap);
-  }
+
+  (void)WritableOnWantsWrite(&wrap->writable_listener, 65536);
   return Undefined(env);
 }
 
@@ -430,8 +462,8 @@ napi_value StreamPipeUnpipe(napi_env env, napi_callback_info info) {
   size_t argc = 0;
   napi_get_cb_info(env, info, &argc, nullptr, &self, nullptr);
   StreamPipeWrap* wrap = UnwrapPipe(env, self);
-  if (wrap != nullptr && !wrap->closed) {
-    ClosePipe(env, self, wrap);
+  if (wrap != nullptr) {
+    UnpipeInternal(env, self, wrap, false);
   }
   return Undefined(env);
 }
@@ -442,13 +474,17 @@ napi_value StreamPipeIsClosed(napi_env env, napi_callback_info info) {
   napi_get_cb_info(env, info, &argc, nullptr, &self, nullptr);
   StreamPipeWrap* wrap = UnwrapPipe(env, self);
   napi_value out = nullptr;
-  napi_get_boolean(env, wrap != nullptr ? wrap->closed : true, &out);
+  napi_get_boolean(env, wrap != nullptr ? wrap->is_closed : true, &out);
   return out != nullptr ? out : Undefined(env);
 }
 
-napi_value StreamPipePendingWrites(napi_env env, napi_callback_info /*info*/) {
+napi_value StreamPipePendingWrites(napi_env env, napi_callback_info info) {
+  napi_value self = nullptr;
+  size_t argc = 0;
+  napi_get_cb_info(env, info, &argc, nullptr, &self, nullptr);
+  StreamPipeWrap* wrap = UnwrapPipe(env, self);
   napi_value out = nullptr;
-  napi_create_int32(env, 0, &out);
+  napi_create_uint32(env, wrap != nullptr ? wrap->pending_writes : 0, &out);
   return out != nullptr ? out : Undefined(env);
 }
 
