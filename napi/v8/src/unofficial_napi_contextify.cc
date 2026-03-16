@@ -744,12 +744,18 @@ v8::MaybeLocal<v8::Object> ModuleResolveSourceCallback(v8::Local<v8::Context> co
 
   napi_value source_object = GetRefValue(env, dependent->linked_requests[it->second]->source_object_ref);
   if (source_object == nullptr) {
-    ThrowV8CodeError(context, "ERR_SOURCE_PHASE_NOT_DEFINED", "Source phase object is not defined");
+    ThrowV8CodeError(
+        context,
+        "ERR_SOURCE_PHASE_NOT_DEFINED",
+        "Source phase import object is not defined for module");
     return v8::MaybeLocal<v8::Object>();
   }
   v8::Local<v8::Value> raw = napi_v8_unwrap_value(source_object);
   if (raw.IsEmpty() || !raw->IsObject()) {
-    ThrowV8CodeError(context, "ERR_SOURCE_PHASE_NOT_DEFINED", "Source phase object is not defined");
+    ThrowV8CodeError(
+        context,
+        "ERR_SOURCE_PHASE_NOT_DEFINED",
+        "Source phase import object is not defined for module");
     return v8::MaybeLocal<v8::Object>();
   }
   return raw.As<v8::Object>();
@@ -1083,6 +1089,21 @@ bool NapiV8IsContextifyContext(napi_env env, v8::Local<v8::Context> context) {
   return false;
 }
 
+void NapiV8ApplyPromiseHooksToContextifyContexts(napi_env env) {
+  if (env == nullptr || env->isolate == nullptr) return;
+
+  std::lock_guard<std::mutex> lock(g_context_mu);
+  auto it = g_context_records.find(env);
+  if (it == g_context_records.end()) return;
+
+  for (auto& rec : it->second) {
+    v8::Local<v8::Context> context = rec.context.Get(env->isolate);
+    if (!context.IsEmpty()) {
+      NapiV8ApplyPromiseHooksToContext(env, context);
+    }
+  }
+}
+
 extern "C" {
 
 napi_status NAPI_CDECL unofficial_napi_contextify_make_context(
@@ -1156,6 +1177,7 @@ napi_status NAPI_CDECL unofficial_napi_contextify_make_context(
 
   context->SetSecurityToken(current->GetSecurityToken());
   context->AllowCodeGenerationFromStrings(allow_code_gen_strings);
+  NapiV8ApplyPromiseHooksToContext(env, context);
 
   v8::Local<v8::Object> key_object;
   if (vanilla) {

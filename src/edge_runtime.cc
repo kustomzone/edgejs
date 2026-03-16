@@ -374,6 +374,7 @@ struct PendingExceptionInfo {
   bool has_exception = false;
   napi_value exception = nullptr;
   std::string exception_line;
+  std::string thrown_at;
 };
 
 std::string GetErrorSourceLine(napi_env env,
@@ -381,6 +382,15 @@ std::string GetErrorSourceLine(napi_env env,
                                bool align_internal_assert = false) {
   if (env == nullptr || exception == nullptr) {
     return {};
+  }
+
+  napi_value stderr_line = nullptr;
+  if (unofficial_napi_get_error_source_line_for_stderr(env, exception, &stderr_line) == napi_ok &&
+      stderr_line != nullptr) {
+    std::string formatted = NapiValueToUtf8(env, stderr_line);
+    if (!formatted.empty() && !align_internal_assert) {
+      return formatted;
+    }
   }
 
   unofficial_napi_error_source_positions positions = {};
@@ -491,18 +501,60 @@ bool TakePendingExceptionInfo(napi_env env,
   }
 
   out->has_exception = true;
+  if (DebugExceptionsEnabled()) {
+    napi_valuetype exception_type = napi_undefined;
+    std::string exception_text;
+    if (napi_typeof(env, out->exception, &exception_type) == napi_ok) {
+      exception_text = NapiValueToUtf8(env, out->exception);
+    }
+    std::cerr << "[edge-exc] pending exception type=" << static_cast<int>(exception_type)
+              << " value=" << exception_text << "\n";
+  }
+  napi_value preserved_exception_line_value = nullptr;
+  napi_value preserved_thrown_at_value = nullptr;
+  if (unofficial_napi_take_preserved_error_formatting(
+          env,
+          out->exception,
+          &preserved_exception_line_value,
+          &preserved_thrown_at_value) == napi_ok) {
+    if (preserved_exception_line_value != nullptr) {
+      out->exception_line = NapiValueToUtf8(env, preserved_exception_line_value);
+    }
+    if (preserved_thrown_at_value != nullptr) {
+      out->thrown_at = NapiValueToUtf8(env, preserved_thrown_at_value);
+    }
+  }
+
   if (prior_exception != nullptr && !prior_exception_line.empty()) {
     bool same_exception = false;
     if (napi_strict_equals(env, out->exception, prior_exception, &same_exception) == napi_ok &&
         same_exception) {
-      out->exception_line = prior_exception_line;
+      if (out->exception_line.empty()) {
+        out->exception_line = prior_exception_line;
+      }
+      if (out->thrown_at.empty()) {
+        napi_value thrown_at_value = nullptr;
+        if (unofficial_napi_get_error_thrown_at(env, out->exception, &thrown_at_value) == napi_ok &&
+            thrown_at_value != nullptr) {
+          out->thrown_at = NapiValueToUtf8(env, thrown_at_value);
+        }
+      }
       return true;
     }
   }
 
-  out->exception_line = GetArrowMessageFromError(env, out->exception);
+  if (out->exception_line.empty()) {
+    out->exception_line = GetArrowMessageFromError(env, out->exception);
+  }
   if (out->exception_line.empty()) {
     out->exception_line = GetErrorSourceLine(env, out->exception);
+  }
+  if (out->thrown_at.empty()) {
+    napi_value thrown_at_value = nullptr;
+    if (unofficial_napi_get_error_thrown_at(env, out->exception, &thrown_at_value) == napi_ok &&
+        thrown_at_value != nullptr) {
+      out->thrown_at = NapiValueToUtf8(env, thrown_at_value);
+    }
   }
   return true;
 }
@@ -562,7 +614,8 @@ void StripLeadingExceptionLine(std::string* message) {
 std::string FormatUncaughtExceptionForStderr(napi_env env,
                                              napi_value exception,
                                              const std::string& stack_message,
-                                             const std::string& pending_exception_line = {}) {
+                                             const std::string& pending_exception_line = {},
+                                             const std::string& pending_thrown_at = {}) {
   if (stack_message.empty()) return stack_message;
 
   std::string formatted = stack_message;
@@ -580,10 +633,30 @@ std::string FormatUncaughtExceptionForStderr(napi_env env,
                                          : (pending_exception_line.empty() ? derived_exception_line
                                                                            : pending_exception_line);
   if (!exception_line.empty() && formatted.rfind(exception_line, 0) != 0) {
-    formatted = exception_line + formatted;
+    std::string prefix = exception_line;
+    if (!prefix.empty() && prefix.back() == '\n') {
+      prefix.push_back('\n');
+    }
+    formatted = prefix + formatted;
   }
   StripBuiltinModuleCompileFrame(&formatted);
   NormalizeAssertionPropertyBlock(&formatted);
+  if (EdgeExecArgvHasFlag("--trace-uncaught")) {
+    std::string thrown_at = pending_thrown_at;
+    if (thrown_at.empty()) {
+      napi_value thrown_at_value = nullptr;
+      if (unofficial_napi_get_error_thrown_at(env, exception, &thrown_at_value) == napi_ok &&
+          thrown_at_value != nullptr) {
+        thrown_at = NapiValueToUtf8(env, thrown_at_value);
+      }
+    }
+    if (!thrown_at.empty()) {
+      if (!formatted.empty()) {
+        formatted += "\n";
+      }
+      formatted += thrown_at;
+    }
+  }
   const std::string version = GetProcessVersion(env);
   if (!version.empty()) {
     formatted += "\n\nNode.js " + version;
@@ -657,7 +730,7 @@ std::string GetAndClearPendingException(napi_env env, bool* is_process_exit, int
   const std::string enhanced_exception = EdgeFormatFatalExceptionAfterInspector(env, pending.exception);
   if (!enhanced_exception.empty()) {
     return FormatUncaughtExceptionForStderr(
-        env, pending.exception, enhanced_exception, pending.exception_line);
+        env, pending.exception, enhanced_exception, pending.exception_line, pending.thrown_at);
   }
 
   napi_value stack_value = nullptr;
@@ -671,7 +744,11 @@ std::string GetAndClearPendingException(napi_env env, bool* is_process_exit, int
         size_t copied = 0;
         if (napi_get_value_string_utf8(env, stack_string, stack_buf.data(), stack_buf.size(), &copied) == napi_ok) {
           return FormatUncaughtExceptionForStderr(
-              env, pending.exception, std::string(stack_buf.data(), copied), pending.exception_line);
+              env,
+              pending.exception,
+              std::string(stack_buf.data(), copied),
+              pending.exception_line,
+              pending.thrown_at);
         }
       }
     }
@@ -693,7 +770,12 @@ std::string GetAndClearPendingException(napi_env env, bool* is_process_exit, int
   if (napi_get_value_string_utf8(env, exception_string, buffer.data(), buffer.size(), &copied) != napi_ok) {
     return "";
   }
-  return std::string(buffer.data(), copied);
+  return FormatUncaughtExceptionForStderr(
+      env,
+      pending.exception,
+      std::string(buffer.data(), copied),
+      pending.exception_line,
+      pending.thrown_at);
 }
 
 int GetProcessExitCode(napi_env env, bool* has_exit_code) {
@@ -1001,7 +1083,8 @@ bool ShouldAbortOnUncaughtException() {
 
 std::string FormatFatalExceptionMessage(napi_env env,
                                         napi_value exception,
-                                        const std::string& pending_exception_line = {}) {
+                                        const std::string& pending_exception_line = {},
+                                        const std::string& pending_thrown_at = {}) {
   if (env == nullptr || exception == nullptr) return "Unhandled async exception";
 
   std::string exception_message;
@@ -1009,7 +1092,7 @@ std::string FormatFatalExceptionMessage(napi_env env,
       EdgeFormatFatalExceptionAfterInspector(env, exception);
   if (!enhanced_exception.empty()) {
     exception_message = FormatUncaughtExceptionForStderr(
-        env, exception, enhanced_exception, pending_exception_line);
+        env, exception, enhanced_exception, pending_exception_line, pending_thrown_at);
   }
 
   napi_value stack_value = nullptr;
@@ -1027,7 +1110,11 @@ std::string FormatFatalExceptionMessage(napi_env env,
         if (napi_get_value_string_utf8(
                 env, stack_string, stack_buf.data(), stack_buf.size(), &copied) == napi_ok) {
           exception_message = FormatUncaughtExceptionForStderr(
-              env, exception, std::string(stack_buf.data(), copied), pending_exception_line);
+              env,
+              exception,
+              std::string(stack_buf.data(), copied),
+              pending_exception_line,
+              pending_thrown_at);
         }
       }
     }
@@ -1038,7 +1125,11 @@ std::string FormatFatalExceptionMessage(napi_env env,
     if (napi_coerce_to_string(env, exception, &exception_string) == napi_ok &&
         exception_string != nullptr) {
       exception_message = FormatUncaughtExceptionForStderr(
-          env, exception, NapiValueToUtf8(env, exception_string), pending_exception_line);
+          env,
+          exception,
+          NapiValueToUtf8(env, exception_string),
+          pending_exception_line,
+          pending_thrown_at);
     }
   }
 
@@ -1047,13 +1138,38 @@ std::string FormatFatalExceptionMessage(napi_env env,
 
 [[noreturn]] void AbortOnUncaughtException(napi_env env,
                                           napi_value exception,
-                                          const std::string& pending_exception_line = {}) {
-  std::string exception_message = FormatFatalExceptionMessage(env, exception, pending_exception_line);
+                                          const std::string& pending_exception_line = {},
+                                          const std::string& pending_thrown_at = {}) {
+  std::string exception_message =
+      FormatFatalExceptionMessage(env, exception, pending_exception_line, pending_thrown_at);
   if (!exception_message.empty()) {
     if (exception_message.back() != '\n') exception_message.push_back('\n');
     WriteTextToFd(2, exception_message);
   }
   std::abort();
+}
+
+int FinalizeFatalException(napi_env env,
+                           napi_value exception,
+                           std::string* error_out,
+                           int default_exit_code = 1,
+                           const std::string& exception_line = {},
+                           const std::string& thrown_at = {}) {
+  if (exception == nullptr) {
+    if (error_out != nullptr) {
+      *error_out = "Unhandled async exception";
+    }
+    return default_exit_code;
+  }
+
+  (void)EdgeWriteReportForUncaughtException(env, exception);
+  const int exit_code = EmitProcessExitOnFatalException(env, default_exit_code);
+  const std::string exception_message =
+      FormatFatalExceptionMessage(env, exception, exception_line, thrown_at);
+  if (error_out != nullptr) {
+    *error_out = exception_message.empty() ? "Unhandled async exception" : exception_message;
+  }
+  return exit_code;
 }
 
 bool DispatchUncaughtException(napi_env env,
@@ -1161,15 +1277,17 @@ bool DispatchUncaughtException(napi_env env,
 int HandleExtractedException(napi_env env,
                              napi_value exception,
                              std::string* error_out,
-                             const std::string& pending_exception_line = {}) {
+                             const std::string& pending_exception_line = {},
+                             const std::string& pending_thrown_at = {}) {
   const bool abort_on_uncaught = ShouldAbortOnUncaughtException();
   if (abort_on_uncaught && !HasActiveDomainErrorHandler(env)) {
-    AbortOnUncaughtException(env, exception, pending_exception_line);
+    AbortOnUncaughtException(env, exception, pending_exception_line, pending_thrown_at);
   }
 
   bool handled = false;
   napi_value effective_exception = exception;
   std::string effective_exception_line = pending_exception_line;
+  const std::string effective_exception_thrown_at = pending_thrown_at;
   int fatal_exit_code = -1;
   (void)DispatchUncaughtException(
       env,
@@ -1186,19 +1304,17 @@ int HandleExtractedException(napi_env env,
   }
 
   if (abort_on_uncaught) {
-    AbortOnUncaughtException(env, effective_exception, effective_exception_line);
+    AbortOnUncaughtException(
+        env, effective_exception, effective_exception_line, effective_exception_thrown_at);
   }
 
-  (void)EdgeWriteReportForUncaughtException(env, effective_exception);
-  const int exit_code = EmitProcessExitOnFatalException(
+  return FinalizeFatalException(
       env,
-      fatal_exit_code >= 0 ? fatal_exit_code : 1);
-  const std::string exception_message =
-      FormatFatalExceptionMessage(env, effective_exception, effective_exception_line);
-  if (error_out != nullptr) {
-    *error_out = exception_message.empty() ? "Unhandled async exception" : exception_message;
-  }
-  return exit_code;
+      effective_exception,
+      error_out,
+      fatal_exit_code >= 0 ? fatal_exit_code : 1,
+      effective_exception_line,
+      effective_exception_thrown_at);
 }
 
 int HandlePendingExceptionAfterLoopStep(napi_env env, std::string* error_out) {
@@ -1217,7 +1333,8 @@ int HandlePendingExceptionAfterLoopStep(napi_env env, std::string* error_out) {
     return 1;
   }
 
-  return HandleExtractedException(env, pending.exception, error_out, pending.exception_line);
+  return HandleExtractedException(
+      env, pending.exception, error_out, pending.exception_line, pending.thrown_at);
 }
 
 // Mirrors Node's native tick dispatch by preferring the task_queue callback
@@ -1505,7 +1622,21 @@ int WaitForTopLevelPromiseToSettle(napi_env env, napi_value value, std::string* 
       state == 2 &&
       has_result &&
       settled_result != nullptr) {
+    if (DebugExceptionsEnabled()) {
+      napi_valuetype result_type = napi_undefined;
+      std::string result_text;
+      if (napi_typeof(env, settled_result, &result_type) == napi_ok) {
+        result_text = NapiValueToUtf8(env, settled_result);
+      }
+      std::cerr << "[edge-esm] entry promise rejected type=" << static_cast<int>(result_type)
+                << " value=" << result_text << "\n";
+    }
     napi_throw(env, settled_result);
+    if (DebugExceptionsEnabled()) {
+      bool has_pending = false;
+      napi_is_exception_pending(env, &has_pending);
+      std::cerr << "[edge-esm] after napi_throw pending=" << (has_pending ? "true" : "false") << "\n";
+    }
     const int async_status = HandlePendingExceptionAfterLoopStep(env, error_out);
     if (async_status >= 0) {
       return async_status;
@@ -2903,7 +3034,11 @@ int RunScriptWithGlobals(napi_env env,
       top_level_exception.exception != nullptr) {
     const int exception_status =
         HandleExtractedException(
-            env, top_level_exception.exception, error_out, top_level_exception.exception_line);
+            env,
+            top_level_exception.exception,
+            error_out,
+            top_level_exception.exception_line,
+            top_level_exception.thrown_at);
     if (exception_status >= 0) {
       return exception_status;
     }
@@ -3156,6 +3291,38 @@ bool EdgeHandlePendingExceptionNow(napi_env env, bool* handled_out) {
   }
 
   if (handled_out != nullptr) *handled_out = true;
+  return true;
+}
+
+bool EdgeFinalizeFatalExceptionNow(napi_env env,
+                                   napi_value exception,
+                                   int default_exit_code,
+                                   const std::string& exception_line,
+                                   const std::string& thrown_at) {
+  if (env == nullptr || exception == nullptr) return false;
+
+  const bool abort_on_uncaught = ShouldAbortOnUncaughtException();
+  if (abort_on_uncaught && !HasActiveDomainErrorHandler(env)) {
+    AbortOnUncaughtException(env, exception, exception_line, thrown_at);
+  }
+
+  std::string fatal_error;
+  const int exit_code =
+      FinalizeFatalException(
+          env, exception, &fatal_error, default_exit_code, exception_line, thrown_at);
+  if (!fatal_error.empty()) {
+    if (fatal_error.back() != '\n') fatal_error.push_back('\n');
+    WriteTextToFd(2, fatal_error);
+  }
+
+  if (EdgeWorkerEnvIsMainThread(env) && !EdgeWorkerEnvIsInternalThread(env)) {
+    std::_Exit(exit_code);
+  }
+
+  EdgeWorkerEnvRequestStop(env);
+  if (uv_loop_t* loop = EdgeGetEnvLoop(env); loop != nullptr) {
+    uv_stop(loop);
+  }
   return true;
 }
 

@@ -5,6 +5,7 @@
 
 #include "unofficial_napi.h"
 #include "edge_environment.h"
+#include "edge_runtime.h"
 #include "edge_worker_env.h"
 
 namespace {
@@ -196,6 +197,9 @@ napi_value ErrorsSetGetSourceMapErrorSource(napi_env env, napi_callback_info inf
   auto& st = EnsureErrorsState(env);
   if (argc >= 1) {
     ErrorsSetRef(env, &st.get_source_map_error_source_ref, argv[0]);
+    (void)unofficial_napi_set_get_source_map_error_source_callback(env, argv[0]);
+  } else {
+    (void)unofficial_napi_set_get_source_map_error_source_callback(env, nullptr);
   }
   return MakeUndefined(env);
 }
@@ -210,6 +214,7 @@ napi_value ErrorsSetSourceMapsEnabled(napi_env env, napi_callback_info info) {
     napi_get_value_bool(env, argv[0], &enabled);
   }
   st.source_maps_enabled = enabled;
+  (void)unofficial_napi_set_source_maps_enabled(env, enabled);
   return MakeUndefined(env);
 }
 
@@ -293,6 +298,20 @@ napi_value ErrorsTriggerUncaughtException(napi_env env, napi_callback_info info)
     napi_get_value_bool(env, argv[1], &from_promise);
   }
 
+  if (const char* debug = std::getenv("EDGE_DEBUG_EXCEPTIONS");
+      debug != nullptr && debug[0] != '\0' && debug[0] != '0') {
+    napi_valuetype exception_type = napi_undefined;
+    std::string exception_text;
+    if (exception != nullptr && napi_typeof(env, exception, &exception_type) == napi_ok) {
+      exception_text = ValueToUtf8(env, exception);
+    }
+    std::fprintf(stderr,
+                 "[edge-errors] triggerUncaughtException fromPromise=%s type=%d value=%s\n",
+                 from_promise ? "true" : "false",
+                 static_cast<int>(exception_type),
+                 exception_text.c_str());
+  }
+
   if (!EdgeWorkerEnvOwnsProcessState(env) && EdgeWorkerEnvStopRequested(env)) {
     bool has_pending = false;
     if (napi_is_exception_pending(env, &has_pending) == napi_ok && has_pending) {
@@ -326,6 +345,8 @@ napi_value ErrorsTriggerUncaughtException(napi_env env, napi_callback_info info)
   if (state != nullptr) {
     invoke_ref_callback(state->enhance_fatal_stack_before_inspector_ref);
   }
+
+  (void)unofficial_napi_preserve_error_source_message(env, exception);
 
   napi_value global = nullptr;
   napi_value process = nullptr;
@@ -375,10 +396,7 @@ napi_value ErrorsTriggerUncaughtException(napi_env env, napi_callback_info info)
     invoke_ref_callback(state->enhance_fatal_stack_after_inspector_ref);
   }
 
-  // Match Node's native fatal path by preserving the original engine-provided
-  // source arrow before the exception crosses back through JS.
-  (void)unofficial_napi_preserve_error_source_message(env, exception);
-  napi_throw(env, exception);
+  (void)EdgeFinalizeFatalExceptionNow(env, exception);
   return MakeUndefined(env);
 }
 
@@ -393,6 +411,11 @@ napi_value GetOrCreateErrorsBinding(napi_env env) {
 
   napi_value binding = nullptr;
   if (napi_create_object(env, &binding) != napi_ok || binding == nullptr) return nullptr;
+
+  const bool source_maps_enabled = EdgeExecArgvHasFlag("--enable-source-maps");
+  st.source_maps_enabled = source_maps_enabled;
+  (void)unofficial_napi_set_source_maps_enabled(env, source_maps_enabled);
+
   auto define_method = [&](const char* name, napi_callback cb) -> bool {
     napi_value fn = nullptr;
     return napi_create_function(env, name, NAPI_AUTO_LENGTH, cb, nullptr, &fn) == napi_ok &&

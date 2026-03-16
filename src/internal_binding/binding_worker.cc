@@ -459,6 +459,7 @@ std::vector<std::string> ReadStringArray(napi_env env, napi_value value) {
 }
 
 bool IsAllowedNodeEnvironmentFlag(napi_env env, const std::string& flag) {
+  if (flag == "--no-addons") return true;
   napi_value global = GetGlobal(env);
   napi_value process = GetNamed(env, global, "process");
   napi_value allowed = GetNamed(env, process, "allowedNodeEnvironmentFlags");

@@ -34,6 +34,11 @@ void EdgeSetScriptArgv(const std::vector<std::string>& script_argv);
 void EdgeSetExecArgv(const std::vector<std::string>& exec_argv);
 bool EdgeExecArgvHasFlag(const char* flag);
 bool EdgeReadExecArgvUint64Option(const char* prefix, uint64_t* out, bool* found);
+bool EdgeFinalizeFatalExceptionNow(napi_env env,
+                                   napi_value exception,
+                                   int default_exit_code = 1,
+                                   const std::string& exception_line = {},
+                                   const std::string& thrown_at = {});
 
 enum EdgeMakeCallbackFlags : int {
   kEdgeMakeCallbackNone = 0,

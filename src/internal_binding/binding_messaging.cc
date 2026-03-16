@@ -998,6 +998,17 @@ bool CollectTransferredPorts(
     napi_env env,
     napi_value transfer_list,
     std::vector<QueuedMessage::TransferredPortEntry>* out);
+void DetachTransferredPorts(
+    napi_env env,
+    std::vector<QueuedMessage::TransferredPortEntry>* transferred_ports);
+struct ReceivedTransferredPortState {
+  std::vector<napi_value> ports;
+};
+napi_value RestoreTransferredPortsInValue(napi_env env,
+                                          napi_value value,
+                                          const QueuedMessage& message,
+                                          ReceivedTransferredPortState* state,
+                                          std::vector<ValueTransformPair>* seen_pairs);
 
 napi_value CloneArrayEntriesForStructuredClone(napi_env env,
                                                napi_value array,
@@ -1501,6 +1512,7 @@ napi_value TransformTransferredValuesForQueue(
     std::vector<QueuedMessage::TransferredPortEntry>* transferred_ports,
     std::vector<ValueTransformPair>* seen_pairs) {
   if (transfer_list != nullptr &&
+      TransferListContainsValue(env, transfer_list, value) &&
       IsTransferableValue(env, value)) {
     napi_value marker = nullptr;
     if (CreateTransferredJSTransferableMarkerForQueue(env, value, &marker, transferred_ports) && marker != nullptr) {
@@ -2621,6 +2633,101 @@ bool NormalizePostMessageTransferArg(napi_env env,
   return true;
 }
 
+napi_value CloneMessageValueWithTransfers(napi_env env, napi_value value, napi_value transfer_arg) {
+  napi_value normalized_transfer_arg = nullptr;
+  napi_value transfer_list = nullptr;
+  if (transfer_arg != nullptr &&
+      !NormalizePostMessageTransferArg(env, transfer_arg, &normalized_transfer_arg, &transfer_list)) {
+    return nullptr;
+  }
+
+  if (transfer_list != nullptr && TransferListContainsMarkedUntransferable(env, transfer_list, value)) {
+    napi_value err = CreateDataCloneError(env, "An ArrayBuffer is marked as untransferable");
+    if (err != nullptr) napi_throw(env, err);
+    return nullptr;
+  }
+  if (TransferListContainsDuplicateArrayBuffer(env, transfer_list)) {
+    napi_value err = CreateDataCloneError(env, "Transfer list contains duplicate ArrayBuffer");
+    if (err != nullptr) napi_throw(env, err);
+    return nullptr;
+  }
+  if (!ValidateTransferListMessagePorts(env, transfer_list)) {
+    return nullptr;
+  }
+  if (TransferListContainsDuplicateMessagePort(env, transfer_list)) {
+    napi_value err = CreateDataCloneError(env, "Transfer list contains duplicate MessagePort");
+    if (err != nullptr) napi_throw(env, err);
+    return nullptr;
+  }
+
+  std::vector<QueuedMessage::TransferredPortEntry> transferred_ports;
+  if (!CollectTransferredPorts(env, transfer_list, &transferred_ports)) {
+    return nullptr;
+  }
+
+  std::vector<ValueTransformPair> transferred_value_pairs;
+  napi_value transferred_value =
+      TransformTransferredValuesForQueue(env, value, transfer_list, &transferred_ports, &transferred_value_pairs);
+  if (transferred_value == nullptr) {
+    DeleteTransferredPortRefs(env, &transferred_ports);
+    return nullptr;
+  }
+
+  std::vector<ValueTransformPair> seen_pairs;
+  napi_value transformed_value =
+      TransformTransferredPortsForQueue(env, transferred_value, transferred_ports, &seen_pairs);
+  if (transformed_value == nullptr) {
+    DeleteTransferredPortRefs(env, &transferred_ports);
+    return nullptr;
+  }
+
+  auto clone_prepared_value = [&](napi_value clone_input) -> napi_value {
+    napi_value arraybuffer_transfer_list = CreateArrayBufferTransferList(env, normalized_transfer_arg);
+    napi_value cloned = nullptr;
+    const napi_status clone_status =
+        arraybuffer_transfer_list != nullptr
+            ? unofficial_napi_structured_clone_with_transfer(
+                  env, clone_input, arraybuffer_transfer_list, &cloned)
+            : unofficial_napi_structured_clone(env, clone_input, &cloned);
+    if (clone_status != napi_ok || cloned == nullptr) {
+      bool has_pending = false;
+      if (napi_is_exception_pending(env, &has_pending) == napi_ok && has_pending) {
+        return ReadPendingCloneErrorMessage(env, clone_input);
+      }
+      std::string message = DescribeCloneFailureValue(env, clone_input);
+      napi_value err = CreateDataCloneError(
+          env, message.empty() ? "The object could not be cloned." : message.c_str());
+      if (err != nullptr) napi_throw(env, err);
+      return nullptr;
+    }
+    return cloned;
+  };
+
+  napi_value cloned = clone_prepared_value(transformed_value);
+  if (cloned == nullptr) {
+    DeleteTransferredPortRefs(env, &transferred_ports);
+    return nullptr;
+  }
+
+  QueuedMessage message;
+  message.transferred_ports = std::move(transferred_ports);
+  DetachTransferredPorts(env, &message.transferred_ports);
+
+  if (!message.transferred_ports.empty()) {
+    ReceivedTransferredPortState received_ports;
+    std::vector<ValueTransformPair> restore_pairs;
+    cloned = RestoreTransferredPortsInValue(env, cloned, message, &received_ports, &restore_pairs);
+    if (cloned == nullptr) {
+      DeleteTransferredPortRefs(env, &message.transferred_ports);
+      return nullptr;
+    }
+  }
+
+  cloned = RestoreTransferableDataAfterStructuredClone(env, cloned);
+  DeleteTransferredPortRefs(env, &message.transferred_ports);
+  return cloned;
+}
+
 napi_value CloneMessageValue(napi_env env, napi_value value, napi_value transfer_arg) {
   napi_value clone_input = value;
   if (IsProcessEnvValue(env, clone_input)) {
@@ -2630,24 +2737,25 @@ napi_value CloneMessageValue(napi_env env, napi_value value, napi_value transfer
   clone_input = PrepareTransferableDataForStructuredClone(env, clone_input, false);
   if (clone_input == nullptr) return nullptr;
 
-  napi_value arraybuffer_transfer_list = CreateArrayBufferTransferList(env, transfer_arg);
-  napi_value cloned = nullptr;
-  const napi_status clone_status =
-      arraybuffer_transfer_list != nullptr
-          ? unofficial_napi_structured_clone_with_transfer(
-                env, clone_input, arraybuffer_transfer_list, &cloned)
-          : unofficial_napi_structured_clone(env, clone_input, &cloned);
-  if (clone_status != napi_ok || cloned == nullptr) {
-    bool has_pending = false;
-    if (napi_is_exception_pending(env, &has_pending) == napi_ok && has_pending) {
-      return ReadPendingCloneErrorMessage(env, clone_input);
+  auto clone_prepared_value = [&](napi_value prepared_value) -> napi_value {
+    napi_value cloned = nullptr;
+    const napi_status clone_status = unofficial_napi_structured_clone(env, prepared_value, &cloned);
+    if (clone_status != napi_ok || cloned == nullptr) {
+      bool has_pending = false;
+      if (napi_is_exception_pending(env, &has_pending) == napi_ok && has_pending) {
+        return ReadPendingCloneErrorMessage(env, prepared_value);
+      }
+      std::string message = DescribeCloneFailureValue(env, prepared_value);
+      napi_value err = CreateDataCloneError(
+          env, message.empty() ? "The object could not be cloned." : message.c_str());
+      if (err != nullptr) napi_throw(env, err);
+      return nullptr;
     }
-    std::string message = DescribeCloneFailureValue(env, clone_input);
-    napi_value err = CreateDataCloneError(
-        env, message.empty() ? "The object could not be cloned." : message.c_str());
-    if (err != nullptr) napi_throw(env, err);
-    return nullptr;
-  }
+    return cloned;
+  };
+
+  napi_value cloned = clone_prepared_value(clone_input);
+  if (cloned == nullptr) return nullptr;
   return RestoreTransferableDataAfterStructuredClone(env, cloned);
 }
 
@@ -3060,10 +3168,6 @@ void DetachTransferredPorts(napi_env env,
     DeleteRefIfPresent(env, &entry.source_port_ref);
   }
 }
-
-struct ReceivedTransferredPortState {
-  std::vector<napi_value> ports;
-};
 
 napi_value GetOrCreateReceivedTransferredPort(napi_env env,
                                               const QueuedMessage& message,
@@ -4063,7 +4167,9 @@ napi_value StructuredCloneCallback(napi_env env, napi_callback_info info) {
   if (ThrowDirectCloneFailureIfDetected(env, argv[0])) {
     return nullptr;
   }
-  return CloneMessageValue(env, argv[0], argc >= 2 ? argv[1] : nullptr);
+  return argc >= 2 && argv[1] != nullptr
+             ? CloneMessageValueWithTransfers(env, argv[0], argv[1])
+             : CloneMessageValue(env, argv[0], nullptr);
 }
 
 napi_value BroadcastChannelCallback(napi_env env, napi_callback_info info) {

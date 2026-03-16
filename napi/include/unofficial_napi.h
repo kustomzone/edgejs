@@ -73,6 +73,8 @@ NAPI_EXTERN napi_status unofficial_napi_terminate_execution(napi_env env);
 // used when embedder code intentionally stops a worker but still needs the
 // current JS stack to unwind normally.
 NAPI_EXTERN napi_status unofficial_napi_cancel_terminate_execution(napi_env env);
+NAPI_EXTERN napi_status unofficial_napi_set_pending_exception(napi_env env,
+                                                              napi_value error);
 
 using unofficial_napi_interrupt_callback = void (*)(napi_env env, void* data);
 
@@ -169,6 +171,25 @@ NAPI_EXTERN napi_status unofficial_napi_get_error_source_positions(
 NAPI_EXTERN napi_status unofficial_napi_preserve_error_source_message(
     napi_env env,
     napi_value error);
+NAPI_EXTERN napi_status unofficial_napi_set_source_maps_enabled(
+    napi_env env,
+    bool enabled);
+NAPI_EXTERN napi_status unofficial_napi_set_get_source_map_error_source_callback(
+    napi_env env,
+    napi_value callback);
+NAPI_EXTERN napi_status unofficial_napi_get_error_source_line_for_stderr(
+    napi_env env,
+    napi_value error,
+    napi_value* result_out);
+NAPI_EXTERN napi_status unofficial_napi_get_error_thrown_at(
+    napi_env env,
+    napi_value error,
+    napi_value* result_out);
+NAPI_EXTERN napi_status unofficial_napi_take_preserved_error_formatting(
+    napi_env env,
+    napi_value error,
+    napi_value* source_line_out,
+    napi_value* thrown_at_out);
 
 // Unofficial helper used by module_wrap parity paths to tell the runtime's
 // PromiseReject callback machinery that a rejected promise is being handled

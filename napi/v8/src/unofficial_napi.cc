@@ -239,6 +239,28 @@ void AppendJsonNumber(std::string* out, T value) {
   out->append(stream.str());
 }
 
+void StripStackFrameLine(std::string* stack, const char* prefix) {
+  if (stack == nullptr || prefix == nullptr || stack->empty()) return;
+  size_t pos = stack->find(prefix);
+  while (pos != std::string::npos) {
+    const size_t end = stack->find('\n', pos + 1);
+    stack->erase(pos, end == std::string::npos ? std::string::npos : end - pos);
+    pos = stack->find(prefix);
+  }
+}
+
+void StripInternalAsyncStackFrames(std::string* stack) {
+  static constexpr const char* kPrefixes[] = {
+      "\n    at process.processTicksAndRejections (node:internal/process/task_queues:",
+      "\n    at process.processTicksAndRejections (node:internal/process/task_queues)",
+      "\n    at triggerUncaughtException (node:internal/process/promises:",
+      "\n    at triggerUncaughtException (node:internal/modules/run_main:",
+  };
+  for (const char* prefix : kPrefixes) {
+    StripStackFrameLine(stack, prefix);
+  }
+}
+
 void BuildHeapProfileNode(v8::Isolate* isolate,
                           const v8::AllocationProfile::Node* profile_node,
                           std::string* out) {
@@ -380,7 +402,25 @@ v8::MaybeLocal<v8::Value> NapiPrepareStackTraceCallback(v8::Local<v8::Context> c
   if (try_catch.HasCaught() && !try_catch.HasTerminated()) {
     try_catch.ReThrow();
   }
-  return result;
+  v8::Local<v8::Value> value;
+  if (!result.ToLocal(&value) || !value->IsString()) {
+    return result;
+  }
+
+  v8::String::Utf8Value utf8(context->GetIsolate(), value);
+  std::string formatted =
+      *utf8 != nullptr ? std::string(*utf8, utf8.length()) : std::string();
+  StripInternalAsyncStackFrames(&formatted);
+  v8::Local<v8::String> filtered;
+  if (!v8::String::NewFromUtf8(
+           context->GetIsolate(),
+           formatted.c_str(),
+           v8::NewStringType::kNormal,
+           static_cast<int>(formatted.size()))
+           .ToLocal(&filtered)) {
+    return value;
+  }
+  return filtered;
 }
 
 bool IsEnvThreadEntered(napi_env env) {
@@ -650,10 +690,22 @@ void PromiseRejectCallback(v8::PromiseRejectMessage message) {
       return;
   }
 
+  const bool debug_promise_reject =
+      std::getenv("EDGE_DEBUG_EXCEPTIONS") != nullptr &&
+      std::getenv("EDGE_DEBUG_EXCEPTIONS")[0] != '\0' &&
+      std::getenv("EDGE_DEBUG_EXCEPTIONS")[0] != '0';
+
   v8::HandleScope handle_scope(isolate);
   v8::Local<v8::Context> context = env->context();
   v8::Context::Scope context_scope(context);
   v8::TryCatch tc(isolate);
+  if (debug_promise_reject) {
+    v8::String::Utf8Value text(isolate, value);
+    std::fprintf(stderr,
+                 "[edge-pr] event=%d value=%s\n",
+                 static_cast<int>(event),
+                 *text != nullptr ? *text : "<unprintable>");
+  }
   v8::Local<v8::Value> args[] = {
       v8::Integer::New(isolate, static_cast<int>(event)),
       promise,
@@ -692,6 +744,14 @@ bool GetPromiseHookFunction(napi_env env,
   return true;
 }
 
+bool HasPromiseHooks(const std::array<v8::Global<v8::Function>, 4>& hooks) {
+  for (const auto& hook : hooks) {
+    if (!hook.IsEmpty()) return true;
+  }
+  return false;
+}
+
+#ifndef V8_ENABLE_JAVASCRIPT_PROMISE_HOOKS
 size_t PromiseHookIndex(v8::PromiseHookType type) {
   switch (type) {
     case v8::PromiseHookType::kInit:
@@ -705,13 +765,6 @@ size_t PromiseHookIndex(v8::PromiseHookType type) {
     default:
       return 4;
   }
-}
-
-bool HasPromiseHooks(const std::array<v8::Global<v8::Function>, 4>& hooks) {
-  for (const auto& hook : hooks) {
-    if (!hook.IsEmpty()) return true;
-  }
-  return false;
 }
 
 void PromiseHookCallback(v8::PromiseHookType type,
@@ -755,6 +808,24 @@ void PromiseHookCallback(v8::PromiseHookType type,
   if (tc.HasCaught() && !tc.HasTerminated()) {
     tc.ReThrow();
   }
+}
+#endif
+
+std::array<v8::Local<v8::Function>, 4> LookupPromiseHooksForContext(napi_env env,
+                                                                    v8::Isolate* isolate) {
+  std::array<v8::Local<v8::Function>, 4> hooks;
+  if (env == nullptr || isolate == nullptr) return hooks;
+
+  std::lock_guard<std::mutex> lock(g_runtime_mu);
+  auto hooks_it = g_promise_hooks.find(isolate);
+  if (hooks_it == g_promise_hooks.end()) return hooks;
+
+  for (size_t i = 0; i < hooks.size(); ++i) {
+    if (!hooks_it->second[i].IsEmpty()) {
+      hooks[i] = hooks_it->second[i].Get(isolate);
+    }
+  }
+  return hooks;
 }
 
 v8::Local<v8::String> OneByteString(v8::Isolate* isolate, const char* value) {
@@ -1518,6 +1589,19 @@ napi_status StructuredCloneImpl(
 
 }  // namespace
 
+void NapiV8ApplyPromiseHooksToContext(napi_env env, v8::Local<v8::Context> context) {
+  if (env == nullptr || env->isolate == nullptr || context.IsEmpty()) return;
+
+#ifdef V8_ENABLE_JAVASCRIPT_PROMISE_HOOKS
+  std::array<v8::Local<v8::Function>, 4> hooks =
+      LookupPromiseHooksForContext(env, env->isolate);
+  context->SetPromiseHooks(hooks[0], hooks[1], hooks[2], hooks[3]);
+#else
+  (void) env;
+  (void) context;
+#endif
+}
+
 extern "C" {
 
 napi_status NAPI_CDECL unofficial_napi_set_enqueue_foreground_task_callback(
@@ -1627,6 +1711,7 @@ napi_status NAPI_CDECL unofficial_napi_destroy_env_instance(napi_env env) {
       ResetPrepareStackTraceState(&prepare_it->second);
       g_prepare_stack_trace_callbacks.erase(prepare_it);
     }
+    unofficial_napi_internal::ResetErrorFormattingState(env);
     g_fatal_error_callbacks.erase(env->isolate);
     g_near_heap_limit_callbacks.erase(env->isolate);
     auto profiler_it = g_profiler_states.find(env);
@@ -1952,6 +2037,18 @@ napi_status NAPI_CDECL unofficial_napi_cancel_terminate_execution(napi_env env) 
   return napi_ok;
 }
 
+napi_status NAPI_CDECL unofficial_napi_set_pending_exception(napi_env env,
+                                                             napi_value error) {
+  if (env == nullptr || env->isolate == nullptr || error == nullptr) {
+    return napi_invalid_arg;
+  }
+  env->last_exception.Reset();
+  env->last_exception_source_line.clear();
+  env->last_exception_thrown_at.clear();
+  env->last_exception.Reset(env->isolate, napi_v8_unwrap_value(error));
+  return napi_ok;
+}
+
 napi_status NAPI_CDECL unofficial_napi_request_interrupt(
     napi_env env,
     unofficial_napi_interrupt_callback callback,
@@ -2151,7 +2248,12 @@ napi_status NAPI_CDECL unofficial_napi_set_promise_hooks(napi_env env,
     }
   }
 
+#ifdef V8_ENABLE_JAVASCRIPT_PROMISE_HOOKS
+  NapiV8ApplyPromiseHooksToContext(env, env->context());
+  NapiV8ApplyPromiseHooksToContextifyContexts(env);
+#else
   env->isolate->SetPromiseHook(has_hooks ? PromiseHookCallback : nullptr);
+#endif
   return napi_ok;
 }
 
@@ -2189,28 +2291,45 @@ napi_status NAPI_CDECL unofficial_napi_get_error_source_positions(
   return unofficial_napi_internal::GetErrorSourcePositions(env, error, out);
 }
 
+napi_status NAPI_CDECL unofficial_napi_set_source_maps_enabled(
+    napi_env env,
+    bool enabled) {
+  return unofficial_napi_internal::SetSourceMapsEnabled(env, enabled);
+}
+
+napi_status NAPI_CDECL unofficial_napi_set_get_source_map_error_source_callback(
+    napi_env env,
+    napi_value callback) {
+  return unofficial_napi_internal::SetGetSourceMapErrorSourceCallback(env, callback);
+}
+
+napi_status NAPI_CDECL unofficial_napi_get_error_source_line_for_stderr(
+    napi_env env,
+    napi_value error,
+    napi_value* result_out) {
+  return unofficial_napi_internal::GetErrorSourceLineForStderr(env, error, result_out);
+}
+
+napi_status NAPI_CDECL unofficial_napi_get_error_thrown_at(
+    napi_env env,
+    napi_value error,
+    napi_value* result_out) {
+  return unofficial_napi_internal::GetErrorThrownAt(env, error, result_out);
+}
+
+napi_status NAPI_CDECL unofficial_napi_take_preserved_error_formatting(
+    napi_env env,
+    napi_value error,
+    napi_value* source_line_out,
+    napi_value* thrown_at_out) {
+  return unofficial_napi_internal::TakePreservedErrorFormatting(
+      env, error, source_line_out, thrown_at_out);
+}
+
 napi_status NAPI_CDECL unofficial_napi_preserve_error_source_message(
     napi_env env,
     napi_value error) {
-  if (env == nullptr || env->isolate == nullptr || error == nullptr) {
-    return napi_invalid_arg;
-  }
-
-  v8::HandleScope scope(env->isolate);
-  v8::Local<v8::Context> context = env->context();
-  v8::Local<v8::Value> raw = napi_v8_unwrap_value(error);
-  if (raw.IsEmpty() || !raw->IsObject()) {
-    return napi_invalid_arg;
-  }
-
-  v8::Local<v8::Message> message = v8::Exception::CreateMessage(env->isolate, raw);
-  if (message.IsEmpty()) {
-    return napi_generic_failure;
-  }
-
-  unofficial_napi_internal::SetArrowMessage(
-      env->isolate, context, raw, message);
-  return napi_ok;
+  return unofficial_napi_internal::PreserveErrorSourceMessage(env, error);
 }
 
 napi_status NAPI_CDECL unofficial_napi_mark_promise_as_handled(

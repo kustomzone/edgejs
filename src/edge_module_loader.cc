@@ -983,50 +983,79 @@ static napi_value BuiltinsCompileFunctionCallback(napi_env env, napi_callback_in
     napi_throw_error(env, nullptr, msg.c_str());
     return nullptr;
   }
-  std::string wrapped;
-  const bool is_per_context = IsPerContextBuiltinId(id);
-  if (is_per_context) {
-    wrapped.reserve(source.size() + 280 + id.size());
-    wrapped += "(function(primordials, privateSymbols, perIsolateSymbols) {\n";
-    wrapped += "return function(exports, require, module, process, internalBinding, __ignoredPrimordials) {\n";
-    wrapped += source;
-    wrapped += "\n};\n";
-    wrapped += "})\n//# sourceURL=node:";
-    wrapped += id;
-  } else {
-    wrapped.reserve(source.size() + 160 + id.size());
-    wrapped += "(function(exports, require, module, process, internalBinding, primordials) {\n";
-    wrapped += source;
-    wrapped += "\n})\n//# sourceURL=node:";
-    wrapped += id;
+  napi_value code = nullptr;
+  if (napi_create_string_utf8(env, source.c_str(), source.size(), &code) != napi_ok || code == nullptr) {
+    return nullptr;
   }
-
-  napi_value wrapped_script = nullptr;
-  if (napi_create_string_utf8(env, wrapped.c_str(), wrapped.size(), &wrapped_script) != napi_ok ||
-      wrapped_script == nullptr) {
+  const std::string filename_string = "node:" + id;
+  napi_value filename = nullptr;
+  if (napi_create_string_utf8(env, filename_string.c_str(), NAPI_AUTO_LENGTH, &filename) != napi_ok ||
+      filename == nullptr) {
+    return nullptr;
+  }
+  napi_value undefined = nullptr;
+  napi_get_undefined(env, &undefined);
+  napi_value params = nullptr;
+  if (napi_create_array(env, &params) != napi_ok || params == nullptr) {
+    return nullptr;
+  }
+  auto set_param = [&](uint32_t index, const char* value) -> bool {
+    napi_value param = nullptr;
+    return napi_create_string_utf8(env, value, NAPI_AUTO_LENGTH, &param) == napi_ok &&
+           param != nullptr &&
+           napi_set_element(env, params, index, param) == napi_ok;
+  };
+  if (id == "internal/bootstrap/realm") {
+    if (!set_param(0, "process") ||
+        !set_param(1, "getLinkedBinding") ||
+        !set_param(2, "getInternalBinding") ||
+        !set_param(3, "primordials")) {
+      return nullptr;
+    }
+  } else if (IsPerContextBuiltinId(id)) {
+    if (!set_param(0, "exports") ||
+        !set_param(1, "primordials") ||
+        !set_param(2, "privateSymbols") ||
+        !set_param(3, "perIsolateSymbols")) {
+      return nullptr;
+    }
+  } else if (id.rfind("internal/main/", 0) == 0 || id.rfind("internal/bootstrap/", 0) == 0) {
+    if (!set_param(0, "process") ||
+        !set_param(1, "require") ||
+        !set_param(2, "internalBinding") ||
+        !set_param(3, "primordials")) {
+      return nullptr;
+    }
+  } else {
+    if (!set_param(0, "exports") ||
+        !set_param(1, "require") ||
+        !set_param(2, "module") ||
+        !set_param(3, "process") ||
+        !set_param(4, "internalBinding") ||
+        !set_param(5, "primordials")) {
+      return nullptr;
+    }
+  }
+  napi_value compile_result = nullptr;
+  if (unofficial_napi_contextify_compile_function(env,
+                                                  code,
+                                                  filename,
+                                                  0,
+                                                  0,
+                                                  undefined,
+                                                  false,
+                                                  undefined,
+                                                  undefined,
+                                                  params,
+                                                  undefined,
+                                                  &compile_result) != napi_ok ||
+      compile_result == nullptr) {
     return nullptr;
   }
   napi_value compiled = nullptr;
-  if (napi_run_script(env, wrapped_script, &compiled) != napi_ok || compiled == nullptr) {
+  if (napi_get_named_property(env, compile_result, "function", &compiled) != napi_ok ||
+      compiled == nullptr) {
     return nullptr;
-  }
-  if (is_per_context) {
-    napi_value global = nullptr;
-    if (napi_get_global(env, &global) != napi_ok || global == nullptr) {
-      return nullptr;
-    }
-    napi_value primordials = GetStatePrimordials(env, state);
-    napi_value private_symbols = GetStatePrivateSymbols(env, state);
-    napi_value per_isolate_symbols = GetStatePerIsolateSymbols(env, state);
-    if (primordials == nullptr) napi_get_undefined(env, &primordials);
-    if (private_symbols == nullptr) napi_get_undefined(env, &private_symbols);
-    if (per_isolate_symbols == nullptr) napi_get_undefined(env, &per_isolate_symbols);
-    napi_value outer_args[3] = {primordials, private_symbols, per_isolate_symbols};
-    napi_value inner = nullptr;
-    if (napi_call_function(env, global, compiled, 3, outer_args, &inner) != napi_ok || inner == nullptr) {
-      return nullptr;
-    }
-    compiled = inner;
   }
   return compiled;
 }

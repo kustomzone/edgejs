@@ -338,6 +338,9 @@ inline bool CheckValue(napi_env env, napi_value value) {
 void ClearLastException(napi_env env) {
   if (env == nullptr) return;
   env->last_exception.Reset();
+  env->last_exception_message.Reset();
+  env->last_exception_source_line.clear();
+  env->last_exception_thrown_at.clear();
 }
 
 void SetLastException(napi_env env,
@@ -345,12 +348,14 @@ void SetLastException(napi_env env,
                       v8::Local<v8::Message> message = v8::Local<v8::Message>()) {
   if (env == nullptr) return;
   env->last_exception.Reset();
+  env->last_exception_message.Reset();
+  env->last_exception_source_line.clear();
+  env->last_exception_thrown_at.clear();
   if (exception.IsEmpty()) return;
 
   env->last_exception.Reset(env->isolate, exception);
   if (!message.IsEmpty()) {
-    unofficial_napi_internal::SetArrowMessage(
-        env->isolate, env->context(), exception, message);
+    env->last_exception_message.Reset(env->isolate, message);
   }
 }
 
@@ -1888,6 +1893,9 @@ napi_status NAPI_CDECL napi_call_function(napi_env env,
     SetLastException(env, tryCatch.Exception(), tryCatch.Message());
     return napi_v8_set_last_error(env, napi_pending_exception, "Function call threw");
   }
+  if (maybe.IsEmpty()) {
+    return napi_generic_failure;
+  }
   if (result != nullptr) {
     v8::Local<v8::Value> out;
     if (!maybe.ToLocal(&out)) return napi_generic_failure;
@@ -2842,6 +2850,31 @@ napi_status NAPI_CDECL napi_get_and_clear_last_exception(napi_env env,
   if (!CheckEnv(env) || result == nullptr) return napi_invalid_arg;
   if (env->last_exception.IsEmpty()) return napi_generic_failure;
   v8::Local<v8::Value> ex = env->last_exception.Get(env->isolate);
+  napi_value wrapped = napi_v8_wrap_value(env, ex);
+  if (wrapped != nullptr &&
+      env->last_exception_source_line.empty() &&
+      env->last_exception_thrown_at.empty()) {
+    v8::Local<v8::Message> message;
+    if (!env->last_exception_message.IsEmpty()) {
+      message = env->last_exception_message.Get(env->isolate);
+    }
+    if (!message.IsEmpty()) {
+      unofficial_napi_internal::PreserveErrorFormatting(
+          env,
+          ex,
+          unofficial_napi_internal::GetErrorSourceLineForStderrImpl(env, message),
+          unofficial_napi_internal::GetThrownAtString(env->isolate, message));
+    } else {
+      (void)unofficial_napi_internal::PreserveErrorSourceMessage(env, wrapped);
+    }
+  } else {
+    unofficial_napi_internal::PreserveErrorFormatting(
+        env,
+        ex,
+        env->last_exception_source_line,
+        env->last_exception_thrown_at);
+  }
+  env->last_exception_message.Reset();
   ClearLastException(env);
   *result = napi_v8_wrap_value(env, ex);
   return (*result == nullptr) ? napi_generic_failure : napi_ok;
