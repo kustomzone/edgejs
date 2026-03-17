@@ -314,7 +314,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Install wasixcc
-        uses: wasix-org/wasixcc@v0.4.1
+        uses: wasix-org/wasixcc@v0.4.2
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           sysroot-tag: v2026-02-16.1
