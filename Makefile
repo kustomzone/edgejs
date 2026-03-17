@@ -1,6 +1,7 @@
 .PHONY: build build-napi-v8 build-napi-jsc test test-only check-portability clean-dist dist dist-only
 
 UNAME_S := $(shell uname -s)
+BUILD_NAPI_DIR ?= build-v8-napi
 BUILD_DIR ?= build-edge
 BUILD_TARGET ?=
 DIST_DIR ?= dist
@@ -22,6 +23,15 @@ NAPI_JSC_BUILD_DIR ?= build-napi-jsc
 ifeq ($(UNAME_S),Darwin)
 BUILD_ENV := env -u CPPFLAGS -u LDFLAGS
 endif
+
+build-napi:
+	$(BUILD_ENV) cmake -S napi/v8 -B $(BUILD_NAPI_DIR) -DCMAKE_BUILD_TYPE=$(CMAKE_BUILD_TYPE) $(EXTRA_CMAKE_ARGS) $(CMAKE_ARGS)
+	$(BUILD_ENV) cmake --build $(BUILD_NAPI_DIR) -j$(JOBS)
+
+test-napi: build-napi test-napi-only
+
+test-napi-only:
+	$(BUILD_ENV) ctest --test-dir $(BUILD_NAPI_DIR) --output-on-failure -R '^napi_v8\.'
 
 build:
 	$(BUILD_ENV) cmake -S . -B $(BUILD_DIR) -DCMAKE_BUILD_TYPE=$(CMAKE_BUILD_TYPE) $(EXTRA_CMAKE_ARGS) $(CMAKE_ARGS)

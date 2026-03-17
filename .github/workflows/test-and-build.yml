@@ -72,10 +72,10 @@ jobs:
           ! grep -nE "v8::|<v8.h>|\"v8.h\"" napi/include/js_native_api.h napi/include/node_api.h
 
       - name: Build napi-v8
-        run: make build-napi-v8 CMAKE_BUILD_TYPE=Release JOBS=4
+        run: make build-napi CMAKE_BUILD_TYPE=Release JOBS=4
 
       - name: Test napi-v8
-        run: ctest --test-dir build-napi-v8 --output-on-failure -R '^napi_v8\.'
+        run: make test-napi-only TEST_JOBS=4
 
       - name: Build edge
         run: |
@@ -233,10 +233,10 @@ jobs:
           ! grep -nE "v8::|<v8.h>|\"v8.h\"" napi/include/js_native_api.h napi/include/node_api.h
 
       - name: Build napi-v8
-        run: make build-napi-v8 CMAKE_BUILD_TYPE=Release JOBS=4
+        run: make build-napi CMAKE_BUILD_TYPE=Release JOBS=4
 
       - name: Test napi-v8
-        run: ctest --test-dir build-napi-v8 --output-on-failure -R '^napi_v8\.'
+        run: make test-napi-only TEST_JOBS=4
 
       - name: Build edge
         run: |
