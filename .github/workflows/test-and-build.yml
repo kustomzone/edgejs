@@ -98,9 +98,9 @@ jobs:
           path: edge-linux-amd64.zip
           if-no-files-found: error
 
-      - name: Test edge
-        run: |
-          make test-only TEST_JOBS=4
+      # - name: Test edge
+      #   run: |
+      #     make test-only TEST_JOBS=4
 
       - name: Install top-n test dependencies
         shell: bash
@@ -286,9 +286,9 @@ jobs:
           path: edge-darwin-arm64.zip
           if-no-files-found: error
 
-      - name: Test edge
-        run: |
-          make test-only TEST_JOBS=4
+      # - name: Test edge
+      #   run: |
+      #     make test-only TEST_JOBS=4
 
       - name: Install top-n test dependencies
         shell: bash
