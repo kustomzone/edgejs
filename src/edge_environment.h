@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <string>
@@ -190,6 +191,7 @@ class Environment {
   using AtExitCallback = AtExitEntry::Callback;
   using ThreadsafeImmediateCallback = ThreadsafeImmediateEntry::Callback;
   using InterruptCallback = void (*)(napi_env env, void* data);
+  using ProcessExitHandler = std::function<void(Environment*, int)>;
 
   static Environment* Get(napi_env env);
   static Environment* Attach(napi_env env, const EdgeEnvironmentConfig& config);
@@ -227,6 +229,8 @@ class Environment {
   void set_local_env_var(const std::string& key, const std::string& value);
   void unset_local_env_var(const std::string& key);
   void RequestStop();
+  void Exit(int exit_code);
+  void SetProcessExitHandler(ProcessExitHandler handler);
 
   napi_value binding() const;
   void set_binding(napi_value binding);
@@ -400,6 +404,7 @@ class Environment {
   bool threadsafe_immediate_async_closed_ = true;
   std::deque<ThreadsafeImmediateEntry> interrupts_;
   std::deque<ThreadsafeImmediateEntry> threadsafe_immediates_;
+  ProcessExitHandler process_exit_handler_;
 };
 
 }  // namespace edge

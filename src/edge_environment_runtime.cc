@@ -3,6 +3,7 @@
 #include "edge_cares_wrap.h"
 #include "edge_runtime_platform.h"
 #include "edge_worker_control.h"
+#include "unofficial_napi.h"
 
 namespace {
 
@@ -21,10 +22,40 @@ void CaresCleanup(napi_env env, void* /*arg*/) {
   EdgeRunCaresWrapEnvCleanup(env);
 }
 
+void ExitCurrentEnvironment(edge::Environment* environment, bool stop_sub_workers) {
+  if (environment == nullptr) return;
+
+  napi_env env = environment->env();
+  if (stop_sub_workers) {
+    EdgeWorkerStopAllForEnv(env);
+  }
+
+  if (uv_loop_t* loop = environment->GetExistingEventLoop(); loop != nullptr) {
+    uv_stop(loop);
+  }
+
+  // Node hard-exits the main thread here. Edge still needs to unwind through
+  // the embedder cleanup path, so terminate the current env instead.
+  (void)unofficial_napi_terminate_execution(env);
+}
+
+void MainThreadProcessExitHandler(edge::Environment* environment, int /*exit_code*/) {
+  ExitCurrentEnvironment(environment, true);
+}
+
+void WorkerThreadProcessExitHandler(edge::Environment* environment, int /*exit_code*/) {
+  ExitCurrentEnvironment(environment, false);
+}
 }  // namespace
 
 bool EdgeAttachEnvironmentForRuntime(napi_env env, const EdgeEnvironmentConfig* config) {
   if (!EdgeEnvironmentAttach(env, config)) return false;
+
+  if (auto* environment = EdgeEnvironmentGet(env); environment != nullptr) {
+    environment->SetProcessExitHandler(
+        environment->owns_process_state() ? MainThreadProcessExitHandler
+                                          : WorkerThreadProcessExitHandler);
+  }
 
   EdgeEnvironmentRegisterCleanupStage(env, StopWorkersCleanup, nullptr, kCleanupStopWorkers);
   EdgeEnvironmentRegisterCleanupStage(

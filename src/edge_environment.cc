@@ -426,6 +426,33 @@ void Environment::RequestStop() {
   stop_requested_ = true;
 }
 
+void Environment::Exit(int exit_code) {
+  ProcessExitHandler handler;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    exiting_ = true;
+    has_exit_code_ = true;
+    exit_code_ = exit_code;
+    stop_requested_ = true;
+    handler = process_exit_handler_;
+  }
+
+  if (handler != nullptr) {
+    handler(this, exit_code);
+    return;
+  }
+
+  if (uv_loop_t* loop = GetExistingEventLoop(); loop != nullptr) {
+    uv_stop(loop);
+  }
+  (void)unofficial_napi_terminate_execution(env_);
+}
+
+void Environment::SetProcessExitHandler(ProcessExitHandler handler) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  process_exit_handler_ = std::move(handler);
+}
+
 napi_value Environment::binding() const {
   napi_ref ref = nullptr;
   {

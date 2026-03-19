@@ -39,6 +39,7 @@ bool EdgeFinalizeFatalExceptionNow(napi_env env,
                                    int default_exit_code = 1,
                                    const std::string& exception_line = {},
                                    const std::string& thrown_at = {});
+void EdgePrepareProcessExit(napi_env env, int exit_code);
 
 enum EdgeMakeCallbackFlags : int {
   kEdgeMakeCallbackNone = 0,
