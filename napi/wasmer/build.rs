@@ -36,6 +36,8 @@ enum ExtraLink {
 
 fn main() {
     println!("cargo:rerun-if-changed=src/napi_bridge_init.cc");
+    println!("cargo:rerun-if-changed=../../src/edge_napi_embedder_hooks.cc");
+    println!("cargo:rerun-if-changed=../../src/edge_napi_embedder_hooks.h");
     println!("cargo:rerun-if-changed=../v8/src/edge_v8_platform.cc");
     println!("cargo:rerun-if-changed=../v8/src/js_native_api_v8.cc");
     println!("cargo:rerun-if-changed=../v8/src/unofficial_napi.cc");
@@ -100,6 +102,7 @@ fn main() {
         .include(napi_include.to_str().unwrap())
         .include(napi_v8_src.to_str().unwrap())
         .file("src/napi_bridge_init.cc")
+        .file(edge_src.join("edge_napi_embedder_hooks.cc").to_str().unwrap())
         .file(napi_v8_src.join("js_native_api_v8.cc").to_str().unwrap())
         .file(napi_v8_src.join("unofficial_napi.cc").to_str().unwrap())
         .file(

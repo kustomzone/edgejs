@@ -331,6 +331,14 @@ fn guest_unofficial_napi_release_env_with_loop(
     unsafe { snapi_bridge_unofficial_release_env_with_loop(snapi_env_state, loop_id) }
 }
 
+fn guest_unofficial_napi_set_embedder_hooks(
+    env: FunctionEnvMut<RuntimeEnv>,
+    napi_env: i32,
+) -> i32 {
+    let env_handle = snapi_env(&env, napi_env);
+    unsafe { snapi_bridge_unofficial_set_embedder_hooks(env_handle) }
+}
+
 fn guest_unofficial_napi_low_memory_notification(
     env: FunctionEnvMut<RuntimeEnv>,
     napi_env: i32,
@@ -931,6 +939,97 @@ fn guest_unofficial_napi_get_error_source_positions(
     0
 }
 
+fn guest_unofficial_napi_set_source_maps_enabled(
+    env: FunctionEnvMut<RuntimeEnv>,
+    napi_env: i32,
+    enabled: i32,
+) -> i32 {
+    let env_handle = snapi_env(&env, napi_env);
+    unsafe { snapi_bridge_unofficial_set_source_maps_enabled(env_handle, enabled) }
+}
+
+fn guest_unofficial_napi_set_get_source_map_error_source_callback(
+    env: FunctionEnvMut<RuntimeEnv>,
+    napi_env: i32,
+    callback: i32,
+) -> i32 {
+    let env_handle = snapi_env(&env, napi_env);
+    let callback_id = if callback > 0 { callback as u32 } else { 0 };
+    unsafe {
+        snapi_bridge_unofficial_set_get_source_map_error_source_callback(env_handle, callback_id)
+    }
+}
+
+fn guest_unofficial_napi_get_error_source_line_for_stderr(
+    mut env: FunctionEnvMut<RuntimeEnv>,
+    napi_env: i32,
+    error: i32,
+    result_ptr: i32,
+) -> i32 {
+    let env_handle = snapi_env(&env, napi_env);
+    let error_id = if error > 0 { error as u32 } else { 0 };
+    let mut result_id = 0u32;
+    let status = unsafe {
+        snapi_bridge_unofficial_get_error_source_line_for_stderr(
+            env_handle,
+            error_id,
+            &mut result_id,
+        )
+    };
+    if status == 0 && result_ptr > 0 {
+        write_guest_u32(&mut env, result_ptr as u32, result_id);
+    }
+    status
+}
+
+fn guest_unofficial_napi_get_error_thrown_at(
+    mut env: FunctionEnvMut<RuntimeEnv>,
+    napi_env: i32,
+    error: i32,
+    result_ptr: i32,
+) -> i32 {
+    let env_handle = snapi_env(&env, napi_env);
+    let error_id = if error > 0 { error as u32 } else { 0 };
+    let mut result_id = 0u32;
+    let status = unsafe {
+        snapi_bridge_unofficial_get_error_thrown_at(env_handle, error_id, &mut result_id)
+    };
+    if status == 0 && result_ptr > 0 {
+        write_guest_u32(&mut env, result_ptr as u32, result_id);
+    }
+    status
+}
+
+fn guest_unofficial_napi_take_preserved_error_formatting(
+    mut env: FunctionEnvMut<RuntimeEnv>,
+    napi_env: i32,
+    error: i32,
+    source_line_ptr: i32,
+    thrown_at_ptr: i32,
+) -> i32 {
+    let env_handle = snapi_env(&env, napi_env);
+    let error_id = if error > 0 { error as u32 } else { 0 };
+    let mut source_line_id = 0u32;
+    let mut thrown_at_id = 0u32;
+    let status = unsafe {
+        snapi_bridge_unofficial_take_preserved_error_formatting(
+            env_handle,
+            error_id,
+            &mut source_line_id,
+            &mut thrown_at_id,
+        )
+    };
+    if status == 0 {
+        if source_line_ptr > 0 {
+            write_guest_u32(&mut env, source_line_ptr as u32, source_line_id);
+        }
+        if thrown_at_ptr > 0 {
+            write_guest_u32(&mut env, thrown_at_ptr as u32, thrown_at_id);
+        }
+    }
+    status
+}
+
 fn guest_unofficial_napi_preserve_error_source_message(
     env: FunctionEnvMut<RuntimeEnv>,
     napi_env: i32,
@@ -1486,6 +1585,57 @@ fn guest_unofficial_napi_contextify_create_cached_data(
     };
     if status == 0 && result_ptr > 0 {
         write_guest_u32(&mut env, result_ptr as u32, result_id);
+    }
+    status
+}
+
+fn guest_unofficial_napi_contextify_start_sigint_watchdog(
+    mut env: FunctionEnvMut<RuntimeEnv>,
+    napi_env: i32,
+    result_ptr: i32,
+) -> i32 {
+    let env_handle = snapi_env(&env, napi_env);
+    let mut result = 0i32;
+    let status =
+        unsafe { snapi_bridge_unofficial_contextify_start_sigint_watchdog(env_handle, &mut result) };
+    if status == 0 && result_ptr > 0 {
+        write_guest_u8(&mut env, result_ptr as u32, (result != 0) as u8);
+    }
+    status
+}
+
+fn guest_unofficial_napi_contextify_stop_sigint_watchdog(
+    mut env: FunctionEnvMut<RuntimeEnv>,
+    napi_env: i32,
+    had_pending_signal_ptr: i32,
+) -> i32 {
+    let env_handle = snapi_env(&env, napi_env);
+    let mut had_pending_signal = 0i32;
+    let status = unsafe {
+        snapi_bridge_unofficial_contextify_stop_sigint_watchdog(env_handle, &mut had_pending_signal)
+    };
+    if status == 0 && had_pending_signal_ptr > 0 {
+        write_guest_u8(
+            &mut env,
+            had_pending_signal_ptr as u32,
+            (had_pending_signal != 0) as u8,
+        );
+    }
+    status
+}
+
+fn guest_unofficial_napi_contextify_watchdog_has_pending_sigint(
+    mut env: FunctionEnvMut<RuntimeEnv>,
+    napi_env: i32,
+    result_ptr: i32,
+) -> i32 {
+    let env_handle = snapi_env(&env, napi_env);
+    let mut result = 0i32;
+    let status = unsafe {
+        snapi_bridge_unofficial_contextify_watchdog_has_pending_sigint(env_handle, &mut result)
+    };
+    if status == 0 && result_ptr > 0 {
+        write_guest_u8(&mut env, result_ptr as u32, (result != 0) as u8);
     }
     status
 }
@@ -4859,6 +5009,10 @@ pub fn register_napi_imports(
         guest_unofficial_napi_create_env_with_options
     );
     reg!(
+        "unofficial_napi_set_embedder_hooks",
+        guest_unofficial_napi_set_embedder_hooks
+    );
+    reg!(
         "unofficial_napi_release_env",
         guest_unofficial_napi_release_env
     );
@@ -4999,6 +5153,26 @@ pub fn register_napi_imports(
         guest_unofficial_napi_get_error_source_positions
     );
     reg!(
+        "unofficial_napi_set_source_maps_enabled",
+        guest_unofficial_napi_set_source_maps_enabled
+    );
+    reg!(
+        "unofficial_napi_set_get_source_map_error_source_callback",
+        guest_unofficial_napi_set_get_source_map_error_source_callback
+    );
+    reg!(
+        "unofficial_napi_get_error_source_line_for_stderr",
+        guest_unofficial_napi_get_error_source_line_for_stderr
+    );
+    reg!(
+        "unofficial_napi_get_error_thrown_at",
+        guest_unofficial_napi_get_error_thrown_at
+    );
+    reg!(
+        "unofficial_napi_take_preserved_error_formatting",
+        guest_unofficial_napi_take_preserved_error_formatting
+    );
+    reg!(
         "unofficial_napi_preserve_error_source_message",
         guest_unofficial_napi_preserve_error_source_message
     );
@@ -5089,6 +5263,18 @@ pub fn register_napi_imports(
     reg!(
         "unofficial_napi_contextify_create_cached_data",
         guest_unofficial_napi_contextify_create_cached_data
+    );
+    reg!(
+        "unofficial_napi_contextify_start_sigint_watchdog",
+        guest_unofficial_napi_contextify_start_sigint_watchdog
+    );
+    reg!(
+        "unofficial_napi_contextify_stop_sigint_watchdog",
+        guest_unofficial_napi_contextify_stop_sigint_watchdog
+    );
+    reg!(
+        "unofficial_napi_contextify_watchdog_has_pending_sigint",
+        guest_unofficial_napi_contextify_watchdog_has_pending_sigint
     );
     reg!(
         "unofficial_napi_module_wrap_create_source_text",

@@ -3,9 +3,10 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use virtual_fs::{AsyncReadExt, FileSystem};
-use wasmer::sys::EngineBuilder;
+use wasmer::sys::{EngineBuilder, Features};
 use wasmer::{Module, Store};
-use wasmer_compiler_llvm::LLVM;
+use wasmer_cache::{Cache, FileSystemCache, Hash as CacheHash};
+use wasmer_compiler_llvm::{LLVM, LLVMOptLevel};
 use wasmer_types::ModuleHash;
 use wasmer_wasix::{
     Pipe, PluggableRuntime, WasiError,
@@ -28,8 +29,36 @@ pub struct LoadedWasm {
 }
 
 fn create_cli_store() -> Store {
-    let engine = EngineBuilder::new(LLVM::default()).engine();
+    let mut features = Features::default();
+    features.exceptions(true);
+
+    let mut compiler = LLVM::default();
+    compiler.opt_level(LLVMOptLevel::Less);
+
+    let engine = EngineBuilder::new(compiler)
+        .set_features(Some(features))
+        .engine();
     Store::new(engine)
+}
+
+fn wasmer_cache_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join("wasmer-cache")
+}
+
+fn load_or_compile_module(store: &Store, wasm_bytes: &[u8]) -> Result<Module> {
+    let key = CacheHash::generate(wasm_bytes);
+    let mut cache = FileSystemCache::new(wasmer_cache_dir())
+        .context("failed to create/access Wasmer cache directory")?;
+
+    if let Ok(module) = unsafe { cache.load(store, key) } {
+        return Ok(module);
+    }
+
+    let module = Module::new(store, wasm_bytes).context("failed to compile wasm module")?;
+    let _ = cache.store(key, &module);
+    Ok(module)
 }
 
 fn spawn_pipe_drain_thread(
@@ -64,7 +93,7 @@ pub fn load_wasix_module(wasm_path: &Path) -> Result<LoadedWasm> {
     let wasm_bytes = std::fs::read(wasm_path)
         .with_context(|| format!("failed to read wasm file at {}", wasm_path.display()))?;
     let store = create_cli_store();
-    let module = Module::new(&store, &wasm_bytes).context("failed to compile wasm module")?;
+    let module = load_or_compile_module(&store, &wasm_bytes)?;
     let module_hash = ModuleHash::sha256(&wasm_bytes);
 
     Ok(LoadedWasm {

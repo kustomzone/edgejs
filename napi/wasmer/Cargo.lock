@@ -2067,6 +2067,7 @@ dependencies = [
  "ureq",
  "virtual-fs",
  "wasmer",
+ "wasmer-cache",
  "wasmer-compiler-llvm",
  "wasmer-types",
  "wasmer-wasix",
@@ -4153,6 +4154,18 @@ dependencies = [
  "wasmparser 0.245.1",
  "wat",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "wasmer-cache"
+version = "7.1.0-rc.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "29840c1daf5d517ba6d614a47af82eecd78ed7b7af96c785a125dbf814591039"
+dependencies = [
+ "blake3",
+ "hex",
+ "thiserror 2.0.18",
+ "wasmer",
 ]
 
 [[package]]

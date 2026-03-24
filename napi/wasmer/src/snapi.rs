@@ -61,6 +61,7 @@ unsafe extern "C" {
         stack_limit: u32,
         env_out: *mut SnapiEnv,
     ) -> i32;
+    pub fn snapi_bridge_unofficial_set_embedder_hooks(env: SnapiEnv) -> i32;
     pub fn snapi_bridge_unofficial_release_env(env: SnapiEnv) -> i32;
     pub fn snapi_bridge_unofficial_release_env_with_loop(env: SnapiEnv, loop_id: u32) -> i32;
     pub fn snapi_bridge_unofficial_low_memory_notification(env: SnapiEnv) -> i32;
@@ -189,6 +190,27 @@ unsafe extern "C" {
         start_column_out: *mut i32,
         end_column_out: *mut i32,
     ) -> i32;
+    pub fn snapi_bridge_unofficial_set_source_maps_enabled(env: SnapiEnv, enabled: i32) -> i32;
+    pub fn snapi_bridge_unofficial_set_get_source_map_error_source_callback(
+        env: SnapiEnv,
+        callback_id: u32,
+    ) -> i32;
+    pub fn snapi_bridge_unofficial_get_error_source_line_for_stderr(
+        env: SnapiEnv,
+        error_id: u32,
+        result_out: *mut u32,
+    ) -> i32;
+    pub fn snapi_bridge_unofficial_get_error_thrown_at(
+        env: SnapiEnv,
+        error_id: u32,
+        result_out: *mut u32,
+    ) -> i32;
+    pub fn snapi_bridge_unofficial_take_preserved_error_formatting(
+        env: SnapiEnv,
+        error_id: u32,
+        source_line_out: *mut u32,
+        thrown_at_out: *mut u32,
+    ) -> i32;
     pub fn snapi_bridge_unofficial_preserve_error_source_message(
         env: SnapiEnv,
         error_id: u32,
@@ -315,6 +337,18 @@ unsafe extern "C" {
         column_offset: i32,
         host_defined_option_id: u32,
         result_out: *mut u32,
+    ) -> i32;
+    pub fn snapi_bridge_unofficial_contextify_start_sigint_watchdog(
+        env: SnapiEnv,
+        result_out: *mut i32,
+    ) -> i32;
+    pub fn snapi_bridge_unofficial_contextify_stop_sigint_watchdog(
+        env: SnapiEnv,
+        had_pending_signal_out: *mut i32,
+    ) -> i32;
+    pub fn snapi_bridge_unofficial_contextify_watchdog_has_pending_sigint(
+        env: SnapiEnv,
+        result_out: *mut i32,
     ) -> i32;
     pub fn snapi_bridge_unofficial_module_wrap_create_source_text(
         env: SnapiEnv,

@@ -19,12 +19,7 @@ fn maybe_add_builtin_mounts(
         }
         path
     } else {
-        let manifest_dir = std::env::var_os("CARGO_MANIFEST_DIR").ok_or_else(|| {
-            anyhow!(
-                "builtin js dir is not configured: set --builtin-js-dir, {BUILTIN_JS_ENV_VAR}, or CARGO_MANIFEST_DIR"
-            )
-        })?;
-        let repo_root = PathBuf::from(manifest_dir).join("../..");
+        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
         let lib = repo_root.join("lib");
         if lib.is_dir() {
             std::fs::canonicalize(&lib).ok().unwrap_or(lib)
