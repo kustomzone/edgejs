@@ -3,6 +3,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <set>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -78,12 +79,25 @@ std::string BuildCompatWrappedPathPrefix() {
   return updated_path;
 }
 
-bool SafeModeVersionHasNapiFeature(const std::string& version_output) {
+bool SafeModeVersionHasRequiredNapiFeatures(const std::string& version_output) {
   std::istringstream stream(version_output);
   std::string line;
   while (std::getline(stream, line)) {
     if (line.rfind("features:", 0) != 0) continue;
-    return line.find("NAPI") != std::string::npos;
+
+    std::istringstream feature_stream(line.substr(std::strlen("features:")));
+    std::set<std::string> features;
+    std::string feature;
+    while (feature_stream >> feature) {
+      if (!feature.empty() && feature.back() == ',') {
+        feature.pop_back();
+      }
+      if (!feature.empty()) {
+        features.insert(feature);
+      }
+    }
+
+    return features.contains("napi_v10") && features.contains("napi_extension_wasmer_v0");
   }
   return false;
 }
@@ -309,14 +323,17 @@ int EdgeRunSafeModeCommand(const std::vector<std::string>& forwarded_args, std::
   }
   const std::string version_output =
       version_result.stdout_output.empty() ? version_result.stderr_output : version_result.stdout_output;
-  if (!SafeModeVersionHasNapiFeature(version_output)) {
+  if (!SafeModeVersionHasRequiredNapiFeatures(version_output)) {
     if (error_out != nullptr) {
-      *error_out = "safe mode requires a Wasmer build with the NAPI feature enabled.\nInstall it from " + std::string(kSafeModeInstallUrl);
+      *error_out =
+          "safe mode requires a Wasmer build with the napi_v10 and "
+          "napi_extension_wasmer_v0 features enabled.\nInstall it from " +
+          std::string(kSafeModeInstallUrl);
     }
     return 1;
   }
 
-  std::vector<std::string> child_args = {"wasmer", "run", "wasmer/edgejs", "--volume=.", "--net"};
+  std::vector<std::string> child_args = {"wasmer", "run", "--experimental-napi", "wasmer/edgejs", "--volume=.", "--net"};
   child_args.insert(child_args.end(), forwarded_args.begin(), forwarded_args.end());
   return RunCommandPassthrough(child_args, error_out);
 }
