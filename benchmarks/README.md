@@ -57,6 +57,20 @@ What it does not measure:
 - network or filesystem async work
 - framework-level reactivity behavior
 
+### `zlib-gzip-gunzip-sync`
+Repeatedly compresses and decompresses the same in-memory payload with `node:zlib` and prints a deterministic checksum.
+
+What it isolates:
+- short-lived compression and decompression cost for a one-shot process
+- `node:zlib` compatibility on a small deterministic workload
+- runtime behavior for a common built-in module beyond startup-only baselines
+
+What it does not measure:
+- streaming compression behavior
+- filesystem or network I/O
+- large real-world archive throughput
+- long-running server workloads
+
 ## Runtime prerequisites
 
 Install and verify the comparison runtimes you want to use:
