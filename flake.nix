@@ -33,7 +33,7 @@
               inherit system nixpkgs;
             };
             rustToolchain =
-              pkgs.rust-bin.fromRustupToolchainFile ./napi/rust-toolchain.toml;
+              pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
             v8Prebuilt = pkgs.stdenvNoCC.mkDerivation {
               pname = "ubi-v8-prebuilt";
               version = "11.9.2";
